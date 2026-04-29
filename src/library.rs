@@ -7,7 +7,10 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::catalog::{CatalogFileFingerprint, CatalogStore, CatalogTrack};
+use crate::{
+    catalog::{CatalogFileFingerprint, CatalogStore, CatalogTrack},
+    perf,
+};
 use anyhow::{Context, Result, anyhow};
 use lofty::{
     file::{AudioFile, TaggedFileExt},
@@ -126,6 +129,7 @@ impl LibraryIndexer {
     }
 
     pub fn scan(&self) -> ScanReport {
+        let _span = perf::span("library.scan", format!("roots={}", self.roots.len()));
         let mut report = ScanReport::default();
 
         for root in &self.roots {
@@ -167,6 +171,10 @@ impl LibraryIndexer {
     }
 
     pub fn scan_with_events(&self, events: &mpsc::Sender<LibraryEvent>) -> ScanReport {
+        let _span = perf::span(
+            "library.scan_with_events",
+            format!("roots={}", self.roots.len()),
+        );
         self.scan_with_events_until(events, || false).0
     }
 
@@ -175,9 +183,18 @@ impl LibraryIndexer {
         events: &mpsc::Sender<LibraryEvent>,
         mut should_stop: impl FnMut() -> bool,
     ) -> (ScanReport, bool) {
+        let _span = perf::span(
+            "library.scan_with_events_until",
+            format!(
+                "roots={} batch_size={}",
+                self.roots.len(),
+                self.options.batch_size
+            ),
+        );
         let mut report = ScanReport::default();
         let mut progress = ScanProgress::default();
         let batch_size = self.options.batch_size.max(1);
+        let mut emitted_tracks = Vec::new();
 
         let _ = events.send(LibraryEvent::ScanStarted);
         let scan_id =
@@ -195,7 +212,11 @@ impl LibraryIndexer {
                     }
                 });
         let cached_tracks = self.catalog.as_ref().and_then(|catalog| {
-            match catalog.load_track_fingerprints(&self.roots) {
+            match perf::time_result(
+                "library.scan.load_track_fingerprints",
+                format!("roots={}", self.roots.len()),
+                || catalog.load_track_fingerprints(&self.roots),
+            ) {
                 Ok(tracks) => Some(tracks),
                 Err(error) => {
                     send_error(
@@ -251,10 +272,14 @@ impl LibraryIndexer {
                     report.tracks.push(track_from_catalog(cached_track.clone()));
                     cached_seen_paths.push(path.to_path_buf());
 
-                    if report.tracks.len() % batch_size == 0 {
-                        let start = report.tracks.len() - batch_size;
-                        let _ = events
-                            .send(LibraryEvent::TracksIndexed(report.tracks[start..].to_vec()));
+                    if progress.indexed % batch_size == 0 {
+                        perf::event(
+                            "library.scan.cached_progress",
+                            format!(
+                                "indexed={} discovered={} errors={}",
+                                progress.indexed, progress.discovered, progress.errors
+                            ),
+                        );
                         let _ = events.send(LibraryEvent::ScanProgress(progress));
                     }
 
@@ -274,12 +299,21 @@ impl LibraryIndexer {
                         }
 
                         progress.indexed += 1;
-                        report.tracks.push(track);
+                        report.tracks.push(track.clone());
+                        emitted_tracks.push(track);
 
-                        if report.tracks.len() % batch_size == 0 {
-                            let start = report.tracks.len() - batch_size;
-                            let _ = events
-                                .send(LibraryEvent::TracksIndexed(report.tracks[start..].to_vec()));
+                        if emitted_tracks.len() % batch_size == 0 {
+                            let start = emitted_tracks.len() - batch_size;
+                            perf::event(
+                                "library.scan.emit_batch",
+                                format!(
+                                    "kind=indexed batch={batch_size} indexed={} discovered={} errors={}",
+                                    progress.indexed, progress.discovered, progress.errors
+                                ),
+                            );
+                            let _ = events.send(LibraryEvent::TracksIndexed(
+                                emitted_tracks[start..].to_vec(),
+                            ));
                             let _ = events.send(LibraryEvent::ScanProgress(progress));
                         }
                     }
@@ -297,10 +331,14 @@ impl LibraryIndexer {
             }
         }
 
-        let sent_full_batches = report.tracks.len() / batch_size * batch_size;
-        if sent_full_batches < report.tracks.len() {
+        let sent_full_batches = emitted_tracks.len() / batch_size * batch_size;
+        if sent_full_batches < emitted_tracks.len() {
+            perf::event(
+                "library.scan.emit_final_batch",
+                format!("batch={}", emitted_tracks.len() - sent_full_batches),
+            );
             let _ = events.send(LibraryEvent::TracksIndexed(
-                report.tracks[sent_full_batches..].to_vec(),
+                emitted_tracks[sent_full_batches..].to_vec(),
             ));
         }
 
@@ -325,10 +363,21 @@ impl LibraryIndexer {
         }
         let _ = events.send(LibraryEvent::ScanProgress(progress));
         let _ = events.send(LibraryEvent::ScanFinished);
+        perf::event(
+            "library.scan.finished",
+            format!(
+                "completed=true discovered={} indexed={} errors={}",
+                progress.discovered, progress.indexed, progress.errors
+            ),
+        );
         (report, true)
     }
 
     pub fn start_watching(self, events: mpsc::Sender<LibraryEvent>) -> Result<LibraryWatcher> {
+        let _span = perf::span(
+            "library.start_watching",
+            format!("roots={}", self.roots.len()),
+        );
         let roots = self.roots.clone();
         let options = self.options.clone();
         let catalog = self.catalog.clone();
@@ -354,6 +403,7 @@ pub struct LibraryWatcher {
 
 impl LibraryWatcher {
     pub fn stop(mut self) {
+        let _span = perf::span("library.watcher.stop", "");
         let _ = self.shutdown_tx.send(());
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -383,6 +433,11 @@ pub fn is_supported_audio_file(path: impl AsRef<Path>) -> bool {
 
 pub fn index_audio_file(path: impl AsRef<Path>) -> Result<Track> {
     let path = path.as_ref();
+    let _span = perf::slow_span(
+        "library.index_audio_file",
+        Duration::from_millis(25),
+        format!("path={}", path.display()),
+    );
     if !is_supported_audio_file(path) {
         return Err(anyhow!("unsupported audio extension"));
     }
@@ -514,6 +569,7 @@ fn run_watcher(
     events: mpsc::Sender<LibraryEvent>,
     shutdown_rx: mpsc::Receiver<()>,
 ) {
+    let _span = perf::span("library.run_watcher", format!("roots={}", roots.len()));
     let mut indexer = LibraryIndexer::with_options(roots.clone(), options.clone());
     indexer.catalog = catalog.clone();
     let mut shutdown_requested = false;

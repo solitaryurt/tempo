@@ -171,8 +171,7 @@ impl TextInputState {
         self.text
             .char_indices()
             .map(|(ix, _)| ix)
-            .filter(|ix| *ix < offset)
-            .next_back()
+            .rfind(|ix| *ix < offset)
             .unwrap_or(0)
     }
 

@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Instant;
 
 impl TempoApp {
     pub(super) fn filtered_track_count(&self) -> usize {
@@ -10,9 +11,16 @@ impl TempoApp {
     }
 
     pub(super) fn invalidate_track_indices(&mut self) {
+        let start = Instant::now();
         for tab_ix in 0..self.tabs.len() {
             self.rebuild_track_indices_for_tab(tab_ix);
         }
+        perf::log_duration_if_slow(
+            "search.invalidate_track_indices",
+            start.elapsed(),
+            Duration::from_millis(4),
+            format!("tabs={} tracks={}", self.tabs.len(), self.tracks.len()),
+        );
     }
 
     pub(super) fn current_track_indices(&self) -> &[usize] {
@@ -27,6 +35,7 @@ impl TempoApp {
     }
 
     pub(super) fn rebuild_track_indices_for_tab(&mut self, tab_ix: usize) {
+        let start = Instant::now();
         let Some(tab) = self.tabs.get(tab_ix) else {
             return;
         };
@@ -43,6 +52,23 @@ impl TempoApp {
             tab.track_indices = indices;
             tab.scrollbar_markers = scrollbar_markers;
         }
+        perf::log_duration_if_slow(
+            "search.rebuild_track_indices_for_tab",
+            start.elapsed(),
+            Duration::from_millis(4),
+            format!(
+                "tab={tab_ix} source={} query_len={} sort={} dir={} results={} markers={}",
+                Self::tab_source_label(source),
+                search_query.len(),
+                Self::sort_column_label(sort_column),
+                Self::sort_direction_label(sort_direction),
+                self.track_indices_for_tab(tab_ix).len(),
+                self.tabs
+                    .get(tab_ix)
+                    .map(|tab| tab.scrollbar_markers.len())
+                    .unwrap_or_default()
+            ),
+        );
     }
 
     pub(super) fn compute_track_indices(
@@ -52,9 +78,23 @@ impl TempoApp {
         sort_column: SortColumn,
         sort_direction: SortDirection,
     ) -> Vec<usize> {
+        let total_start = Instant::now();
         let terms = Self::search_terms(search_query);
-        let mut indices = self
-            .source_track_indices(source)
+        let source_start = Instant::now();
+        let source_indices = self.source_track_indices(source);
+        perf::log_duration_if_slow(
+            "search.source_track_indices",
+            source_start.elapsed(),
+            Duration::from_millis(4),
+            format!(
+                "source={} tracks={} candidates={}",
+                Self::tab_source_label(source),
+                self.tracks.len(),
+                source_indices.len()
+            ),
+        );
+        let filter_start = Instant::now();
+        let mut indices = source_indices
             .into_iter()
             .filter(|track_ix| {
                 self.tracks
@@ -62,14 +102,38 @@ impl TempoApp {
                     .is_some_and(|track| Self::track_matches_search_terms(track, &terms))
             })
             .collect::<Vec<_>>();
+        perf::log_duration_if_slow(
+            "search.filter_tracks",
+            filter_start.elapsed(),
+            Duration::from_millis(4),
+            format!(
+                "source={} terms={} results={}",
+                Self::tab_source_label(source),
+                terms.len(),
+                indices.len()
+            ),
+        );
 
         if sort_column == SortColumn::Index {
             if sort_direction == SortDirection::Descending {
                 indices.reverse();
             }
+            perf::log_duration_if_slow(
+                "search.compute_track_indices",
+                total_start.elapsed(),
+                Duration::from_millis(4),
+                format!(
+                    "source={} query_len={} sort={} results={}",
+                    Self::tab_source_label(source),
+                    search_query.len(),
+                    Self::sort_column_label(sort_column),
+                    indices.len()
+                ),
+            );
             return indices;
         }
 
+        let sort_start = Instant::now();
         indices.sort_by(|a, b| {
             let left = &self.tracks[*a];
             let right = &self.tracks[*b];
@@ -115,8 +179,65 @@ impl TempoApp {
                 SortDirection::Descending => ordering.reverse(),
             }
         });
+        perf::log_duration_if_slow(
+            "search.sort_tracks",
+            sort_start.elapsed(),
+            Duration::from_millis(4),
+            format!(
+                "sort={} dir={} results={}",
+                Self::sort_column_label(sort_column),
+                Self::sort_direction_label(sort_direction),
+                indices.len()
+            ),
+        );
+        perf::log_duration_if_slow(
+            "search.compute_track_indices",
+            total_start.elapsed(),
+            Duration::from_millis(4),
+            format!(
+                "source={} query_len={} sort={} results={}",
+                Self::tab_source_label(source),
+                search_query.len(),
+                Self::sort_column_label(sort_column),
+                indices.len()
+            ),
+        );
 
         indices
+    }
+
+    fn tab_source_label(source: TabSource) -> &'static str {
+        match source {
+            TabSource::Library => "library",
+            TabSource::Playlist(_) => "playlist",
+            TabSource::Artist(_) => "artist",
+            TabSource::Album(_) => "album",
+        }
+    }
+
+    fn sort_column_label(column: SortColumn) -> &'static str {
+        match column {
+            SortColumn::Index => "index",
+            SortColumn::Title => "title",
+            SortColumn::Artist => "artist",
+            SortColumn::AlbumByArtist => "album_by_artist",
+            SortColumn::Album => "album",
+            SortColumn::TrackNumber => "track_number",
+            SortColumn::Format => "format",
+            SortColumn::Bitrate => "bitrate",
+            SortColumn::FileSize => "file_size",
+            SortColumn::Year => "year",
+            SortColumn::DateAdded => "date_added",
+            SortColumn::Plays => "plays",
+            SortColumn::Duration => "duration",
+        }
+    }
+
+    fn sort_direction_label(direction: SortDirection) -> &'static str {
+        match direction {
+            SortDirection::Ascending => "ascending",
+            SortDirection::Descending => "descending",
+        }
     }
 
     pub(super) fn compute_scrollbar_markers(
@@ -319,6 +440,8 @@ impl TempoApp {
     }
 
     pub(super) fn set_search_query(&mut self, query: String) {
+        let start = Instant::now();
+        let query_len = query.len();
         self.search_debounce_generation = self.search_debounce_generation.wrapping_add(1);
         self.active_tab_mut().search_query = query.clone();
         self.search_input.set_text(query);
@@ -339,6 +462,15 @@ impl TempoApp {
         self.active_tab()
             .table_scroll_handle
             .scroll_to_item(0, ScrollStrategy::Top);
+        perf::log_duration(
+            "search.set_search_query",
+            start.elapsed(),
+            format!(
+                "query_len={query_len} results={} tracks={}",
+                self.current_track_indices().len(),
+                self.tracks.len()
+            ),
+        );
     }
 
     pub(super) fn clear_search_query(&mut self) {

@@ -4,6 +4,8 @@ use anyhow::{Context, Result, anyhow};
 use cpal::{Device, traits::DeviceTrait as _, traits::HostTrait as _};
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player};
 
+use crate::perf;
+
 #[derive(Clone, Debug)]
 pub struct PlaybackOutputDevice {
     pub name: String,
@@ -18,6 +20,10 @@ pub struct PlaybackController {
 
 impl PlaybackController {
     pub fn new(preferred_output: Option<&str>, volume: f32) -> Result<Self> {
+        let _span = perf::span(
+            "playback.new",
+            format!("preferred_output={}", preferred_output.unwrap_or("default")),
+        );
         let (device, output_name) = Self::open_output(preferred_output)?;
         let player = Player::connect_new(device.mixer());
         player.set_volume(volume);
@@ -30,6 +36,7 @@ impl PlaybackController {
     }
 
     pub fn output_devices() -> Vec<PlaybackOutputDevice> {
+        let _span = perf::span("playback.output_devices", "");
         let host = cpal::default_host();
         let default_output_id = host
             .default_output_device()
@@ -55,6 +62,7 @@ impl PlaybackController {
     }
 
     pub fn set_output(&mut self, output_name: &str, volume: f32) -> Result<()> {
+        let _span = perf::span("playback.set_output", format!("output={output_name}"));
         let (device, output_name) = Self::open_output(Some(output_name))?;
         let player = Player::connect_new(device.mixer());
         player.set_volume(volume);
@@ -67,6 +75,10 @@ impl PlaybackController {
     }
 
     fn open_output(preferred_output: Option<&str>) -> Result<(MixerDeviceSink, String)> {
+        let _span = perf::span(
+            "playback.open_output",
+            format!("preferred_output={}", preferred_output.unwrap_or("default")),
+        );
         let host = cpal::default_host();
         let outputs = host
             .output_devices()
@@ -99,6 +111,7 @@ impl PlaybackController {
     }
 
     pub fn play_path(&self, path: &Path) -> Result<()> {
+        let _span = perf::span("playback.play_path", format!("path={}", path.display()));
         let file =
             File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
         let source = Decoder::try_from(file)

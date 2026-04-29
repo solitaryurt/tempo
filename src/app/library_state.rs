@@ -1,4 +1,9 @@
 use super::*;
+use std::time::{Duration as StdDuration, Instant};
+
+const LIBRARY_EVENT_TICK: Duration = Duration::from_millis(100);
+const LIBRARY_EVENT_BUDGET: StdDuration = StdDuration::from_millis(12);
+const LIBRARY_EVENT_MAX_EVENTS: usize = 4;
 
 impl TempoApp {
     pub(super) fn default_library_roots(saved_roots: &[PathBuf]) -> Vec<PathBuf> {
@@ -41,6 +46,7 @@ impl TempoApp {
     }
 
     pub(super) fn save_app_state(&self) {
+        let _span = perf::slow_span("app_state.save", Duration::from_millis(4), "");
         let Some(path) = Self::app_state_path() else {
             return;
         };
@@ -139,19 +145,35 @@ impl TempoApp {
     }
 
     pub(super) fn restart_library_watcher(&mut self, cx: &mut Context<Self>) {
+        let _span = perf::span(
+            "library.restart_watcher",
+            format!("roots={}", self.library_roots.len()),
+        );
         if let Some(watcher) = self._library_watcher.take() {
-            watcher.stop();
+            perf::time("library.restart_watcher.stop_old", "", || watcher.stop());
         }
 
         self.stop_current_playback();
         self.library_root_label = Self::library_root_label(&self.library_roots);
-        self.tracks = Self::load_cached_tracks(self.catalog.as_ref(), &self.library_roots)
-            .unwrap_or_default();
-        self.reload_catalog_browse_data();
+        self.tracks = perf::time(
+            "library.restart_watcher.load_cached_tracks",
+            format!("roots={}", self.library_roots.len()),
+            || {
+                Self::load_cached_tracks(self.catalog.as_ref(), &self.library_roots)
+                    .unwrap_or_default()
+            },
+        );
+        perf::time("library.restart_watcher.reload_browse", "", || {
+            self.reload_catalog_browse_data()
+        });
         self.queue.clear();
         self.waveform_cache.clear();
         self.waveform_loading.clear();
-        self.invalidate_track_indices();
+        perf::time(
+            "library.restart_watcher.rebuild_indices",
+            format!("tracks={}", self.tracks.len()),
+            || self.invalidate_track_indices(),
+        );
         for tab in &mut self.tabs {
             tab.selected_track = 0;
         }
@@ -162,8 +184,11 @@ impl TempoApp {
         self.is_scanning = false;
 
         let (event_tx, event_rx) = mpsc::channel();
-        let (status, watcher) =
-            Self::start_watcher_for_roots(&self.library_roots, event_tx, self.catalog.clone());
+        let (status, watcher) = perf::time(
+            "library.restart_watcher.start_new",
+            format!("roots={}", self.library_roots.len()),
+            || Self::start_watcher_for_roots(&self.library_roots, event_tx, self.catalog.clone()),
+        );
         self.library_status = status;
         self._library_watcher = watcher;
         self.start_library_event_loop(event_rx, cx);
@@ -211,26 +236,59 @@ impl TempoApp {
     ) {
         cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(100))
-                    .await;
+                cx.background_executor().timer(LIBRARY_EVENT_TICK).await;
 
-                loop {
+                let drain_start = Instant::now();
+                let mut event_count = 0_usize;
+                let mut track_count = 0_usize;
+                let mut error_count = 0_usize;
+                let mut pending_tracks = Vec::new();
+                let mut pending_events = Vec::new();
+                while event_count < LIBRARY_EVENT_MAX_EVENTS
+                    && drain_start.elapsed() < LIBRARY_EVENT_BUDGET
+                {
                     match event_rx.try_recv() {
                         Ok(event) => {
-                            if this
-                                .update(cx, |app, cx| {
-                                    app.apply_library_event(event);
-                                    cx.notify();
-                                })
-                                .is_err()
-                            {
-                                return;
+                            event_count += 1;
+                            match event {
+                                LibraryEvent::TracksIndexed(tracks) => {
+                                    track_count += tracks.len();
+                                    pending_tracks.extend(tracks);
+                                }
+                                LibraryEvent::ScanError(error) => {
+                                    error_count += 1;
+                                    pending_events.push(LibraryEvent::ScanError(error));
+                                }
+                                event => pending_events.push(event),
                             }
                         }
                         Err(mpsc::TryRecvError::Empty) => break,
                         Err(mpsc::TryRecvError::Disconnected) => return,
                     }
+                }
+
+                if event_count > 0 {
+                    if !pending_tracks.is_empty() {
+                        pending_events.push(LibraryEvent::TracksIndexed(pending_tracks));
+                    }
+
+                    if this
+                        .update(cx, |app, cx| {
+                            for event in pending_events {
+                                app.apply_library_event(event);
+                            }
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+
+                    perf::log_duration(
+                        "library.event_drain",
+                        drain_start.elapsed(),
+                        format!("events={event_count} tracks={track_count} errors={error_count}"),
+                    );
                 }
             }
         })
@@ -241,6 +299,10 @@ impl TempoApp {
         catalog: Option<&CatalogStore>,
         roots: &[PathBuf],
     ) -> anyhow::Result<Vec<Track>> {
+        let _span = perf::span(
+            "library.load_cached_tracks",
+            format!("roots={}", roots.len()),
+        );
         let Some(catalog) = catalog else {
             return Ok(Vec::new());
         };
@@ -256,6 +318,10 @@ impl TempoApp {
         catalog: Option<&CatalogStore>,
         roots: &[PathBuf],
     ) -> anyhow::Result<Vec<Artist>> {
+        let _span = perf::span(
+            "library.load_cached_artists",
+            format!("roots={}", roots.len()),
+        );
         let Some(catalog) = catalog else {
             return Ok(Vec::new());
         };
@@ -271,6 +337,10 @@ impl TempoApp {
         catalog: Option<&CatalogStore>,
         roots: &[PathBuf],
     ) -> anyhow::Result<Vec<Album>> {
+        let _span = perf::span(
+            "library.load_cached_albums",
+            format!("roots={}", roots.len()),
+        );
         let Some(catalog) = catalog else {
             return Ok(Vec::new());
         };
@@ -283,6 +353,7 @@ impl TempoApp {
     }
 
     pub(super) fn reload_catalog_browse_data(&mut self) {
+        let _span = perf::span("library.reload_catalog_browse_data", "");
         if let Ok(artists) = Self::load_cached_artists(self.catalog.as_ref(), &self.library_roots) {
             self.artists = artists;
         }
@@ -294,17 +365,32 @@ impl TempoApp {
     pub(super) fn apply_library_event(&mut self, event: LibraryEvent) {
         match event {
             LibraryEvent::ScanStarted => {
+                perf::event(
+                    "scan.started",
+                    format!("roots={}", self.library_roots.len()),
+                );
                 self.context_menu_track = None;
                 self.scan_progress = ScanProgress::default();
                 self.scan_errors.clear();
+                self.scan_changed_tracks = false;
                 self.is_scanning = true;
                 self.library_status = format!("Scanning {}", self.library_root_label);
             }
             LibraryEvent::ScanProgress(progress) => {
+                perf::event(
+                    "scan.progress",
+                    format!(
+                        "discovered={} indexed={} errors={}",
+                        progress.discovered, progress.indexed, progress.errors
+                    ),
+                );
                 self.scan_progress = progress;
                 self.library_status = Self::scan_status(progress, self.is_scanning);
             }
             LibraryEvent::TracksIndexed(tracks) => {
+                let apply_start = Instant::now();
+                let indexed_count = tracks.len();
+                self.scan_changed_tracks = self.scan_changed_tracks || indexed_count > 0;
                 for track in tracks {
                     let track = Track::from(track);
                     if let Some(existing_ix) = self
@@ -326,15 +412,36 @@ impl TempoApp {
                     }
                 }
 
+                let rebuild_start = Instant::now();
                 self.invalidate_track_indices();
+                perf::log_duration_if_slow(
+                    "scan.tracks_indexed.rebuild_indices",
+                    rebuild_start.elapsed(),
+                    Duration::from_millis(4),
+                    format!("tracks={} tabs={}", self.tracks.len(), self.tabs.len()),
+                );
+                let clamp_start = Instant::now();
                 self.clamp_track_indices();
+                perf::log_duration_if_slow(
+                    "scan.tracks_indexed.clamp_indices",
+                    clamp_start.elapsed(),
+                    Duration::from_millis(4),
+                    format!("tracks={}", self.tracks.len()),
+                );
                 if self.scan_progress.indexed < self.tracks.len() {
                     self.scan_progress.indexed = self.tracks.len();
                 }
                 self.library_status = Self::scan_status(self.scan_progress, self.is_scanning);
+                perf::log_duration(
+                    "scan.tracks_indexed.apply",
+                    apply_start.elapsed(),
+                    format!("batch={indexed_count} total={}", self.tracks.len()),
+                );
             }
             LibraryEvent::TrackRemoved(path) => {
+                let remove_start = Instant::now();
                 if let Some(ix) = self.tracks.iter().position(|track| track.path == path) {
+                    self.scan_changed_tracks = true;
                     if let Some(catalog) = &self.catalog {
                         let _ = catalog.mark_file_removed(&path);
                     }
@@ -351,14 +458,25 @@ impl TempoApp {
                     self.clamp_track_indices();
                     self.library_status = Self::scan_status(self.scan_progress, self.is_scanning);
                 }
+                perf::log_duration(
+                    "scan.track_removed.apply",
+                    remove_start.elapsed(),
+                    format!("path={}", path.display()),
+                );
             }
             LibraryEvent::ScanError(error) => {
+                perf::event(
+                    "scan.error",
+                    format!("path={} message={}", error.path.display(), error.message),
+                );
                 self.scan_progress.errors += 1;
                 self.library_status = format!("Scan warning: {}", error.message);
                 self.scan_errors.push(error);
             }
             LibraryEvent::ScanFinished => {
-                if self.catalog.is_some()
+                let finish_start = Instant::now();
+                if self.scan_changed_tracks
+                    && self.catalog.is_some()
                     && let Ok(tracks) =
                         Self::load_cached_tracks(self.catalog.as_ref(), &self.library_roots)
                 {
@@ -367,10 +485,24 @@ impl TempoApp {
                     self.waveform_loading.clear();
                     self.invalidate_track_indices();
                 }
-                self.reload_catalog_browse_data();
+                if self.scan_changed_tracks {
+                    self.reload_catalog_browse_data();
+                }
                 self.clamp_track_indices();
                 self.is_scanning = false;
                 self.library_status = Self::scan_status(self.scan_progress, false);
+                perf::log_duration(
+                    "scan.finished.apply",
+                    finish_start.elapsed(),
+                    format!(
+                        "changed={} tracks={} artists={} albums={} errors={}",
+                        self.scan_changed_tracks,
+                        self.tracks.len(),
+                        self.artists.len(),
+                        self.albums.len(),
+                        self.scan_progress.errors
+                    ),
+                );
             }
         }
     }

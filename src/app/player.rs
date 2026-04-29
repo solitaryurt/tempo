@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Instant;
 
 impl TempoApp {
     fn render_marquee_text(
@@ -201,6 +202,7 @@ impl TempoApp {
     }
 
     pub(super) fn play_track_with_history(&mut self, track_ix: usize, record_history: bool) {
+        let start = Instant::now();
         let Some(track) = self.tracks.get(track_ix) else {
             return;
         };
@@ -217,11 +219,16 @@ impl TempoApp {
 
         match playback.play_path(&track_path) {
             Ok(()) => {
-                let plays = self
-                    .catalog
-                    .as_ref()
-                    .and_then(|catalog| catalog.increment_play_count(&track_path).ok())
-                    .unwrap_or_else(|| self.tracks[track_ix].plays.saturating_add(1));
+                let plays = perf::time(
+                    "player.increment_play_count",
+                    format!("path={}", track_path.display()),
+                    || {
+                        self.catalog
+                            .as_ref()
+                            .and_then(|catalog| catalog.increment_play_count(&track_path).ok())
+                            .unwrap_or_else(|| self.tracks[track_ix].plays.saturating_add(1))
+                    },
+                );
                 if let Some(track) = self.tracks.get_mut(track_ix) {
                     track.plays = plays;
                 }
@@ -236,6 +243,14 @@ impl TempoApp {
                 self.playback_status = format!("Playback failed: {error:#}");
             }
         }
+        perf::log_duration(
+            "player.play_track",
+            start.elapsed(),
+            format!(
+                "track_ix={track_ix} record_history={record_history} path={}",
+                track_path.display()
+            ),
+        );
     }
 
     pub(super) fn toggle_playback(&mut self) {
@@ -514,6 +529,7 @@ impl TempoApp {
         track_ix: usize,
         cx: &mut Context<Self>,
     ) -> (Vec<f32>, bool) {
+        let start = Instant::now();
         if self.waveform_cache.len() < self.tracks.len() {
             self.waveform_cache.resize_with(self.tracks.len(), || None);
         }
@@ -522,6 +538,12 @@ impl TempoApp {
         }
 
         if let Some(waveform) = self.waveform_cache[track_ix].as_ref() {
+            perf::log_duration_if_slow(
+                "player.cached_waveform.hit",
+                start.elapsed(),
+                Duration::from_millis(2),
+                format!("track_ix={track_ix} segments={}", waveform.len()),
+            );
             return (waveform.clone(), self.waveform_loading[track_ix]);
         }
 
@@ -531,6 +553,10 @@ impl TempoApp {
             self.waveform_loading[track_ix] = true;
             let expected_path = source.path.clone();
             let catalog = self.catalog.clone();
+            perf::event(
+                "player.waveform.request",
+                format!("track_ix={track_ix} path={}", expected_path.display()),
+            );
             cx.spawn(async move |this, cx| {
                 let waveform = cx
                     .background_executor()
@@ -543,7 +569,9 @@ impl TempoApp {
                         .get(track_ix)
                         .is_some_and(|track| track.path == expected_path)
                     {
-                        app.waveform_cache[track_ix] = Some(waveform);
+                        if track_ix < app.waveform_cache.len() {
+                            app.waveform_cache[track_ix] = Some(waveform);
+                        }
                         if track_ix < app.waveform_loading.len() {
                             app.waveform_loading[track_ix] = false;
                         }
@@ -564,15 +592,27 @@ impl TempoApp {
         track: &WaveformSource,
         catalog: Option<CatalogStore>,
     ) -> Vec<f32> {
+        let start = Instant::now();
         if let Some(catalog) = catalog.as_ref()
             && let Ok(Some(waveform)) =
                 catalog.load_waveform(&track.path, WAVEFORM_SEGMENTS, WAVEFORM_CACHE_VERSION)
         {
+            perf::log_duration(
+                "player.waveform.load_or_generate",
+                start.elapsed(),
+                format!("source=cache path={}", track.path.display()),
+            );
             return waveform;
         }
 
         let Some(waveform) = Self::decode_waveform(track) else {
-            return Self::generate_fallback_waveform(track);
+            let waveform = Self::generate_fallback_waveform(track);
+            perf::log_duration(
+                "player.waveform.load_or_generate",
+                start.elapsed(),
+                format!("source=fallback path={}", track.path.display()),
+            );
+            return waveform;
         };
 
         if let Some(catalog) = catalog.as_ref() {
@@ -584,11 +624,28 @@ impl TempoApp {
             );
         }
 
+        perf::log_duration(
+            "player.waveform.load_or_generate",
+            start.elapsed(),
+            format!("source=decode path={}", track.path.display()),
+        );
         waveform
     }
 
     pub(super) fn decode_waveform(track: &WaveformSource) -> Option<Vec<f32>> {
-        Self::decode_waveform_sampled(track).or_else(|| Self::decode_waveform_full(track))
+        let start = Instant::now();
+        let waveform =
+            Self::decode_waveform_sampled(track).or_else(|| Self::decode_waveform_full(track));
+        perf::log_duration(
+            "player.waveform.decode",
+            start.elapsed(),
+            format!(
+                "path={} success={}",
+                track.path.display(),
+                waveform.is_some()
+            ),
+        );
+        waveform
     }
 
     pub(super) fn decode_waveform_sampled(track: &WaveformSource) -> Option<Vec<f32>> {
@@ -1277,7 +1334,11 @@ impl TempoApp {
     ) -> impl IntoElement + use<> {
         let colors = *self.colors();
         let current_output = self.current_output_label();
-        let devices = PlaybackController::output_devices();
+        let devices = perf::time(
+            "player.output_devices_for_menu",
+            "",
+            PlaybackController::output_devices,
+        );
 
         self.menu_panel(260.0)
             .child(self.menu_header_with_subtitle("Audio Output", current_output.clone()))

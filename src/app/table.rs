@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Instant;
 
 const AUTOSIZE_TEXT_PADDING: f32 = 20.0;
 const AUTOSIZE_TEXT_CHAR_W: f32 = 7.2;
@@ -185,6 +186,10 @@ impl TempoApp {
         }
 
         self.active_tab_mut().table_horizontal_scroll = next;
+        perf::event(
+            "table.scroll.horizontal",
+            format!("delta={delta:.1} offset={next:.1} max={max_scroll:.1}"),
+        );
         true
     }
 
@@ -248,6 +253,14 @@ impl TempoApp {
         target: ColumnResizeTarget,
         event: &MouseDownEvent,
     ) {
+        perf::event(
+            "table.resize.begin",
+            format!(
+                "target={} width={:.1}",
+                Self::resize_target_label(target),
+                self.resize_target_width(target)
+            ),
+        );
         self.column_resize = Some(ColumnResize {
             target,
             start_x: f32::from(event.position.x),
@@ -272,7 +285,20 @@ impl TempoApp {
     }
 
     pub(super) fn finish_column_resize(&mut self) -> bool {
-        self.column_resize.take().is_some()
+        let resize = self.column_resize.take();
+        if let Some(resize) = resize {
+            perf::event(
+                "table.resize.finish",
+                format!(
+                    "target={} width={:.1}",
+                    Self::resize_target_label(resize.target),
+                    self.resize_target_width(resize.target)
+                ),
+            );
+            true
+        } else {
+            false
+        }
     }
 
     pub(super) fn autosize_table_column(&mut self, column: TableColumn) {
@@ -280,11 +306,18 @@ impl TempoApp {
     }
 
     pub(super) fn autosize_resize_target(&mut self, target: ColumnResizeTarget) {
+        let start = Instant::now();
         self.column_resize = None;
         self.set_resize_target_width(target, self.autosize_resize_target_width(target));
+        perf::log_duration(
+            "table.autosize_column",
+            start.elapsed(),
+            format!("target={}", Self::resize_target_label(target)),
+        );
     }
 
     pub(super) fn autosize_resize_target_width(&self, target: ColumnResizeTarget) -> f32 {
+        let start = Instant::now();
         match target {
             ColumnResizeTarget::Track(column) => self.autosize_table_column_width(column),
             ColumnResizeTarget::Artist(ArtistTableColumn::Artwork)
@@ -297,12 +330,23 @@ impl TempoApp {
                     .map(|text| Self::autosize_text_width(&text))
                     .fold(header_width, f32::max);
 
-                content_width + AUTOSIZE_TEXT_PADDING
+                let width = content_width + AUTOSIZE_TEXT_PADDING;
+                perf::log_duration_if_slow(
+                    "table.autosize_column_width",
+                    start.elapsed(),
+                    Duration::from_millis(4),
+                    format!(
+                        "target={} width={width:.1}",
+                        Self::resize_target_label(target)
+                    ),
+                );
+                width
             }
         }
     }
 
     pub(super) fn autosize_table_column_width(&self, column: TableColumn) -> f32 {
+        let start = Instant::now();
         match column {
             TableColumn::Artwork | TableColumn::Loved => return AUTOSIZE_ICON_COL_W,
             _ => {}
@@ -318,7 +362,18 @@ impl TempoApp {
             })
             .fold(header_width, f32::max);
 
-        content_width + AUTOSIZE_TEXT_PADDING
+        let width = content_width + AUTOSIZE_TEXT_PADDING;
+        perf::log_duration_if_slow(
+            "table.autosize_track_column_width",
+            start.elapsed(),
+            Duration::from_millis(4),
+            format!(
+                "column={} rows={} width={width:.1}",
+                Self::column_key(column),
+                self.current_track_indices().len()
+            ),
+        );
+        width
     }
 
     pub(super) fn table_column_text(
@@ -748,6 +803,10 @@ impl TempoApp {
             thumb_offset,
             start_offset,
         });
+        perf::event(
+            "table.scrollbar.vertical.begin",
+            format!("max_scroll={:.1}", metrics.max_scroll),
+        );
         self.scroll_table_to_scrollbar_y(event.position.y, thumb_offset);
         true
     }
@@ -766,7 +825,17 @@ impl TempoApp {
     }
 
     pub(super) fn finish_table_scrollbar_drag(&mut self) -> bool {
-        self.table_scrollbar_drag.take().is_some()
+        let finished = self.table_scrollbar_drag.take().is_some();
+        if finished {
+            perf::event(
+                "table.scrollbar.vertical.finish",
+                format!(
+                    "offset_y={:.1}",
+                    f32::from(self.table_scrollbar_base_handle().offset().y)
+                ),
+            );
+        }
+        finished
     }
 
     pub(super) fn begin_table_horizontal_scrollbar_drag(&mut self, event: &MouseDownEvent) -> bool {
@@ -786,6 +855,14 @@ impl TempoApp {
             thumb_offset,
             start_scroll: self.current_table_horizontal_scroll(),
         });
+        perf::event(
+            "table.scrollbar.horizontal.begin",
+            format!(
+                "offset={:.1} max_scroll={:.1}",
+                self.current_table_horizontal_scroll(),
+                metrics.max_scroll
+            ),
+        );
         self.scroll_table_to_horizontal_scrollbar_x(event.position.x, thumb_offset)
     }
 
@@ -803,7 +880,14 @@ impl TempoApp {
     }
 
     pub(super) fn finish_table_horizontal_scrollbar_drag(&mut self) -> bool {
-        self.table_horizontal_scrollbar_drag.take().is_some()
+        let finished = self.table_horizontal_scrollbar_drag.take().is_some();
+        if finished {
+            perf::event(
+                "table.scrollbar.horizontal.finish",
+                format!("offset={:.1}", self.current_table_horizontal_scroll()),
+            );
+        }
+        finished
     }
 
     pub(super) fn cancel_table_horizontal_scrollbar_drag(&mut self) -> bool {
@@ -841,6 +925,10 @@ impl TempoApp {
         }
 
         self.table_is_scrolling = true;
+        perf::event(
+            "table.scroll.begin",
+            format!("rows={}", self.current_track_indices().len()),
+        );
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -856,6 +944,7 @@ impl TempoApp {
                 let Ok(should_stop) = this.update(cx, |app, cx| {
                     if app.table_scroll_generation == generation && app.table_is_scrolling {
                         app.table_is_scrolling = false;
+                        perf::event("table.scroll.end", format!("generation={generation}"));
                         cx.notify();
                         true
                     } else {
@@ -1556,6 +1645,7 @@ impl TempoApp {
             .when(active, |this| this.child(icon))
             .when_some(sort_column, |this, sort_column| {
                 this.on_click(cx.listener(move |this, _, _, cx| {
+                    let sort_start = Instant::now();
                     let tab = this.active_tab_mut();
                     if column == TableColumn::Album {
                         (tab.sort_column, tab.sort_direction) =
@@ -1571,6 +1661,15 @@ impl TempoApp {
                     }
 
                     this.invalidate_track_indices();
+                    perf::log_duration(
+                        "table.sort_header_click",
+                        sort_start.elapsed(),
+                        format!(
+                            "column={} results={}",
+                            Self::column_key(column),
+                            this.current_track_indices().len()
+                        ),
+                    );
                     cx.notify();
                 }))
             })

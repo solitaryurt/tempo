@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
-    mem::size_of,
+    mem::{size_of, size_of_val},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -9,7 +9,10 @@ use std::{
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
-use crate::library::{Artwork, Track};
+use crate::{
+    library::{Artwork, Track},
+    perf,
+};
 
 const APP_DIR: &str = "tempo";
 
@@ -113,6 +116,7 @@ impl CatalogFileFingerprint {
 
 impl CatalogStore {
     pub fn open_default() -> Result<Self> {
+        let _span = perf::span("catalog.open_default", "");
         let data_dir = data_home().join(APP_DIR);
         let cache_dir = cache_home().join(APP_DIR);
         fs::create_dir_all(&data_dir).context("failed to create Tempo data directory")?;
@@ -122,7 +126,7 @@ impl CatalogStore {
             db_path: data_dir.join("tempo.sqlite"),
             cache_dir,
         };
-        store.migrate()?;
+        perf::time_result("catalog.migrate", "", || store.migrate())?;
         Ok(store)
     }
 
@@ -131,6 +135,11 @@ impl CatalogStore {
     }
 
     fn connect(&self) -> Result<Connection> {
+        let _span = perf::slow_span(
+            "catalog.connect",
+            Duration::from_millis(8),
+            format!("db={}", self.db_path.display()),
+        );
         let connection = Connection::open(&self.db_path)
             .with_context(|| format!("failed to open {}", self.db_path.display()))?;
         connection.execute_batch(
@@ -143,6 +152,7 @@ impl CatalogStore {
     }
 
     fn migrate(&self) -> Result<()> {
+        let _span = perf::span("catalog.migrate_inner", "");
         let connection = self.connect()?;
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS library_roots (
@@ -331,6 +341,7 @@ impl CatalogStore {
     }
 
     pub fn begin_scan(&self, roots: &[PathBuf]) -> Result<i64> {
+        let _span = perf::span("catalog.begin_scan", format!("roots={}", roots.len()));
         let mut connection = self.connect()?;
         let now = now_millis();
         let transaction = connection.transaction()?;
@@ -355,6 +366,10 @@ impl CatalogStore {
     }
 
     pub fn finish_scan(&self, scan_id: i64, roots: &[PathBuf]) -> Result<()> {
+        let _span = perf::span(
+            "catalog.finish_scan",
+            format!("scan_id={scan_id} roots={}", roots.len()),
+        );
         let mut connection = self.connect()?;
         let now = now_millis();
         let transaction = connection.transaction()?;
@@ -383,6 +398,11 @@ impl CatalogStore {
     }
 
     pub fn upsert_track(&self, track: &Track, scan_id: Option<i64>) -> Result<CatalogTrack> {
+        let _span = perf::slow_span(
+            "catalog.upsert_track",
+            Duration::from_millis(25),
+            format!("path={}", track.path.display()),
+        );
         let mut connection = self.connect()?;
         let transaction = connection.transaction()?;
         let now = now_millis();
@@ -552,6 +572,10 @@ impl CatalogStore {
     }
 
     pub fn mark_file_removed(&self, path: &Path) -> Result<()> {
+        let _span = perf::span(
+            "catalog.mark_file_removed",
+            format!("path={}", path.display()),
+        );
         let connection = self.connect()?;
         let now = now_millis();
         connection.execute(
@@ -569,6 +593,14 @@ impl CatalogStore {
         segments: usize,
         version: u32,
     ) -> Result<Option<Vec<f32>>> {
+        let _span = perf::slow_span(
+            "catalog.load_waveform",
+            Duration::from_millis(8),
+            format!(
+                "path={} segments={segments} version={version}",
+                path.display()
+            ),
+        );
         let Some(current_fingerprint) = CatalogFileFingerprint::from_path(path) else {
             return Ok(None);
         };
@@ -622,6 +654,14 @@ impl CatalogStore {
         version: u32,
         peaks: &[f32],
     ) -> Result<()> {
+        let _span = perf::slow_span(
+            "catalog.save_waveform",
+            Duration::from_millis(8),
+            format!(
+                "path={} segments={segments} version={version}",
+                path.display()
+            ),
+        );
         if peaks.len() != segments {
             return Ok(());
         }
@@ -676,6 +716,11 @@ impl CatalogStore {
         path: &Path,
         scan_id: Option<i64>,
     ) -> Result<Option<CatalogTrack>> {
+        let _span = perf::slow_span(
+            "catalog.cached_track_if_unchanged",
+            Duration::from_millis(8),
+            format!("path={}", path.display()),
+        );
         let Some(fingerprint) = CatalogFileFingerprint::from_path(path) else {
             return Ok(None);
         };
@@ -706,6 +751,7 @@ impl CatalogStore {
     }
 
     pub fn load_tracks(&self, roots: &[PathBuf]) -> Result<Vec<CatalogTrack>> {
+        let _span = perf::span("catalog.load_tracks", format!("roots={}", roots.len()));
         if roots.is_empty() {
             return Ok(Vec::new());
         }
@@ -752,10 +798,14 @@ impl CatalogStore {
             })
         })?;
 
-        let tracks = rows
+        let tracks: Vec<CatalogTrack> = rows
             .filter_map(|row| row.ok())
             .filter(|track| path_in_roots(&track.path, roots))
             .collect();
+        perf::event(
+            "catalog.load_tracks.count",
+            format!("tracks={}", tracks.len()),
+        );
         Ok(tracks)
     }
 
@@ -763,6 +813,10 @@ impl CatalogStore {
         &self,
         roots: &[PathBuf],
     ) -> Result<HashMap<PathBuf, (CatalogFileFingerprint, CatalogTrack)>> {
+        let _span = perf::span(
+            "catalog.load_track_fingerprints",
+            format!("roots={}", roots.len()),
+        );
         if roots.is_empty() {
             return Ok(HashMap::new());
         }
@@ -826,10 +880,18 @@ impl CatalogStore {
                 tracks.insert(path, (fingerprint, track));
             }
         }
+        perf::event(
+            "catalog.load_track_fingerprints.count",
+            format!("tracks={}", tracks.len()),
+        );
         Ok(tracks)
     }
 
     pub fn increment_play_count(&self, path: &Path) -> Result<u32> {
+        let _span = perf::span(
+            "catalog.increment_play_count",
+            format!("path={}", path.display()),
+        );
         let connection = self.connect()?;
         let now = now_millis();
         connection.execute(
@@ -857,6 +919,10 @@ impl CatalogStore {
     }
 
     pub fn mark_paths_seen(&self, scan_id: i64, paths: &[PathBuf]) -> Result<()> {
+        let _span = perf::span(
+            "catalog.mark_paths_seen",
+            format!("scan_id={scan_id} paths={}", paths.len()),
+        );
         if paths.is_empty() {
             return Ok(());
         }
@@ -1131,6 +1197,7 @@ impl CatalogStore {
     }
 
     pub fn load_artists(&self, roots: &[PathBuf]) -> Result<Vec<CatalogArtist>> {
+        let _span = perf::span("catalog.load_artists", format!("roots={}", roots.len()));
         if roots.is_empty() {
             return Ok(Vec::new());
         }
@@ -1228,10 +1295,15 @@ impl CatalogStore {
             })
             .collect::<Vec<_>>();
         artists.sort_by_key(|artist| artist.name.to_lowercase());
+        perf::event(
+            "catalog.load_artists.count",
+            format!("artists={}", artists.len()),
+        );
         Ok(artists)
     }
 
     pub fn load_albums(&self, roots: &[PathBuf]) -> Result<Vec<CatalogAlbum>> {
+        let _span = perf::span("catalog.load_albums", format!("roots={}", roots.len()));
         if roots.is_empty() {
             return Ok(Vec::new());
         }
@@ -1326,6 +1398,10 @@ impl CatalogStore {
                 .then(left.year.cmp(&right.year))
                 .then(left.title.to_lowercase().cmp(&right.title.to_lowercase()))
         });
+        perf::event(
+            "catalog.load_albums.count",
+            format!("albums={}", albums.len()),
+        );
         Ok(albums)
     }
 
@@ -1622,7 +1698,7 @@ fn path_in_roots(path: &Path, roots: &[PathBuf]) -> bool {
 }
 
 fn waveform_to_blob(peaks: &[f32]) -> Vec<u8> {
-    let mut blob = Vec::with_capacity(peaks.len() * size_of::<f32>());
+    let mut blob = Vec::with_capacity(size_of_val(peaks));
     for peak in peaks {
         blob.extend_from_slice(&peak.to_le_bytes());
     }

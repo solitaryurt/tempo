@@ -573,7 +573,7 @@ impl TempoApp {
             .py_2()
             .border_b_1()
             .border_color(rgb(colors.row_border))
-            .bg(rgb(if ix % 2 == 0 {
+            .bg(rgb(if ix.is_multiple_of(2) {
                 colors.row
             } else {
                 colors.surface

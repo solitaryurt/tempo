@@ -240,7 +240,7 @@ impl TempoApp {
         let active = track_ix.is_some_and(|track_ix| track_ix == self.playing_track);
         let bg = if active {
             colors.playing
-        } else if ix % 2 == 0 {
+        } else if ix.is_multiple_of(2) {
             colors.row
         } else {
             colors.surface

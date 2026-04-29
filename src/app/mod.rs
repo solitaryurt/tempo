@@ -25,6 +25,7 @@ use tempo::{
         Artwork as LibraryArtwork, IndexingError, LibraryEvent, LibraryIndexer, LibraryWatcher,
         ScanProgress,
     },
+    perf,
     playback::PlaybackController,
 };
 
@@ -858,6 +859,7 @@ pub(crate) struct TempoApp {
     volume_bar_scroll_handle: gpui::ScrollHandle,
     scan_progress: ScanProgress,
     scan_errors: Vec<IndexingError>,
+    scan_changed_tracks: bool,
     is_scanning: bool,
     table_scrollbar_drag: Option<TableScrollbarDrag>,
     table_horizontal_scrollbar_drag: Option<TableHorizontalScrollbarDrag>,
@@ -878,25 +880,60 @@ pub(crate) struct TempoApp {
 
 impl TempoApp {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let _startup_span = perf::span("startup.total", "");
         let focus_handle = cx.focus_handle();
         let search_focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
-        let state = Self::load_app_state();
-        let themes = bundled_themes();
-        let theme_id = resolve_theme_id(state.theme_id, &themes);
-        let roots = Self::default_library_roots(&state.library_roots);
+        let state = perf::time("startup.load_app_state", "", Self::load_app_state);
+        let themes = perf::time("startup.load_themes", "", bundled_themes);
+        let theme_id = perf::time("startup.resolve_theme", "", || {
+            resolve_theme_id(state.theme_id, &themes)
+        });
+        let roots = perf::time("startup.default_roots", "", || {
+            Self::default_library_roots(&state.library_roots)
+        });
         let library_root_label = Self::library_root_label(&roots);
-        let (catalog, catalog_status) = match CatalogStore::open_default() {
+        let (catalog, catalog_status) = match perf::time_result(
+            "startup.catalog_open_default",
+            "",
+            CatalogStore::open_default,
+        ) {
             Ok(catalog) => (Some(catalog), None),
             Err(error) => (None, Some(format!("Catalog cache unavailable: {error:#}"))),
         };
-        let cached_tracks = Self::load_cached_tracks(catalog.as_ref(), &roots).unwrap_or_default();
-        let cached_artists =
-            Self::load_cached_artists(catalog.as_ref(), &roots).unwrap_or_default();
-        let cached_albums = Self::load_cached_albums(catalog.as_ref(), &roots).unwrap_or_default();
+        let cached_tracks = perf::time(
+            "startup.cached_tracks",
+            format!("roots={}", roots.len()),
+            || Self::load_cached_tracks(catalog.as_ref(), &roots).unwrap_or_default(),
+        );
+        perf::event(
+            "startup.cached_tracks.count",
+            format!("tracks={}", cached_tracks.len()),
+        );
+        let cached_artists = perf::time(
+            "startup.cached_artists",
+            format!("roots={}", roots.len()),
+            || Self::load_cached_artists(catalog.as_ref(), &roots).unwrap_or_default(),
+        );
+        perf::event(
+            "startup.cached_artists.count",
+            format!("artists={}", cached_artists.len()),
+        );
+        let cached_albums = perf::time(
+            "startup.cached_albums",
+            format!("roots={}", roots.len()),
+            || Self::load_cached_albums(catalog.as_ref(), &roots).unwrap_or_default(),
+        );
+        perf::event(
+            "startup.cached_albums.count",
+            format!("albums={}", cached_albums.len()),
+        );
         let (event_tx, event_rx) = mpsc::channel();
-        let (mut library_status, library_watcher) =
-            Self::start_watcher_for_roots(&roots, event_tx, catalog.clone());
+        let (mut library_status, library_watcher) = perf::time(
+            "startup.start_watcher",
+            format!("roots={}", roots.len()),
+            || Self::start_watcher_for_roots(&roots, event_tx, catalog.clone()),
+        );
         if let Some(catalog_status) = catalog_status {
             library_status = catalog_status;
         }
@@ -904,7 +941,9 @@ impl TempoApp {
         let volume = state.volume.clamp(0.0, 1.0);
         let visible_columns = Self::sanitize_visible_columns(state.visible_table_columns);
         let (playback, playback_status) =
-            match PlaybackController::new(state.output_device.as_deref(), volume) {
+            match perf::time_result("startup.playback_init", "", || {
+                PlaybackController::new(state.output_device.as_deref(), volume)
+            }) {
                 Ok(playback) => (Some(playback), "Audio output ready".to_string()),
                 Err(error) => (None, format!("Playback unavailable: {error:#}")),
             };
@@ -938,7 +977,8 @@ impl TempoApp {
         let album_grid_scroll_top = state.album_grid_scroll_top;
         let album_table_scroll_top = state.album_table_scroll_top;
         let save_on_quit = cx.on_app_quit(|app, _cx| {
-            app.save_app_state();
+            perf::event("shutdown.app_quit", "saving_state");
+            perf::time("shutdown.save_app_state", "", || app.save_app_state());
             async {}
         });
 
@@ -1005,6 +1045,7 @@ impl TempoApp {
             volume_bar_scroll_handle: gpui::ScrollHandle::new(),
             scan_progress: ScanProgress::default(),
             scan_errors: Vec::new(),
+            scan_changed_tracks: false,
             is_scanning: false,
             table_scrollbar_drag: None,
             table_horizontal_scrollbar_drag: None,
@@ -1045,10 +1086,20 @@ impl TempoApp {
             .base_handle
             .set_offset(point(px(0.0), px(-album_table_scroll_top.max(0.0))));
 
-        app.invalidate_track_indices();
-        app.clamp_track_indices();
-        app.start_library_event_loop(event_rx, cx);
-        app.start_playback_tick(cx);
+        perf::time(
+            "startup.initial_index_rebuild",
+            format!("tracks={} tabs={}", app.tracks.len(), app.tabs.len()),
+            || app.invalidate_track_indices(),
+        );
+        perf::time("startup.clamp_track_indices", "", || {
+            app.clamp_track_indices()
+        });
+        perf::time("startup.start_library_event_loop", "", || {
+            app.start_library_event_loop(event_rx, cx)
+        });
+        perf::time("startup.start_playback_tick", "", || {
+            app.start_playback_tick(cx)
+        });
         app
     }
 
