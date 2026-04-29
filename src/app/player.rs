@@ -529,6 +529,7 @@ impl TempoApp {
         } else {
             (playback_position.as_secs_f32() / track.duration_value.as_secs_f32()).clamp(0.0, 1.0)
         };
+        let now_playing_active_color = colors.accent_soft;
 
         div()
             .h(px(86.0))
@@ -544,7 +545,11 @@ impl TempoApp {
                 div()
                     .id("now-playing-album-link")
                     .cursor_pointer()
-                    .child(self.album_tile(track, 54.0))
+                    .child(self.album_tile_with_hover_border(
+                        track,
+                        54.0,
+                        Some(now_playing_active_color),
+                    ))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.open_album_tab_for_track(playing_track_ix);
                         cx.notify();
@@ -562,7 +567,7 @@ impl TempoApp {
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(rgb(colors.text_strong))
                             .cursor_pointer()
-                            .hover(move |this| this.text_color(rgb(colors.accent_soft)))
+                            .hover(move |this| this.text_color(rgb(now_playing_active_color)))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.select_track_in_all_music(playing_track_ix);
                                 cx.notify();
@@ -582,7 +587,9 @@ impl TempoApp {
                                     .overflow_hidden()
                                     .text_ellipsis()
                                     .cursor_pointer()
-                                    .hover(move |this| this.text_color(rgb(colors.accent_soft)))
+                                    .hover(move |this| {
+                                        this.text_color(rgb(now_playing_active_color))
+                                    })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.open_artist_tab_for_track(playing_track_ix);
                                         cx.notify();
@@ -653,7 +660,7 @@ impl TempoApp {
                                             .rounded_full()
                                             .bg(rgb(colors.text)),
                                     ),
-                            )
+                            ),
                     ),
             )
             .into_any_element()
@@ -862,12 +869,13 @@ impl TempoApp {
                         cx.notify();
                     })),
             )
-            .child(self.transport_button("↻", false, false).on_click(cx.listener(
-                |this, _, _, cx| {
-                    this.play_random_track();
-                    cx.notify();
-                },
-            )))
+            .child(
+                self.transport_button("↻", false, false)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.play_random_track();
+                        cx.notify();
+                    })),
+            )
     }
 
     pub(super) fn transport_button(

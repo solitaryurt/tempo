@@ -2,36 +2,49 @@ use super::*;
 
 impl TempoApp {
     pub(super) fn album_tile(&self, track: &Track, size: f32) -> AnyElement {
+        self.album_tile_with_hover_border(track, size, None)
+    }
+
+    pub(super) fn album_tile_with_hover_border(
+        &self,
+        track: &Track,
+        size: f32,
+        hover_border: Option<u32>,
+    ) -> AnyElement {
         let initials = track.album_initials.clone();
         let color = track.album_color;
         let fallback_initials = initials.clone();
         let colors = *self.colors();
-
-        div()
+        let mut tile = div()
             .w(px(size))
             .h(px(size))
             .rounded_sm()
             .border_1()
             .border_color(rgb(colors.border_strong))
-            .overflow_hidden()
-            .child(match &track.artwork {
-                Some(TrackArtwork::Embedded(image)) => img(image.clone())
-                    .size_full()
-                    .object_fit(ObjectFit::Cover)
-                    .with_fallback(move || {
-                        Self::album_tile_fallback(fallback_initials.clone(), color, colors)
-                    })
-                    .into_any_element(),
-                Some(TrackArtwork::File(path)) => img(path.clone())
-                    .size_full()
-                    .object_fit(ObjectFit::Cover)
-                    .with_fallback(move || {
-                        Self::album_tile_fallback(fallback_initials.clone(), color, colors)
-                    })
-                    .into_any_element(),
-                None => Self::album_tile_fallback(initials, color, colors),
-            })
-            .into_any_element()
+            .overflow_hidden();
+
+        if let Some(hover_border) = hover_border {
+            tile = tile.hover(move |this| this.border_color(rgb(hover_border)));
+        }
+
+        tile.child(match &track.artwork {
+            Some(TrackArtwork::Embedded(image)) => img(image.clone())
+                .size_full()
+                .object_fit(ObjectFit::Cover)
+                .with_fallback(move || {
+                    Self::album_tile_fallback(fallback_initials.clone(), color, colors)
+                })
+                .into_any_element(),
+            Some(TrackArtwork::File(path)) => img(path.clone())
+                .size_full()
+                .object_fit(ObjectFit::Cover)
+                .with_fallback(move || {
+                    Self::album_tile_fallback(fallback_initials.clone(), color, colors)
+                })
+                .into_any_element(),
+            None => Self::album_tile_fallback(initials, color, colors),
+        })
+        .into_any_element()
     }
 
     pub(super) fn album_tile_placeholder(&self, track: &Track, size: f32) -> AnyElement {
