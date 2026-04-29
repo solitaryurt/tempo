@@ -70,6 +70,10 @@ impl TempoApp {
             album_grid_scroll_top: Self::uniform_list_scroll_top(&self.album_grid_scroll_handle),
             album_table_scroll_top: Self::uniform_list_scroll_top(&self.album_table_scroll_handle),
             playback_history: self.playback_history.clone(),
+            playing_track_path: self
+                .tracks
+                .get(self.playing_track)
+                .map(|track| track.path.clone()),
         };
 
         let Some(parent) = path.parent() else {

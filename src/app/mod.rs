@@ -663,6 +663,11 @@ struct AppState {
     album_table_scroll_top: f32,
     #[serde(default)]
     playback_history: Vec<PlaybackHistoryEntry>,
+    /// Path of the track that was last shown in the now-playing area.
+    /// Stored as a path (rather than an index) so the now-playing display
+    /// stays correct after the library is rescanned and indices shift.
+    #[serde(default)]
+    playing_track_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -702,6 +707,7 @@ impl Default for AppState {
             album_grid_scroll_top: 0.0,
             album_table_scroll_top: 0.0,
             playback_history: Vec::new(),
+            playing_track_path: None,
         }
     }
 }
@@ -940,6 +946,26 @@ impl TempoApp {
         } else {
             state.page
         };
+        // Resolve the now-playing track index by path so a rescanned library
+        // (which can shift indices) still highlights the correct row in the
+        // bottom-left now-playing area. Falls back to the most recent
+        // playback-history entry, then to the first track.
+        let initial_playing_track = state
+            .playing_track_path
+            .as_deref()
+            .and_then(|saved_path| {
+                cached_tracks
+                    .iter()
+                    .position(|track| track.path == saved_path)
+            })
+            .or_else(|| {
+                state.playback_history.last().and_then(|entry| {
+                    cached_tracks
+                        .iter()
+                        .position(|track| track.path == entry.track_path)
+                })
+            })
+            .unwrap_or(0);
         let mut tabs = Self::restore_tabs(&state.tabs);
         if tabs.is_empty() {
             tabs.push(BrowseTab::library(1));
@@ -995,7 +1021,7 @@ impl TempoApp {
             alt_pressed: false,
             tooltip: None,
             tooltip_generation: 0,
-            playing_track: 0,
+            playing_track: initial_playing_track,
             is_playing: false,
             playback_mode: PlaybackMode::Straight,
             context_menu_track: None,

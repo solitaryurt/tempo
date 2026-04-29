@@ -364,7 +364,7 @@ impl<'a> Cursor<'a> {
         }
         let bytes = &self.bytes[self.position..end];
         self.position = end;
-        Ok(String::from_utf8(bytes.to_vec()).context("invalid utf-8 in snapshot")?)
+        String::from_utf8(bytes.to_vec()).context("invalid utf-8 in snapshot")
     }
 
     fn read_opt_string(&mut self) -> Result<Option<String>> {
