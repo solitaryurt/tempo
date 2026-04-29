@@ -203,6 +203,10 @@ impl TempoApp {
             let x = f32::from(delta.x);
             let y = f32::from(delta.y);
             let scroll_delta = if x.abs() > y.abs() { x } else { y };
+            perf::event(
+                "table.scroll.wheel",
+                format!("axis=horizontal dx={x:.1} dy={y:.1} applied={scroll_delta:.1}"),
+            );
 
             if self.scroll_table_horizontally(scroll_delta) {
                 cx.stop_propagation();
@@ -211,6 +215,16 @@ impl TempoApp {
             return;
         }
 
+        let delta = event.delta.pixel_delta(px(TABLE_ROW_H));
+        perf::event(
+            "table.scroll.wheel",
+            format!(
+                "axis=vertical dx={:.1} dy={:.1} rows={}",
+                f32::from(delta.x),
+                f32::from(delta.y),
+                self.current_track_indices().len()
+            ),
+        );
         self.mark_table_scrolling(cx);
     }
 
@@ -1137,6 +1151,17 @@ impl TempoApp {
                                 "track-table-rows",
                                 item_count,
                                 cx.processor(move |this, range: Range<usize>, _window, cx| {
+                                    let visible_count = range.end.saturating_sub(range.start);
+                                    let _build_span = perf::span(
+                                        "table.uniform_list.build",
+                                        format!(
+                                            "rows={} range={}..{} scrolling={}",
+                                            visible_count,
+                                            range.start,
+                                            range.end,
+                                            this.table_is_scrolling
+                                        ),
+                                    );
                                     range
                                         .enumerate()
                                         .filter_map(|(visible_row_ix, row_ix)| {
@@ -1320,65 +1345,11 @@ impl TempoApp {
         if item_count == 0 {
             return div().into_any_element();
         }
-        let colors = *self.colors();
 
         let metrics = self.table_scrollbar_metrics();
-        let thumb_top = metrics.map_or(0.0, |metrics| metrics.thumb_top);
-        let thumb_height =
-            metrics.map_or(TABLE_SCROLLBAR_MIN_THUMB_H, |metrics| metrics.thumb_height);
-        let track_height = metrics.map_or(0.0, |metrics| metrics.track_height);
-        let scrollable = metrics.is_some_and(|metrics| metrics.max_scroll > 0.0);
         let current_label = metrics.and_then(|metrics| self.current_scrollbar_label(metrics));
-        let max_markers = if track_height > 0.0 {
-            ((track_height / 16.0).floor() as usize).clamp(2, TABLE_SCROLLBAR_MAX_MARKERS)
-        } else {
-            0
-        };
-        let marker_stride = self
-            .active_tab()
-            .scrollbar_markers
-            .len()
-            .saturating_add(max_markers.saturating_sub(1))
-            / max_markers.max(1);
-        let marker_stride = marker_stride.max(1);
-        let markers = self
-            .active_tab()
-            .scrollbar_markers
-            .iter()
-            .enumerate()
-            .filter_map(|(ix, marker)| {
-                if ix % marker_stride != 0 {
-                    return None;
-                }
-
-                let top = TABLE_SCROLLBAR_MARGIN + marker.ratio.clamp(0.0, 1.0) * track_height;
-                Some(
-                    div()
-                        .absolute()
-                        .top(px((top - 7.0).max(TABLE_SCROLLBAR_MARGIN)))
-                        .right(px(14.0))
-                        .w(px(30.0))
-                        .h(px(14.0))
-                        .flex()
-                        .items_center()
-                        .justify_end()
-                        .text_xs()
-                        .text_color(rgb(colors.text_faint))
-                        .child(marker.label.clone())
-                        .into_any_element(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let current_label_top = (TABLE_SCROLLBAR_MARGIN + thumb_top + thumb_height / 2.0 - 9.0)
-            .clamp(
-                TABLE_SCROLLBAR_MARGIN,
-                (track_height - 18.0).max(TABLE_SCROLLBAR_MARGIN),
-            );
-        let hints_opacity = if self.table_scrollbar_drag.is_some() {
-            1.0
-        } else {
-            0.0
-        };
+        let markers = self.active_tab().scrollbar_markers.clone();
+        let is_dragging = self.table_scrollbar_drag.is_some();
 
         div()
             .id("table-scrollbar")
@@ -1413,6 +1384,81 @@ impl TempoApp {
                     }
                 }),
             )
+            .child(self.render_marker_scrollbar_inner(
+                metrics,
+                &markers,
+                current_label,
+                is_dragging,
+            ))
+            .into_any_element()
+    }
+
+    /// Render the marker rail + current-position label tooltip + thumb track
+    /// shared between the tracks table and the browse pages. Callers wrap
+    /// this in their own outer interactive `div` with the appropriate
+    /// `on_mouse_*` listeners and id, so the helper itself doesn't need to
+    /// know which scrollbar drag state to consult.
+    pub(super) fn render_marker_scrollbar_inner(
+        &self,
+        metrics: Option<TableScrollbarMetrics>,
+        markers: &[ScrollbarMarker],
+        current_label: Option<String>,
+        is_dragging: bool,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let thumb_top = metrics.map_or(0.0, |metrics| metrics.thumb_top);
+        let thumb_height =
+            metrics.map_or(TABLE_SCROLLBAR_MIN_THUMB_H, |metrics| metrics.thumb_height);
+        let track_height = metrics.map_or(0.0, |metrics| metrics.track_height);
+        let scrollable = metrics.is_some_and(|metrics| metrics.max_scroll > 0.0);
+
+        let max_markers = if track_height > 0.0 {
+            ((track_height / 16.0).floor() as usize).clamp(2, TABLE_SCROLLBAR_MAX_MARKERS)
+        } else {
+            0
+        };
+        let marker_stride =
+            markers.len().saturating_add(max_markers.saturating_sub(1)) / max_markers.max(1);
+        let marker_stride = marker_stride.max(1);
+        let marker_elements = markers
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, marker)| {
+                if ix % marker_stride != 0 {
+                    return None;
+                }
+
+                let top = TABLE_SCROLLBAR_MARGIN + marker.ratio.clamp(0.0, 1.0) * track_height;
+                Some(
+                    div()
+                        .absolute()
+                        .top(px((top - 7.0).max(TABLE_SCROLLBAR_MARGIN)))
+                        .right(px(14.0))
+                        .w(px(30.0))
+                        .h(px(14.0))
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .text_xs()
+                        .text_color(rgb(colors.text_faint))
+                        .child(marker.label.clone())
+                        .into_any_element(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let current_label_top = (TABLE_SCROLLBAR_MARGIN + thumb_top + thumb_height / 2.0 - 9.0)
+            .clamp(
+                TABLE_SCROLLBAR_MARGIN,
+                (track_height - 18.0).max(TABLE_SCROLLBAR_MARGIN),
+            );
+        let hints_opacity = if is_dragging { 1.0 } else { 0.0 };
+
+        div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .w(px(TABLE_SCROLLBAR_W))
             .child(
                 div()
                     .absolute()
@@ -1422,7 +1468,7 @@ impl TempoApp {
                     .w(px(TABLE_SCROLLBAR_W))
                     .opacity(hints_opacity)
                     .hover(|this| this.opacity(1.0))
-                    .children(markers)
+                    .children(marker_elements)
                     .when(scrollable, |this| {
                         this.when_some(current_label, |this, label| {
                             this.child(
@@ -1466,7 +1512,7 @@ impl TempoApp {
                             .right(px(1.0))
                             .h(px(thumb_height))
                             .rounded_full()
-                            .bg(rgb(if self.table_scrollbar_drag.is_some() {
+                            .bg(rgb(if is_dragging {
                                 colors.text
                             } else {
                                 colors.text_faint

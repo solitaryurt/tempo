@@ -531,6 +531,7 @@ enum BrowseScrollbarTarget {
     ArtistsTable,
     AlbumsGrid,
     AlbumsTable,
+    PlaybackHistory,
 }
 
 #[derive(Clone, Copy)]
@@ -1754,6 +1755,18 @@ fn format_duration(duration: Duration) -> String {
 
 impl Render for TempoApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Per-frame top-level span. During scrolling this fires every frame
+        // (~16 ms target at 60Hz). Wide gaps between frames or unusually
+        // long render durations are the usual smoking gun for jank.
+        let _frame_span = perf::span(
+            "render.frame",
+            format!(
+                "page={} tab_kind={} scrolling={}",
+                Self::page_label(self.page),
+                Self::tab_kind_label(self.tabs.get(self.active_tab)),
+                self.table_is_scrolling
+            ),
+        );
         let colors = self.colors();
 
         div()
@@ -1827,6 +1840,27 @@ impl Render for TempoApp {
 }
 
 impl TempoApp {
+    fn page_label(page: Page) -> &'static str {
+        match page {
+            Page::Library => "library",
+            Page::Artists => "artists",
+            Page::Albums => "albums",
+            Page::PlaybackHistory => "playback_history",
+            Page::ScanErrors => "scan_errors",
+            Page::Settings => "settings",
+        }
+    }
+
+    fn tab_kind_label(tab: Option<&BrowseTab>) -> &'static str {
+        match tab.map(|tab| tab.source) {
+            Some(TabSource::Library) => "library",
+            Some(TabSource::Playlist(_)) => "playlist",
+            Some(TabSource::Artist(_)) => "artist",
+            Some(TabSource::Album(_)) => "album",
+            None => "none",
+        }
+    }
+
     fn play_selected(&mut self, _: &PlaySelected, window: &mut Window, cx: &mut Context<Self>) {
         if self.search_focus_handle.is_focused(window) {
             return;

@@ -43,6 +43,9 @@ impl TempoApp {
             .flex()
             .flex_col()
             .child(self.render_simple_page_header("Playback History", subtitle))
+            .when(self.tabs.len() > 1, |this| {
+                this.child(self.render_tab_bar(cx))
+            })
             .child(
                 div()
                     .id("playback-history-scroll")
@@ -82,28 +85,48 @@ impl TempoApp {
                 )
             })
             .when(!self.playback_history.is_empty(), |this| {
+                let scrollbar = self.render_browse_scrollbar(
+                    BrowseScrollbarTarget::PlaybackHistory,
+                    item_count,
+                    cx,
+                );
                 this.child(
-                    uniform_list(
-                        "playback-history-rows",
-                        item_count,
-                        cx.processor(move |this, range: Range<usize>, _window, cx| {
-                            range
-                                .filter_map(|row_ix| {
-                                    let history_ix = ordered_indices.get(row_ix).copied()?;
-                                    let entry = this.playback_history.get(history_ix)?;
-                                    Some(
-                                        this.render_playback_history_row(
-                                            row_ix, history_ix, entry, cx,
-                                        )
-                                        .into_any_element(),
-                                    )
-                                })
-                                .collect()
-                        }),
-                    )
-                    .flex_1()
-                    .min_h_0()
-                    .track_scroll(scroll_handle),
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .relative()
+                        .child(
+                            uniform_list(
+                                "playback-history-rows",
+                                item_count,
+                                cx.processor(move |this, range: Range<usize>, _window, cx| {
+                                    let visible = range.end.saturating_sub(range.start);
+                                    let _build_span = perf::span(
+                                        "history.uniform_list.build",
+                                        format!(
+                                            "rows={} range={}..{}",
+                                            visible, range.start, range.end
+                                        ),
+                                    );
+                                    range
+                                        .filter_map(|row_ix| {
+                                            let history_ix =
+                                                ordered_indices.get(row_ix).copied()?;
+                                            let entry = this.playback_history.get(history_ix)?;
+                                            Some(
+                                                this.render_playback_history_row(
+                                                    row_ix, history_ix, entry, cx,
+                                                )
+                                                .into_any_element(),
+                                            )
+                                        })
+                                        .collect()
+                                }),
+                            )
+                            .size_full()
+                            .track_scroll(scroll_handle),
+                        )
+                        .child(scrollbar),
                 )
             })
     }
@@ -384,7 +407,7 @@ impl TempoApp {
         }
     }
 
-    fn sorted_playback_history_indices(&self) -> Vec<usize> {
+    pub(super) fn sorted_playback_history_indices(&self) -> Vec<usize> {
         let mut indices = (0..self.playback_history.len()).collect::<Vec<_>>();
         indices.sort_by(|left, right| {
             self.playback_history[*right]

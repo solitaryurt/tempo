@@ -211,6 +211,9 @@ impl TempoApp {
                 self.artist_view_mode,
                 cx,
             ))
+            .when(self.tabs.len() > 1, |this| {
+                this.child(self.render_tab_bar(cx))
+            })
             .child(match self.artist_view_mode {
                 BrowseViewMode::Grid => self.render_artist_grid(grid_columns, artist_indices, cx),
                 BrowseViewMode::Table => self.render_artist_table(artist_indices, cx),
@@ -249,6 +252,9 @@ impl TempoApp {
             .flex()
             .flex_col()
             .child(self.render_browse_header(window, "Albums", subtitle, self.album_view_mode, cx))
+            .when(self.tabs.len() > 1, |this| {
+                this.child(self.render_tab_bar(cx))
+            })
             .child(match self.album_view_mode {
                 BrowseViewMode::Grid => self.render_album_grid(grid_columns, album_indices, cx),
                 BrowseViewMode::Table => self.render_album_table(album_indices, cx),
@@ -396,6 +402,18 @@ impl TempoApp {
                     list_id,
                     row_count,
                     cx.processor(move |this, range: Range<usize>, _window, cx| {
+                        let visible = range.end.saturating_sub(range.start);
+                        let _build_span = perf::span(
+                            "browse.uniform_list.build",
+                            format!(
+                                "target={} rows={} range={}..{} columns={}",
+                                Self::browse_scrollbar_target_id(target),
+                                visible,
+                                range.start,
+                                range.end,
+                                columns
+                            ),
+                        );
                         let item_indices = item_indices.clone();
                         range
                             .map(|row_ix| render_row(this, row_ix, columns, &item_indices, cx))
@@ -596,6 +614,17 @@ impl TempoApp {
                                 list_id,
                                 row_count,
                                 cx.processor(move |this, range: Range<usize>, _window, cx| {
+                                    let visible = range.end.saturating_sub(range.start);
+                                    let _build_span = perf::span(
+                                        "browse.uniform_list.build",
+                                        format!(
+                                            "target={} rows={} range={}..{} mode=table",
+                                            Self::browse_scrollbar_target_id(target),
+                                            visible,
+                                            range.start,
+                                            range.end
+                                        ),
+                                    );
                                     let row_indices = row_indices.clone();
                                     range
                                         .filter_map(|row_ix| {
@@ -614,12 +643,16 @@ impl TempoApp {
             .into_any_element()
     }
 
-    fn browse_scroll_handle(&self, target: BrowseScrollbarTarget) -> UniformListScrollHandle {
+    pub(super) fn browse_scroll_handle(
+        &self,
+        target: BrowseScrollbarTarget,
+    ) -> UniformListScrollHandle {
         match target {
             BrowseScrollbarTarget::ArtistsGrid => self.artist_grid_scroll_handle.clone(),
             BrowseScrollbarTarget::ArtistsTable => self.artist_table_scroll_handle.clone(),
             BrowseScrollbarTarget::AlbumsGrid => self.album_grid_scroll_handle.clone(),
             BrowseScrollbarTarget::AlbumsTable => self.album_table_scroll_handle.clone(),
+            BrowseScrollbarTarget::PlaybackHistory => self.playback_history_scroll_handle.clone(),
         }
     }
 
@@ -783,7 +816,7 @@ impl TempoApp {
         true
     }
 
-    fn render_browse_scrollbar(
+    pub(super) fn render_browse_scrollbar(
         &self,
         target: BrowseScrollbarTarget,
         item_count: usize,
@@ -793,12 +826,10 @@ impl TempoApp {
             return div().into_any_element();
         }
 
-        let colors = *self.colors();
         let metrics = self.browse_scrollbar_metrics(target);
-        let thumb_top = metrics.map_or(0.0, |metrics| metrics.thumb_top);
-        let thumb_height =
-            metrics.map_or(TABLE_SCROLLBAR_MIN_THUMB_H, |metrics| metrics.thumb_height);
-        let scrollable = metrics.is_some_and(|metrics| metrics.max_scroll > 0.0);
+        let markers = self.browse_scrollbar_markers(target);
+        let current_label = metrics
+            .and_then(|metrics| self.current_browse_scrollbar_label(target, metrics, &markers));
         let is_dragging = self
             .browse_scrollbar_drag
             .is_some_and(|drag| drag.target == target);
@@ -841,40 +872,22 @@ impl TempoApp {
                     }
                 }),
             )
-            .child(
-                div()
-                    .absolute()
-                    .top(px(TABLE_SCROLLBAR_MARGIN))
-                    .right(px(4.0))
-                    .bottom(px(TABLE_SCROLLBAR_MARGIN))
-                    .w(px(TABLE_SCROLLBAR_TRACK_W))
-                    .rounded_full()
-                    .bg(rgb(colors.elevated))
-                    .opacity(if scrollable { 0.95 } else { 0.0 })
-                    .child(
-                        div()
-                            .absolute()
-                            .top(px(thumb_top))
-                            .left(px(1.0))
-                            .right(px(1.0))
-                            .h(px(thumb_height))
-                            .rounded_full()
-                            .bg(rgb(if is_dragging {
-                                colors.text
-                            } else {
-                                colors.text_faint
-                            })),
-                    ),
-            )
+            .child(self.render_marker_scrollbar_inner(
+                metrics,
+                &markers,
+                current_label,
+                is_dragging,
+            ))
             .into_any_element()
     }
 
-    fn browse_scrollbar_target_id(target: BrowseScrollbarTarget) -> &'static str {
+    pub(super) fn browse_scrollbar_target_id(target: BrowseScrollbarTarget) -> &'static str {
         match target {
             BrowseScrollbarTarget::ArtistsGrid => "artists-grid",
             BrowseScrollbarTarget::ArtistsTable => "artists-table",
             BrowseScrollbarTarget::AlbumsGrid => "albums-grid",
             BrowseScrollbarTarget::AlbumsTable => "albums-table",
+            BrowseScrollbarTarget::PlaybackHistory => "playback-history",
         }
     }
 

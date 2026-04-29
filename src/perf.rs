@@ -5,9 +5,52 @@ use std::{
 };
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
+/// Process-wide instant captured when `enabled()` is first observed true.
+/// This anchors the profiling window so the cutoff is deterministic
+/// regardless of which call site triggers initialization.
+static WINDOW_ANCHOR: OnceLock<Instant> = OnceLock::new();
+/// Hard upper bound on perf event emission, in milliseconds. Configurable
+/// via `TEMPO_PROFILE_WINDOW_MS` so longer captures can be requested
+/// (e.g. for scan profiling). Defaults to 5_000 to keep startup + a brief
+/// scroll session manageable.
+static WINDOW_MS: OnceLock<u64> = OnceLock::new();
+
+const DEFAULT_WINDOW_MS: u64 = 5_000;
 
 pub fn enabled() -> bool {
-    *ENABLED.get_or_init(|| env_flag("TEMPO_PROFILE") || env_flag("TEMPO_PERF_LOG"))
+    let enabled = *ENABLED.get_or_init(|| env_flag("TEMPO_PROFILE") || env_flag("TEMPO_PERF_LOG"));
+    if enabled {
+        // Anchor the window the first time anyone asks. Using `get_or_init`
+        // keeps this lock-free after the first call.
+        WINDOW_ANCHOR.get_or_init(Instant::now);
+        WINDOW_MS.get_or_init(window_ms_from_env);
+    }
+    enabled
+}
+
+/// True iff perf is enabled AND we are still within the profiling window.
+/// All emission helpers gate on this; the goal is to keep the log focused
+/// on the first few seconds (startup + a scroll burst) rather than
+/// printing forever while the app runs.
+pub fn record_now() -> bool {
+    if !enabled() {
+        return false;
+    }
+    let Some(anchor) = WINDOW_ANCHOR.get() else {
+        return false;
+    };
+    let window = WINDOW_MS.get().copied().unwrap_or(DEFAULT_WINDOW_MS);
+    if window == 0 {
+        return true;
+    }
+    anchor.elapsed() <= Duration::from_millis(window)
+}
+
+fn window_ms_from_env() -> u64 {
+    env::var("TEMPO_PROFILE_WINDOW_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_WINDOW_MS)
 }
 
 fn env_flag(name: &str) -> bool {
@@ -18,7 +61,7 @@ fn env_flag(name: &str) -> bool {
 }
 
 pub fn event(name: &str, detail: impl AsRef<str>) {
-    if enabled() {
+    if record_now() {
         let detail = detail.as_ref();
         if detail.is_empty() {
             eprintln!("[tempo perf] {name}");
@@ -29,7 +72,7 @@ pub fn event(name: &str, detail: impl AsRef<str>) {
 }
 
 pub fn log_duration(name: &str, elapsed: Duration, detail: impl AsRef<str>) {
-    if enabled() {
+    if record_now() {
         let detail = detail.as_ref();
         if detail.is_empty() {
             eprintln!("[tempo perf] {name} {}", format_duration(elapsed));
@@ -51,7 +94,7 @@ pub fn log_duration_if_slow(
 }
 
 pub fn time<T>(name: &str, detail: impl AsRef<str>, f: impl FnOnce() -> T) -> T {
-    if !enabled() {
+    if !record_now() {
         return f();
     }
 
@@ -66,7 +109,7 @@ pub fn time_result<T, E>(
     detail: impl AsRef<str>,
     f: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
-    if !enabled() {
+    if !record_now() {
         return f();
     }
 
@@ -89,7 +132,11 @@ pub struct Span {
     detail: String,
     start: Instant,
     threshold: Option<Duration>,
-    enabled: bool,
+    /// Captured at construction time. Spans started inside the window are
+    /// still emitted on drop even if the window has just expired, so a
+    /// long-running span doesn't get dropped silently. Spans started
+    /// outside the window are no-ops.
+    armed: bool,
 }
 
 impl Span {
@@ -99,21 +146,34 @@ impl Span {
             detail,
             start: Instant::now(),
             threshold,
-            enabled: enabled(),
+            armed: record_now(),
         }
     }
 }
 
 impl Drop for Span {
     fn drop(&mut self) {
-        if !self.enabled {
+        if !self.armed {
             return;
         }
 
         let elapsed = self.start.elapsed();
         if self.threshold.is_none_or(|threshold| elapsed >= threshold) {
-            log_duration(self.name, elapsed, &self.detail);
+            log_duration_force(self.name, elapsed, &self.detail);
         }
+    }
+}
+
+/// Emit unconditionally when perf is enabled, even if the window has
+/// expired. Used for spans that began inside the window.
+fn log_duration_force(name: &str, elapsed: Duration, detail: &str) {
+    if !enabled() {
+        return;
+    }
+    if detail.is_empty() {
+        eprintln!("[tempo perf] {name} {}", format_duration(elapsed));
+    } else {
+        eprintln!("[tempo perf] {name} {} {detail}", format_duration(elapsed));
     }
 }
 

@@ -341,6 +341,224 @@ impl TempoApp {
         markers
     }
 
+    /// Compute the alphabetical first-letter markers shown along the
+    /// browse scrollbars.
+    ///
+    /// For the Artists page we emit a fixed `0-9 A-Z` rail so the rail
+    /// reads as a stable index regardless of which letters are actually
+    /// present in the library. Each rail entry's ratio is anchored to the
+    /// first row in the *current* (possibly search-filtered) list whose
+    /// name begins with that character, so dragging the scrollbar still
+    /// jumps to the matching block. Letters with no matching rows are
+    /// rendered with their best-effort interpolated ratio so the rail
+    /// stays evenly spaced.
+    ///
+    /// For Albums we keep the data-driven grouping (one marker per
+    /// run of consecutive items sharing the same artist initial) since
+    /// album lists can be much shorter and the dense rail would feel
+    /// noisy.
+    pub(super) fn browse_scrollbar_markers(
+        &self,
+        target: BrowseScrollbarTarget,
+    ) -> Vec<ScrollbarMarker> {
+        match target {
+            BrowseScrollbarTarget::ArtistsGrid | BrowseScrollbarTarget::ArtistsTable => {
+                let labels = self.browse_marker_labels(target);
+                Self::alphanumeric_rail_markers(&labels)
+            }
+            BrowseScrollbarTarget::AlbumsGrid | BrowseScrollbarTarget::AlbumsTable => {
+                let labels = self.browse_marker_labels(target);
+                Self::group_marker_labels(&labels)
+            }
+            BrowseScrollbarTarget::PlaybackHistory => {
+                // Playback history is sorted by recency; an alphabetical
+                // rail makes no sense there. Skip the marker rail entirely
+                // and rely on the floating drag-position label so the user
+                // still sees which day/time they are scrubbing toward.
+                Vec::new()
+            }
+        }
+    }
+
+    /// Build the fixed `0-9 A-Z` scrollbar rail. Each entry's `ratio` is
+    /// the position of the first matching row in `labels`; entries whose
+    /// character is absent from the data fall back to a linear
+    /// interpolation between their neighbours so the rail stays
+    /// proportionally spaced.
+    fn alphanumeric_rail_markers(labels: &[String]) -> Vec<ScrollbarMarker> {
+        const RAIL: &[char] = &[
+            '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F', 'G',
+            'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X',
+            'Y', 'Z',
+        ];
+
+        if labels.is_empty() {
+            // Even with no data, still show the rail (evenly spaced) so the
+            // affordance is visible.
+            let denom = (RAIL.len() - 1) as f32;
+            return RAIL
+                .iter()
+                .enumerate()
+                .map(|(ix, ch)| ScrollbarMarker {
+                    ratio: ix as f32 / denom,
+                    label: ch.to_string(),
+                })
+                .collect();
+        }
+
+        // For each rail letter, find the first row whose initial matches.
+        // The rail collapses digits 0..9 onto the canonical "#" bucket since
+        // that's how `marker_initial` reports unmatched characters.
+        let row_denom = labels.len().saturating_sub(1).max(1) as f32;
+        let mut anchors: Vec<Option<f32>> = RAIL
+            .iter()
+            .map(|ch| {
+                let target = ch.to_string();
+                let target_alt = if ch.is_ascii_digit() {
+                    Some("#".to_string())
+                } else {
+                    None
+                };
+                labels
+                    .iter()
+                    .position(|label| {
+                        label == &target || target_alt.as_ref().is_some_and(|alt| label == alt)
+                    })
+                    .map(|row_ix| row_ix as f32 / row_denom)
+            })
+            .collect();
+
+        // Fill missing anchors via linear interpolation so the rail is
+        // monotonically increasing and visually evenly distributed.
+        let mut last_known: Option<(usize, f32)> = None;
+        for ix in 0..anchors.len() {
+            if let Some(ratio) = anchors[ix] {
+                last_known = Some((ix, ratio));
+            }
+        }
+        let mut next_known: Vec<Option<(usize, f32)>> = vec![None; anchors.len()];
+        let mut seen: Option<(usize, f32)> = None;
+        for ix in (0..anchors.len()).rev() {
+            if let Some(ratio) = anchors[ix] {
+                seen = Some((ix, ratio));
+            }
+            next_known[ix] = seen;
+        }
+        let mut last_seen: Option<(usize, f32)> = None;
+        for ix in 0..anchors.len() {
+            if anchors[ix].is_some() {
+                last_seen = anchors[ix].map(|r| (ix, r));
+                continue;
+            }
+            anchors[ix] = match (last_seen, next_known[ix]) {
+                (Some((a_ix, a_ratio)), Some((b_ix, b_ratio))) if a_ix != b_ix => {
+                    let span = (b_ix - a_ix) as f32;
+                    let progress = (ix - a_ix) as f32 / span;
+                    Some(a_ratio + (b_ratio - a_ratio) * progress)
+                }
+                (Some((_, ratio)), _) | (_, Some((_, ratio))) => Some(ratio),
+                _ => Some(ix as f32 / (anchors.len() - 1).max(1) as f32),
+            };
+        }
+        let _ = last_known;
+
+        RAIL.iter()
+            .zip(anchors.into_iter())
+            .map(|(ch, ratio)| ScrollbarMarker {
+                ratio: ratio.unwrap_or(0.0).clamp(0.0, 1.0),
+                label: ch.to_string(),
+            })
+            .collect()
+    }
+
+    /// Resolve the label currently under the scrollbar thumb. Used as the
+    /// floating "you are here" label that appears while dragging the
+    /// browse scrollbar, mirroring the tracks-table behavior.
+    ///
+    /// For Artists/Albums this is a first-letter initial; for the
+    /// PlaybackHistory page it is a relative time label (e.g.
+    /// "2 days ago") matching the cell rendering.
+    pub(super) fn current_browse_scrollbar_label(
+        &self,
+        target: BrowseScrollbarTarget,
+        metrics: TableScrollbarMetrics,
+        _markers: &[ScrollbarMarker],
+    ) -> Option<String> {
+        let labels = self.browse_marker_labels(target);
+        if labels.is_empty() {
+            return None;
+        }
+
+        let ratio = if metrics.max_scroll > 0.0 {
+            metrics.scroll_top / metrics.max_scroll
+        } else {
+            0.0
+        };
+        let row_ix =
+            (ratio.clamp(0.0, 1.0) * labels.len().saturating_sub(1) as f32).round() as usize;
+        labels.get(row_ix).cloned()
+    }
+
+    fn browse_marker_labels(&self, target: BrowseScrollbarTarget) -> Vec<String> {
+        match target {
+            BrowseScrollbarTarget::ArtistsGrid | BrowseScrollbarTarget::ArtistsTable => self
+                .artist_indices_for_search_query(&self.browse_search_query)
+                .into_iter()
+                .filter_map(|ix| {
+                    self.artists
+                        .get(ix)
+                        .map(|artist| Self::marker_initial(&artist.name))
+                })
+                .collect(),
+            BrowseScrollbarTarget::AlbumsGrid | BrowseScrollbarTarget::AlbumsTable => self
+                .album_indices_for_search_query(&self.browse_search_query)
+                .into_iter()
+                .filter_map(|ix| {
+                    self.albums
+                        .get(ix)
+                        .map(|album| Self::marker_initial(&album.artist))
+                })
+                .collect(),
+            BrowseScrollbarTarget::PlaybackHistory => self
+                .sorted_playback_history_indices()
+                .into_iter()
+                .filter_map(|ix| {
+                    self.playback_history
+                        .get(ix)
+                        .map(|entry| Self::history_played_at_label(entry.played_at_unix_secs))
+                })
+                .collect(),
+        }
+    }
+
+    fn group_marker_labels(labels: &[String]) -> Vec<ScrollbarMarker> {
+        if labels.len() <= 1 {
+            return Vec::new();
+        }
+
+        let denominator = labels.len().saturating_sub(1) as f32;
+        let mut markers = Vec::new();
+        let mut previous: Option<&str> = None;
+
+        for (row_ix, label) in labels.iter().enumerate() {
+            if previous == Some(label.as_str()) {
+                continue;
+            }
+            previous = Some(label.as_str());
+
+            markers.push(ScrollbarMarker {
+                ratio: row_ix as f32 / denominator,
+                label: label.clone(),
+            });
+
+            if markers.len() >= TABLE_SCROLLBAR_MAX_MARKERS {
+                break;
+            }
+        }
+
+        markers
+    }
+
     pub(super) fn marker_initial(value: &str) -> String {
         value
             .trim_start()

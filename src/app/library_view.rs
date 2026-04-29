@@ -543,6 +543,11 @@ impl TempoApp {
                         "scan-errors-rows",
                         item_count,
                         cx.processor(move |this, range: Range<usize>, _window, _cx| {
+                            let visible = range.end.saturating_sub(range.start);
+                            let _build_span = perf::span(
+                                "scan_errors.uniform_list.build",
+                                format!("rows={} range={}..{}", visible, range.start, range.end),
+                            );
                             let item_count = this.scan_errors.len();
 
                             range
