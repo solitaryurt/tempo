@@ -1613,7 +1613,7 @@ mod tests {
             )
             .unwrap();
 
-        let artists = store.load_artists(&[root.clone()]).unwrap();
+        let artists = store.load_artists(std::slice::from_ref(&root)).unwrap();
         assert_eq!(artists.len(), 1);
         assert_eq!(artists[0].name, "Alice");
         assert_eq!(artists[0].photo_path.as_ref(), Some(&cover_path));
@@ -1678,7 +1678,7 @@ mod tests {
             )
             .unwrap();
 
-        let artists = store.load_artists(&[root.clone()]).unwrap();
+        let artists = store.load_artists(std::slice::from_ref(&root)).unwrap();
         assert_eq!(artists.len(), 2);
         let rocky = artists
             .iter()
@@ -1693,7 +1693,7 @@ mod tests {
         assert_eq!(skepta.album_count, 1);
         assert_eq!(skepta.track_count, 1);
 
-        let albums = store.load_albums(&[root.clone()]).unwrap();
+        let albums = store.load_albums(std::slice::from_ref(&root)).unwrap();
         assert_eq!(albums.len(), 1);
         assert_eq!(albums[0].artist, "A$AP Rocky");
         assert_eq!(albums[0].track_count, 2);

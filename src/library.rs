@@ -241,35 +241,34 @@ impl LibraryIndexer {
 
                 if let Some((stored_fingerprint, cached_track)) =
                     cached_tracks.as_ref().and_then(|tracks| tracks.get(path))
-                {
-                    if CatalogFileFingerprint::from_path(path).is_some_and(|current_fingerprint| {
+                    && CatalogFileFingerprint::from_path(path).is_some_and(|current_fingerprint| {
                         stored_fingerprint.matches(&current_fingerprint)
-                    }) {
-                        progress.indexed += 1;
-                        report.tracks.push(track_from_catalog(cached_track.clone()));
-                        cached_seen_paths.push(path.to_path_buf());
+                    })
+                {
+                    progress.indexed += 1;
+                    report.tracks.push(track_from_catalog(cached_track.clone()));
+                    cached_seen_paths.push(path.to_path_buf());
 
-                        if report.tracks.len() % batch_size == 0 {
-                            let start = report.tracks.len() - batch_size;
-                            let _ = events
-                                .send(LibraryEvent::TracksIndexed(report.tracks[start..].to_vec()));
-                            let _ = events.send(LibraryEvent::ScanProgress(progress));
-                        }
-
-                        continue;
+                    if report.tracks.len() % batch_size == 0 {
+                        let start = report.tracks.len() - batch_size;
+                        let _ = events
+                            .send(LibraryEvent::TracksIndexed(report.tracks[start..].to_vec()));
+                        let _ = events.send(LibraryEvent::ScanProgress(progress));
                     }
+
+                    continue;
                 }
 
                 match index_audio_file(path) {
                     Ok(track) => {
-                        if let Some(catalog) = &self.catalog {
-                            if let Err(error) = catalog.upsert_track(&track, scan_id) {
-                                send_error(
-                                    events,
-                                    track.path.clone(),
-                                    format!("failed to cache indexed metadata: {error:#}"),
-                                );
-                            }
+                        if let Some(catalog) = &self.catalog
+                            && let Err(error) = catalog.upsert_track(&track, scan_id)
+                        {
+                            send_error(
+                                events,
+                                track.path.clone(),
+                                format!("failed to cache indexed metadata: {error:#}"),
+                            );
                         }
 
                         progress.indexed += 1;
@@ -547,7 +546,7 @@ fn run_watcher(
     };
 
     for root in &roots {
-        if let Err(error) = watcher.watch(&root, RecursiveMode::Recursive) {
+        if let Err(error) = watcher.watch(root, RecursiveMode::Recursive) {
             send_error(&events, root.clone(), error.to_string());
         }
     }
@@ -614,28 +613,28 @@ fn flush_pending(
         match action {
             PendingPath::Index if path.exists() => match index_audio_file(&path) {
                 Ok(track) => {
-                    if let Some(catalog) = catalog {
-                        if let Err(error) = catalog.upsert_track(&track, None) {
-                            send_error(
-                                events,
-                                path.clone(),
-                                format!("failed to cache indexed metadata: {error:#}"),
-                            );
-                        }
+                    if let Some(catalog) = catalog
+                        && let Err(error) = catalog.upsert_track(&track, None)
+                    {
+                        send_error(
+                            events,
+                            path.clone(),
+                            format!("failed to cache indexed metadata: {error:#}"),
+                        );
                     }
                     indexed.push(track);
                 }
                 Err(error) => send_error(events, path, error.to_string()),
             },
             PendingPath::Index | PendingPath::Remove => {
-                if let Some(catalog) = catalog {
-                    if let Err(error) = catalog.mark_file_removed(&path) {
-                        send_error(
-                            events,
-                            path.clone(),
-                            format!("failed to mark removed file in catalog: {error:#}"),
-                        );
-                    }
+                if let Some(catalog) = catalog
+                    && let Err(error) = catalog.mark_file_removed(&path)
+                {
+                    send_error(
+                        events,
+                        path.clone(),
+                        format!("failed to mark removed file in catalog: {error:#}"),
+                    );
                 }
                 removed.insert(path);
             }

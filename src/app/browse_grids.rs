@@ -272,6 +272,7 @@ impl TempoApp {
             .max(1.0) as usize
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_browse_grid(
         &self,
         id: &'static str,
@@ -423,6 +424,7 @@ impl TempoApp {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_browse_table(
         &self,
         id: &'static str,
@@ -626,7 +628,7 @@ impl TempoApp {
     fn render_artist_row(&self, row_ix: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
         let artist = self.artists.get(row_ix)?;
         let colors = *self.colors();
-        let bg = if row_ix % 2 == 0 {
+        let bg = if row_ix.is_multiple_of(2) {
             colors.surface
         } else {
             colors.panel_alt
@@ -701,7 +703,7 @@ impl TempoApp {
     fn render_album_row(&self, row_ix: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
         let album = self.albums.get(row_ix)?;
         let colors = *self.colors();
-        let bg = if row_ix % 2 == 0 {
+        let bg = if row_ix.is_multiple_of(2) {
             colors.surface
         } else {
             colors.panel_alt

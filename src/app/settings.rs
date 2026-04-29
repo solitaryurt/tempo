@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use super::*;
 
 impl TempoApp {
@@ -332,7 +334,7 @@ impl TempoApp {
     pub(super) fn render_library_root_row(
         &self,
         ix: usize,
-        root: &PathBuf,
+        root: &Path,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let root_label = root.display().to_string();
@@ -358,7 +360,7 @@ impl TempoApp {
                     .child(root_label),
             )
             .child(
-                self.settings_button("Remove", &format!("remove-library-root-{ix}"))
+                self.settings_button("Remove", format!("remove-library-root-{ix}"))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.remove_library_root(ix, cx);
                         cx.notify();
