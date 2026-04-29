@@ -10,8 +10,8 @@ use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, CursorStyle, FocusHandle, Image,
     ImageFormat, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, PathPromptOptions, Pixels, Render,
-    ScrollStrategy, SharedString, Styled, UniformListScrollHandle, Window, WindowBounds,
-    WindowOptions, actions, div, img, point, prelude::*, px, rgb, size, uniform_list,
+    ScrollStrategy, ScrollWheelEvent, SharedString, Styled, UniformListScrollHandle, Window,
+    WindowBounds, WindowOptions, actions, div, img, point, prelude::*, px, rgb, size, uniform_list,
 };
 use rodio::{Decoder, Source as _};
 use serde::{Deserialize, Serialize};
@@ -313,6 +313,7 @@ const TABLE_SCROLLBAR_TRACK_W: f32 = 6.0;
 const TABLE_SCROLLBAR_MARGIN: f32 = 4.0;
 const TABLE_SCROLLBAR_MIN_THUMB_H: f32 = 32.0;
 const TABLE_SCROLLBAR_MAX_MARKERS: usize = 28;
+const TABLE_SCROLL_IDLE_DELAY: Duration = Duration::from_millis(120);
 const FAST_SCROLL_OVERSCAN_ROWS: usize = 4;
 
 struct TempoApp {
@@ -343,6 +344,8 @@ struct TempoApp {
     show_scan_errors: bool,
     is_scanning: bool,
     table_scrollbar_drag: Option<TableScrollbarDrag>,
+    table_is_scrolling: bool,
+    table_scroll_generation: u64,
     _library_watcher: Option<LibraryWatcher>,
     playback: Option<PlaybackController>,
 }
@@ -397,6 +400,8 @@ impl TempoApp {
             show_scan_errors: false,
             is_scanning: false,
             table_scrollbar_drag: None,
+            table_is_scrolling: false,
+            table_scroll_generation: 0,
             _library_watcher: library_watcher,
             playback,
         };
@@ -831,6 +836,7 @@ impl Render for TempoApp {
             .on_action(cx.listener(Self::move_selection_down))
             .on_action(cx.listener(Self::new_tab))
             .on_action(cx.listener(Self::focus_search))
+            .on_key_down(cx.listener(Self::handle_table_key_down))
             .size_full()
             .bg(rgb(0x111216))
             .text_color(rgb(0xd8d8dd))
@@ -1650,7 +1656,59 @@ impl TempoApp {
         cx.notify();
     }
 
+    fn handle_table_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.page != Page::Library || !self.focus_handle.is_focused(window) {
+            return;
+        }
+
+        let modifiers = event.keystroke.modifiers;
+        if modifiers.control || modifiers.platform || modifiers.alt || modifiers.function {
+            return;
+        }
+
+        let handled = match event.keystroke.key.as_str() {
+            "pageup" => {
+                self.move_selection_by_page(-1);
+                true
+            }
+            "pagedown" => {
+                self.move_selection_by_page(1);
+                true
+            }
+            "home" => {
+                self.select_table_edge(false);
+                true
+            }
+            "end" => {
+                self.select_table_edge(true);
+                true
+            }
+            _ => Self::album_jump_key(event)
+                .map(|jump_key| self.scroll_to_album_initial(jump_key))
+                .unwrap_or(false),
+        };
+
+        if handled {
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
     fn move_selection(&mut self, delta: isize) {
+        self.move_selection_by_rows(delta, ScrollStrategy::Center);
+    }
+
+    fn move_selection_by_page(&mut self, direction: isize) {
+        let rows = self.table_page_row_count() as isize;
+        self.move_selection_by_rows(direction * rows, ScrollStrategy::Center);
+    }
+
+    fn move_selection_by_rows(&mut self, delta: isize, strategy: ScrollStrategy) {
         let indices = self.current_track_indices();
         if indices.is_empty() {
             return;
@@ -1661,12 +1719,71 @@ impl TempoApp {
             return;
         };
         let next = (position as isize + delta).clamp(0, indices.len().saturating_sub(1) as isize);
-        let next_track = indices[next as usize];
-        self.set_active_selected_track(next_track);
+        self.select_table_row(next as usize, strategy);
+    }
+
+    fn select_table_edge(&mut self, end: bool) {
+        let Some(last_row) = self.current_track_indices().len().checked_sub(1) else {
+            return;
+        };
+
+        if end {
+            self.select_table_row(last_row, ScrollStrategy::Bottom);
+        } else {
+            self.select_table_row(0, ScrollStrategy::Top);
+        }
+    }
+
+    fn select_table_row(&mut self, row_ix: usize, strategy: ScrollStrategy) {
+        let Some(track_ix) = self.current_track_indices().get(row_ix).copied() else {
+            return;
+        };
+
+        self.set_active_selected_track(track_ix);
         self.active_tab()
             .table_scroll_handle
-            .scroll_to_item(next as usize, ScrollStrategy::Center);
+            .scroll_to_item(row_ix, strategy);
         self.context_menu_track = None;
+    }
+
+    fn table_page_row_count(&self) -> usize {
+        self.table_scrollbar_metrics()
+            .map(|metrics| (metrics.track_height / TABLE_ROW_H).floor() as usize)
+            .unwrap_or(12)
+            .saturating_sub(1)
+            .max(1)
+    }
+
+    fn album_jump_key(event: &KeyDownEvent) -> Option<char> {
+        let key_char = event.keystroke.key_char.as_deref()?;
+        let mut chars = key_char.chars();
+        let ch = chars.next()?;
+        if chars.next().is_some() {
+            return None;
+        }
+
+        ch.is_ascii_alphanumeric().then(|| ch.to_ascii_uppercase())
+    }
+
+    fn scroll_to_album_initial(&mut self, jump_key: char) -> bool {
+        let Some(row_ix) = self.current_track_indices().iter().position(|track_ix| {
+            self.tracks
+                .get(*track_ix)
+                .is_some_and(|track| Self::album_initial_matches(&track.album, jump_key))
+        }) else {
+            return false;
+        };
+
+        self.select_table_row(row_ix, ScrollStrategy::Top);
+        true
+    }
+
+    fn album_initial_matches(album: &str, jump_key: char) -> bool {
+        album
+            .chars()
+            .find(|ch| ch.is_ascii_alphanumeric())
+            .map(|ch| ch.to_ascii_uppercase() == jump_key)
+            .unwrap_or(false)
     }
 
     fn table_scrollbar_metrics(&self) -> Option<TableScrollbarMetrics> {
@@ -1757,6 +1874,46 @@ impl TempoApp {
         let scrolled = self.finish_table_scrollbar_drag();
         let resized = self.finish_column_resize();
         scrolled || resized
+    }
+
+    fn mark_table_scrolling(&mut self, cx: &mut Context<Self>) {
+        self.table_scroll_generation = self.table_scroll_generation.wrapping_add(1);
+
+        if self.table_is_scrolling {
+            return;
+        }
+
+        self.table_is_scrolling = true;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(generation) = this.update(cx, |app, _cx| app.table_scroll_generation) else {
+                    return;
+                };
+
+                cx.background_executor()
+                    .timer(TABLE_SCROLL_IDLE_DELAY)
+                    .await;
+
+                let Ok(should_stop) = this.update(cx, |app, cx| {
+                    if app.table_scroll_generation == generation && app.table_is_scrolling {
+                        app.table_is_scrolling = false;
+                        cx.notify();
+                        true
+                    } else {
+                        false
+                    }
+                }) else {
+                    return;
+                };
+
+                if should_stop {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     fn scroll_table_to_scrollbar_y(&mut self, mouse_y: Pixels, thumb_offset: f32) -> bool {
@@ -2435,6 +2592,12 @@ impl TempoApp {
             .flex_col()
             .relative()
             .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseDownEvent, window, _cx| {
+                    window.focus(&this.focus_handle);
+                }),
+            )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
                 let scrolled = this.drag_table_scrollbar(event);
                 let resized = !scrolled && this.resize_column_from_mouse(event);
@@ -2476,27 +2639,33 @@ impl TempoApp {
                                 "track-table-rows",
                                 item_count,
                                 cx.processor(move |this, range: Range<usize>, _window, cx| {
-                                    let row_track_indices = range
-                                        .filter_map(|row_ix| {
-                                            this.current_track_indices().get(row_ix).copied()
-                                        })
-                                        .collect::<Vec<_>>();
-
-                                    row_track_indices
-                                        .into_iter()
+                                    range
                                         .enumerate()
-                                        .map(|(visible_row_ix, track_ix)| {
-                                            this.render_track_row(
-                                                visible_row_ix,
-                                                track_ix,
-                                                &this.tracks[track_ix],
-                                                cx,
+                                        .filter_map(|(visible_row_ix, row_ix)| {
+                                            let track_ix = this
+                                                .current_track_indices()
+                                                .get(row_ix)
+                                                .copied()?;
+                                            Some(
+                                                this.render_track_row(
+                                                    visible_row_ix,
+                                                    track_ix,
+                                                    &this.tracks[track_ix],
+                                                    this.table_is_scrolling,
+                                                    cx,
+                                                )
+                                                .into_any_element(),
                                             )
                                         })
                                         .collect()
                                 }),
                             )
                             .size_full()
+                            .on_scroll_wheel(cx.listener(
+                                |this, _event: &ScrollWheelEvent, _window, cx| {
+                                    this.mark_table_scrolling(cx);
+                                },
+                            ))
                             .track_scroll(table_scroll_handle),
                         )
                     })
@@ -2642,19 +2811,7 @@ impl TempoApp {
                     .w(px(self.column_width(TableColumn::Artwork)))
                     .flex()
                     .items_center()
-                    .child(
-                        div()
-                            .w(px(22.0))
-                            .h(px(22.0))
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(rgb(0x3a3d45))
-                            .overflow_hidden()
-                            .child(Self::album_tile_fallback(
-                                track.album_initials.clone(),
-                                track.album_color,
-                            )),
-                    ),
+                    .child(Self::album_tile_placeholder(track, 22.0)),
             )
             .child(
                 div()
@@ -3094,6 +3251,7 @@ impl TempoApp {
         row_ix: usize,
         track_ix: usize,
         track: &Track,
+        lightweight: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let active = track_ix == self.playing_track;
@@ -3116,40 +3274,44 @@ impl TempoApp {
             .border_b_1()
             .border_color(rgb(0x202127))
             .bg(rgb(bg))
-            .cursor_pointer()
-            .hover(|this| this.bg(rgb(0x202229)))
-            .on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
-                this.set_active_selected_track(track_ix);
-                this.context_menu_track = None;
+            .when(!lightweight, |this| {
+                this.cursor_pointer()
+                    .hover(|this| this.bg(rgb(0x202229)))
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        window.focus(&this.focus_handle);
+                        this.set_active_selected_track(track_ix);
+                        this.context_menu_track = None;
 
-                if event.standard_click() && event.modifiers().control {
-                    this.queue_track(track_ix);
-                    cx.notify();
-                    return;
-                }
+                        if event.standard_click() && event.modifiers().control {
+                            this.queue_track(track_ix);
+                            cx.notify();
+                            return;
+                        }
 
-                if event.standard_click() && event.click_count() >= 2 {
-                    this.play_track(track_ix);
-                }
+                        if event.standard_click() && event.click_count() >= 2 {
+                            this.play_track(track_ix);
+                        }
 
-                cx.notify();
-            }))
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
-                    this.set_active_selected_track(track_ix);
-                    this.context_menu_track = Some(track_ix);
-                    this.context_menu_row = row_ix;
-                    cx.notify();
-                }),
-            )
-            .on_drag(
-                TrackDrag::new(track_ix, track),
-                |drag: &TrackDrag, position, _, cx| {
-                    let preview = drag.clone().position(position);
-                    cx.new(|_| preview)
-                },
-            )
+                        cx.notify();
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
+                            window.focus(&this.focus_handle);
+                            this.set_active_selected_track(track_ix);
+                            this.context_menu_track = Some(track_ix);
+                            this.context_menu_row = row_ix;
+                            cx.notify();
+                        }),
+                    )
+                    .on_drag(
+                        TrackDrag::new(track_ix, track),
+                        |drag: &TrackDrag, position, _, cx| {
+                            let preview = drag.clone().position(position);
+                            cx.new(|_| preview)
+                        },
+                    )
+            })
             .child(
                 div()
                     .w(px(self.column_width(TableColumn::Index)))
@@ -3166,7 +3328,11 @@ impl TempoApp {
                     .w(px(self.column_width(TableColumn::Artwork)))
                     .flex()
                     .items_center()
-                    .child(Self::album_tile(track, 22.0)),
+                    .child(if lightweight {
+                        Self::album_tile_placeholder(track, 22.0)
+                    } else {
+                        Self::album_tile(track, 22.0)
+                    }),
             )
             .child(
                 div()
@@ -3362,6 +3528,21 @@ impl TempoApp {
                     .into_any_element(),
                 None => Self::album_tile_fallback(initials, color),
             })
+            .into_any_element()
+    }
+
+    fn album_tile_placeholder(track: &Track, size: f32) -> AnyElement {
+        div()
+            .w(px(size))
+            .h(px(size))
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(0x3a3d45))
+            .overflow_hidden()
+            .child(Self::album_tile_fallback(
+                track.album_initials.clone(),
+                track.album_color,
+            ))
             .into_any_element()
     }
 
