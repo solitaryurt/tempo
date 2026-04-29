@@ -28,7 +28,9 @@ actions!(
         PlaySelected,
         TogglePause,
         MoveSelectionUp,
-        MoveSelectionDown
+        MoveSelectionDown,
+        NewTab,
+        FocusSearch
     ]
 );
 
@@ -152,6 +154,45 @@ struct Playlist {
     track_paths: Vec<PathBuf>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TabSource {
+    Library,
+    Playlist(usize),
+}
+
+struct BrowseTab {
+    source: TabSource,
+    search_query: String,
+    sort_column: SortColumn,
+    sort_direction: SortDirection,
+    selected_track: usize,
+    table_scroll_handle: UniformListScrollHandle,
+}
+
+impl BrowseTab {
+    fn library() -> Self {
+        Self {
+            source: TabSource::Library,
+            search_query: String::new(),
+            sort_column: SortColumn::Index,
+            sort_direction: SortDirection::Ascending,
+            selected_track: 0,
+            table_scroll_handle: UniformListScrollHandle::new(),
+        }
+    }
+
+    fn playlist(playlist_ix: usize) -> Self {
+        Self {
+            source: TabSource::Playlist(playlist_ix),
+            search_query: String::new(),
+            sort_column: SortColumn::Index,
+            sort_direction: SortDirection::Ascending,
+            selected_track: 0,
+            table_scroll_handle: UniformListScrollHandle::new(),
+        }
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct AppState {
     library_roots: Vec<PathBuf>,
@@ -181,15 +222,10 @@ struct TempoApp {
     page: Page,
     left_sidebar_collapsed: bool,
     right_sidebar_collapsed: bool,
-    sort_column: SortColumn,
-    sort_direction: SortDirection,
     column_widths: ColumnWidths,
     column_resize: Option<ColumnResize>,
-    search_query: String,
-    visible_track_indices: Vec<usize>,
-    visible_track_indices_dirty: bool,
-    table_scroll_handle: UniformListScrollHandle,
-    selected_track: usize,
+    tabs: Vec<BrowseTab>,
+    active_tab: usize,
     playing_track: usize,
     is_playing: bool,
     context_menu_track: Option<usize>,
@@ -237,15 +273,10 @@ impl TempoApp {
             page: initial_page,
             left_sidebar_collapsed: false,
             right_sidebar_collapsed: false,
-            sort_column: SortColumn::Index,
-            sort_direction: SortDirection::Ascending,
             column_widths: ColumnWidths::default(),
             column_resize: None,
-            search_query: String::new(),
-            visible_track_indices: Vec::new(),
-            visible_track_indices_dirty: true,
-            table_scroll_handle: UniformListScrollHandle::new(),
-            selected_track: 0,
+            tabs: vec![BrowseTab::library()],
+            active_tab: 0,
             playing_track: 0,
             is_playing: false,
             context_menu_track: None,
@@ -368,7 +399,9 @@ impl TempoApp {
         self.waveform_cache.clear();
         self.waveform_loading.clear();
         self.invalidate_track_indices();
-        self.selected_track = 0;
+        for tab in &mut self.tabs {
+            tab.selected_track = 0;
+        }
         self.playing_track = 0;
         self.is_playing = false;
         self.context_menu_track = None;
@@ -446,6 +479,97 @@ impl TempoApp {
         } else {
             page
         };
+        self.context_menu_track = None;
+    }
+
+    fn active_tab(&self) -> &BrowseTab {
+        &self.tabs[self.active_tab]
+    }
+
+    fn active_tab_mut(&mut self) -> &mut BrowseTab {
+        &mut self.tabs[self.active_tab]
+    }
+
+    fn active_search_query(&self) -> &str {
+        &self.active_tab().search_query
+    }
+
+    fn active_selected_track(&self) -> usize {
+        self.active_tab().selected_track
+    }
+
+    fn set_active_selected_track(&mut self, track_ix: usize) {
+        self.active_tab_mut().selected_track = track_ix;
+    }
+
+    fn tab_title(&self, tab: &BrowseTab) -> String {
+        let query = tab.search_query.trim();
+        if !query.is_empty() {
+            return query.to_string();
+        }
+
+        match tab.source {
+            TabSource::Library => "All Music".to_string(),
+            TabSource::Playlist(playlist_ix) => self
+                .playlists
+                .get(playlist_ix)
+                .map(|playlist| playlist.name.clone())
+                .unwrap_or_else(|| "Missing Playlist".to_string()),
+        }
+    }
+
+    fn new_library_tab(&mut self) {
+        self.tabs.push(BrowseTab::library());
+        self.active_tab = self.tabs.len() - 1;
+        self.page = Page::Library;
+        self.context_menu_track = None;
+    }
+
+    fn open_all_music_tab(&mut self) {
+        if let Some(tab_ix) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.source == TabSource::Library && tab.search_query.trim().is_empty())
+        {
+            self.active_tab = tab_ix;
+        } else {
+            self.tabs.push(BrowseTab::library());
+            self.active_tab = self.tabs.len() - 1;
+        }
+
+        self.open_page(Page::Library);
+    }
+
+    fn open_playlist_tab(&mut self, playlist_ix: usize) {
+        if playlist_ix >= self.playlists.len() {
+            return;
+        }
+
+        if let Some(tab_ix) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.source == TabSource::Playlist(playlist_ix))
+        {
+            self.active_tab = tab_ix;
+        } else {
+            self.tabs.push(BrowseTab::playlist(playlist_ix));
+            self.active_tab = self.tabs.len() - 1;
+        }
+
+        self.open_page(Page::Library);
+    }
+
+    fn close_tab(&mut self, tab_ix: usize) {
+        if self.tabs.len() <= 1 || tab_ix >= self.tabs.len() {
+            return;
+        }
+
+        self.tabs.remove(tab_ix);
+        if self.active_tab > tab_ix {
+            self.active_tab -= 1;
+        } else if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len() - 1;
+        }
         self.context_menu_track = None;
     }
 
@@ -576,6 +700,8 @@ impl Render for TempoApp {
             .on_action(cx.listener(Self::toggle_pause))
             .on_action(cx.listener(Self::move_selection_up))
             .on_action(cx.listener(Self::move_selection_down))
+            .on_action(cx.listener(Self::new_tab))
+            .on_action(cx.listener(Self::focus_search))
             .size_full()
             .bg(rgb(0x111216))
             .text_color(rgb(0xd8d8dd))
@@ -605,7 +731,9 @@ impl TempoApp {
                 self.waveform_cache.clear();
                 self.waveform_loading.clear();
                 self.invalidate_track_indices();
-                self.selected_track = 0;
+                for tab in &mut self.tabs {
+                    tab.selected_track = 0;
+                }
                 self.playing_track = 0;
                 self.is_playing = false;
                 self.context_menu_track = None;
@@ -697,43 +825,60 @@ impl TempoApp {
     }
 
     fn visible_scan_status(&self) -> String {
-        if self.search_query.trim().is_empty() {
-            return format!("{} items  ·  {}", self.tracks.len(), self.library_status);
+        let total = self.active_source_track_count();
+        if self.active_search_query().trim().is_empty() {
+            return format!("{} items  ·  {}", total, self.library_status);
         }
 
         format!(
             "{} of {} items  ·  {}",
             self.filtered_track_count(),
-            self.tracks.len(),
+            total,
             self.library_status
         )
     }
 
     fn filtered_track_count(&self) -> usize {
-        let terms = self.search_terms();
-        self.tracks
-            .iter()
-            .filter(|track| Self::track_matches_search_terms(track, &terms))
-            .count()
+        self.current_track_indices().len()
     }
 
-    fn invalidate_track_indices(&mut self) {
-        self.visible_track_indices_dirty = true;
+    fn active_source_track_count(&self) -> usize {
+        self.source_track_indices(self.active_tab().source).len()
     }
 
-    fn rebuild_visible_track_indices(&mut self) {
-        let terms = self.search_terms();
-        let mut indices: Vec<usize> = self
-            .tracks
-            .iter()
-            .enumerate()
-            .filter_map(|(ix, track)| Self::track_matches_search_terms(track, &terms).then_some(ix))
-            .collect();
+    fn invalidate_track_indices(&mut self) {}
+
+    fn current_track_indices(&self) -> Vec<usize> {
+        self.track_indices_for_tab(self.active_tab)
+    }
+
+    fn track_indices_for_tab(&self, tab_ix: usize) -> Vec<usize> {
+        let Some(tab) = self.tabs.get(tab_ix) else {
+            return Vec::new();
+        };
+
+        let terms = Self::search_terms(&tab.search_query);
+        let mut indices = self
+            .source_track_indices(tab.source)
+            .into_iter()
+            .filter(|track_ix| {
+                self.tracks
+                    .get(*track_ix)
+                    .is_some_and(|track| Self::track_matches_search_terms(track, &terms))
+            })
+            .collect::<Vec<_>>();
+
+        if tab.sort_column == SortColumn::Index {
+            if tab.sort_direction == SortDirection::Descending {
+                indices.reverse();
+            }
+            return indices;
+        }
 
         indices.sort_by(|a, b| {
             let left = &self.tracks[*a];
             let right = &self.tracks[*b];
-            let ordering = match self.sort_column {
+            let ordering = match tab.sort_column {
                 SortColumn::Index => a.cmp(b),
                 SortColumn::Title => left.title.cmp(&right.title),
                 SortColumn::Album => left
@@ -752,42 +897,52 @@ impl TempoApp {
                 SortColumn::Duration => left.duration_value.cmp(&right.duration_value),
             };
 
-            match self.sort_direction {
+            match tab.sort_direction {
                 SortDirection::Ascending => ordering,
                 SortDirection::Descending => ordering.reverse(),
             }
         });
 
-        self.visible_track_indices = indices;
-        self.visible_track_indices_dirty = false;
+        indices
     }
 
-    fn current_track_indices(&mut self) -> Vec<usize> {
-        if self.visible_track_indices_dirty {
-            self.rebuild_visible_track_indices();
+    fn source_track_indices(&self, source: TabSource) -> Vec<usize> {
+        match source {
+            TabSource::Library => (0..self.tracks.len()).collect(),
+            TabSource::Playlist(playlist_ix) => self
+                .playlists
+                .get(playlist_ix)
+                .map(|playlist| {
+                    playlist
+                        .track_paths
+                        .iter()
+                        .filter_map(|path| self.tracks.iter().position(|track| track.path == *path))
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
-
-        self.visible_track_indices.clone()
     }
 
     fn set_search_query(&mut self, query: String) {
-        self.search_query = query;
+        self.active_tab_mut().search_query = query;
         self.context_menu_track = None;
         self.invalidate_track_indices();
         let indices = self.current_track_indices();
+        let selected_track = self.active_selected_track();
         if let Some(first_track_ix) = indices.first() {
-            if !indices.contains(&self.selected_track) {
-                self.selected_track = *first_track_ix;
+            if !indices.contains(&selected_track) {
+                self.set_active_selected_track(*first_track_ix);
             }
         } else {
-            self.selected_track = 0;
+            self.set_active_selected_track(0);
         }
-        self.table_scroll_handle
+        self.active_tab()
+            .table_scroll_handle
             .scroll_to_item(0, ScrollStrategy::Top);
     }
 
     fn clear_search_query(&mut self) {
-        if !self.search_query.is_empty() {
+        if !self.active_search_query().is_empty() {
             self.set_search_query(String::new());
         }
     }
@@ -800,7 +955,7 @@ impl TempoApp {
 
         match event.keystroke.key.as_str() {
             "backspace" => {
-                let mut query = self.search_query.clone();
+                let mut query = self.active_search_query().to_string();
                 query.pop();
                 self.set_search_query(query);
                 cx.stop_propagation();
@@ -816,7 +971,7 @@ impl TempoApp {
                     return;
                 };
                 if key_char.chars().all(|ch| !ch.is_control()) {
-                    let mut query = self.search_query.clone();
+                    let mut query = self.active_search_query().to_string();
                     query.push_str(key_char);
                     self.set_search_query(query);
                     cx.stop_propagation();
@@ -826,13 +981,8 @@ impl TempoApp {
         }
     }
 
-    fn track_matches_search(&self, track: &Track) -> bool {
-        let terms = self.search_terms();
-        Self::track_matches_search_terms(track, &terms)
-    }
-
-    fn search_terms(&self) -> Vec<String> {
-        self.search_query
+    fn search_terms(query: &str) -> Vec<String> {
+        query
             .split_whitespace()
             .map(|term| term.to_lowercase())
             .collect()
@@ -988,7 +1138,9 @@ impl TempoApp {
 
     fn clamp_track_indices(&mut self) {
         if self.tracks.is_empty() {
-            self.selected_track = 0;
+            for tab in &mut self.tabs {
+                tab.selected_track = 0;
+            }
             self.playing_track = 0;
             self.context_menu_track = None;
             self.is_playing = false;
@@ -996,11 +1148,15 @@ impl TempoApp {
         }
 
         let last = self.tracks.len() - 1;
-        self.selected_track = self.selected_track.min(last);
         self.playing_track = self.playing_track.min(last);
 
-        if !self.track_matches_search(&self.tracks[self.selected_track]) {
-            self.selected_track = self.current_track_indices().first().copied().unwrap_or(0);
+        for tab_ix in 0..self.tabs.len() {
+            let indices = self.track_indices_for_tab(tab_ix);
+            let tab = &mut self.tabs[tab_ix];
+            tab.selected_track = tab.selected_track.min(last);
+            if !indices.contains(&tab.selected_track) {
+                tab.selected_track = indices.first().copied().unwrap_or(0);
+            }
         }
 
         if self
@@ -1017,9 +1173,10 @@ impl TempoApp {
         let Some(track) = self.tracks.get(track_ix) else {
             return;
         };
+        let track_path = track.path.clone();
 
         self.playing_track = track_ix;
-        self.selected_track = track_ix;
+        self.set_active_selected_track(track_ix);
         self.context_menu_track = None;
 
         let Some(playback) = &self.playback else {
@@ -1027,7 +1184,7 @@ impl TempoApp {
             return;
         };
 
-        match playback.play_path(&track.path) {
+        match playback.play_path(&track_path) {
             Ok(()) => {
                 self.is_playing = true;
                 self.playback_status = "Playing through default output".to_string();
@@ -1144,7 +1301,7 @@ impl TempoApp {
             return;
         }
 
-        self.play_track(self.selected_track);
+        self.play_track(self.active_selected_track());
         cx.notify();
     }
 
@@ -1172,18 +1329,32 @@ impl TempoApp {
         cx.notify();
     }
 
+    fn new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_library_tab();
+        window.focus(&self.search_focus_handle);
+        cx.notify();
+    }
+
+    fn focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_page(Page::Library);
+        window.focus(&self.search_focus_handle);
+        cx.notify();
+    }
+
     fn move_selection(&mut self, delta: isize) {
         let indices = self.current_track_indices();
         if indices.is_empty() {
             return;
         }
 
-        let Some(position) = indices.iter().position(|ix| *ix == self.selected_track) else {
+        let selected_track = self.active_selected_track();
+        let Some(position) = indices.iter().position(|ix| *ix == selected_track) else {
             return;
         };
         let next = (position as isize + delta).clamp(0, indices.len().saturating_sub(1) as isize);
-        self.selected_track = indices[next as usize];
-        self.table_scroll_handle
+        self.set_active_selected_track(indices[next as usize]);
+        self.active_tab()
+            .table_scroll_handle
             .scroll_to_item(next as usize, ScrollStrategy::Center);
         self.context_menu_track = None;
     }
@@ -1299,7 +1470,7 @@ impl TempoApp {
             .child(self.render_nav_item(
                 "All Music",
                 self.tracks.len().to_string(),
-                self.page == Page::Library,
+                self.page == Page::Library && self.active_tab().source == TabSource::Library,
                 Page::Library,
                 cx,
             ))
@@ -1349,7 +1520,7 @@ impl TempoApp {
                 self.playlists
                     .iter()
                     .enumerate()
-                    .map(|(ix, playlist)| self.render_playlist_nav_item(ix, playlist)),
+                    .map(|(ix, playlist)| self.render_playlist_nav_item(ix, playlist, cx)),
             )
     }
 
@@ -1361,16 +1532,29 @@ impl TempoApp {
             .child(title)
     }
 
-    fn render_playlist_nav_item(&self, ix: usize, playlist: &Playlist) -> impl IntoElement + use<> {
+    fn render_playlist_nav_item(
+        &self,
+        ix: usize,
+        playlist: &Playlist,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let active =
+            self.page == Page::Library && self.active_tab().source == TabSource::Playlist(ix);
+        let bg = if active { 0x282a30 } else { 0x15161a };
+        let fg = if active { 0xf0f0f4 } else { 0xb6b8bf };
+
         div()
             .id(SharedString::from(format!("playlist-{ix}")))
             .h(px(22.0))
             .px_2()
             .rounded_md()
+            .cursor_pointer()
             .flex()
             .items_center()
             .justify_between()
-            .text_color(rgb(0xb6b8bf))
+            .bg(rgb(bg))
+            .text_color(rgb(fg))
+            .active(|this| this.opacity(0.82))
             .child(
                 div()
                     .min_w_0()
@@ -1384,6 +1568,10 @@ impl TempoApp {
                     .text_color(rgb(0x777b84))
                     .child(playlist.track_paths.len().to_string()),
             )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_playlist_tab(ix);
+                cx.notify();
+            }))
     }
 
     fn render_nav_item(
@@ -1417,7 +1605,11 @@ impl TempoApp {
                     .child(count.into()),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_page(target);
+                if target == Page::Library {
+                    this.open_all_music_tab();
+                } else {
+                    this.open_page(target);
+                }
                 cx.notify();
             }))
             .into_any_element()
@@ -1431,7 +1623,114 @@ impl TempoApp {
             .flex_col()
             .bg(rgb(0x131419))
             .child(self.render_library_header(cx))
+            .child(self.render_tab_bar(cx))
             .child(self.render_table(cx))
+    }
+
+    fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        div()
+            .h(px(34.0))
+            .flex_none()
+            .px_3()
+            .border_b_1()
+            .border_color(rgb(0x24252b))
+            .bg(rgb(0x111216))
+            .flex()
+            .items_end()
+            .gap_1()
+            .children(
+                self.tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, tab)| self.render_tab(ix, tab, cx)),
+            )
+            .child(
+                div()
+                    .id("new-tab-button")
+                    .mb(px(5.0))
+                    .w(px(24.0))
+                    .h(px(22.0))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(0x30323a))
+                    .bg(rgb(0x18191f))
+                    .text_color(rgb(0x9a9ea8))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child("+")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.new_library_tab();
+                        window.focus(&this.search_focus_handle);
+                        cx.notify();
+                    })),
+            )
+    }
+
+    fn render_tab(
+        &self,
+        ix: usize,
+        tab: &BrowseTab,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let active = ix == self.active_tab;
+        let bg = if active { 0x1b1c22 } else { 0x15161a };
+        let fg = if active { 0xf0f0f4 } else { 0x9a9ea8 };
+        let border = if active { 0x3a3d45 } else { 0x24252b };
+
+        div()
+            .id(SharedString::from(format!("browse-tab-{ix}")))
+            .max_w(px(210.0))
+            .h(px(28.0))
+            .px_3()
+            .rounded_t_md()
+            .border_1()
+            .border_b_0()
+            .border_color(rgb(border))
+            .bg(rgb(bg))
+            .text_color(rgb(fg))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .gap_2()
+            .active(|this| this.opacity(0.82))
+            .child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(self.tab_title(tab)),
+            )
+            .when(!tab.search_query.trim().is_empty(), |this| {
+                this.child(div().text_xs().text_color(rgb(0xeeb17d)).child("search"))
+            })
+            .when(self.tabs.len() > 1, |this| {
+                this.child(
+                    div()
+                        .id(SharedString::from(format!("close-tab-{ix}")))
+                        .w(px(16.0))
+                        .h(px(16.0))
+                        .rounded_sm()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(rgb(0x777b84))
+                        .hover(|this| this.bg(rgb(0x282a30)).text_color(rgb(0xf0f0f4)))
+                        .child("x")
+                        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                            this.close_tab(ix);
+                            cx.stop_propagation();
+                            cx.notify();
+                        })),
+                )
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.active_tab = ix;
+                this.open_page(Page::Library);
+                cx.notify();
+            }))
     }
 
     fn render_library_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1461,7 +1760,7 @@ impl TempoApp {
                         div()
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(rgb(0xf0f0f4))
-                            .child("All Music"),
+                            .child(self.tab_title(self.active_tab())),
                     ),
             )
             .child(
@@ -1484,7 +1783,7 @@ impl TempoApp {
                     .flex()
                     .items_center()
                     .text_xs()
-                    .text_color(rgb(if self.search_query.is_empty() {
+                    .text_color(rgb(if self.active_search_query().is_empty() {
                         0x737781
                     } else {
                         0xd8d8dd
@@ -1496,10 +1795,10 @@ impl TempoApp {
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                         this.handle_search_key_down(event, cx);
                     }))
-                    .child(if self.search_query.is_empty() {
+                    .child(if self.active_search_query().is_empty() {
                         "⌕  Search library".into()
                     } else {
-                        format!("⌕  {}", self.search_query)
+                        format!("⌕  {}", self.active_search_query())
                     }),
             )
             .child(
@@ -1526,7 +1825,11 @@ impl TempoApp {
     fn render_table(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let indices = self.current_track_indices();
         let item_count = indices.len();
-        let has_no_search_results = item_count == 0 && !self.tracks.is_empty();
+        let active_search_query = self.active_search_query().to_string();
+        let has_no_search_results = item_count == 0
+            && self.active_source_track_count() > 0
+            && !active_search_query.trim().is_empty();
+        let table_scroll_handle = self.active_tab().table_scroll_handle.clone();
 
         div()
             .flex_1()
@@ -1573,7 +1876,7 @@ impl TempoApp {
                         }),
                     )
                     .size_full()
-                    .track_scroll(self.table_scroll_handle.clone()),
+                    .track_scroll(table_scroll_handle),
                 ),
             )
             .when(self.tracks.is_empty(), |this| {
@@ -1628,7 +1931,7 @@ impl TempoApp {
                         .child(
                             div()
                                 .text_color(rgb(0x8a8e97))
-                                .child(format!("No tracks match \"{}\".", self.search_query)),
+                                .child(format!("No tracks match \"{}\".", active_search_query)),
                         ),
                 )
             })
@@ -1673,8 +1976,9 @@ impl TempoApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let width = self.column_width(column);
-        let active = sort_column.is_some_and(|column| self.sort_column == column);
-        let icon = match self.sort_direction {
+        let tab = self.active_tab();
+        let active = sort_column.is_some_and(|column| tab.sort_column == column);
+        let icon = match tab.sort_direction {
             SortDirection::Ascending => "▲",
             SortDirection::Descending => "▼",
         };
@@ -1706,14 +2010,15 @@ impl TempoApp {
             .when(active, |this| this.child(icon))
             .when_some(sort_column, |this, sort_column| {
                 this.on_click(cx.listener(move |this, _, _, cx| {
-                    if this.sort_column == sort_column {
-                        this.sort_direction = match this.sort_direction {
+                    let tab = this.active_tab_mut();
+                    if tab.sort_column == sort_column {
+                        tab.sort_direction = match tab.sort_direction {
                             SortDirection::Ascending => SortDirection::Descending,
                             SortDirection::Descending => SortDirection::Ascending,
                         };
                     } else {
-                        this.sort_column = sort_column;
-                        this.sort_direction = SortDirection::Ascending;
+                        tab.sort_column = sort_column;
+                        tab.sort_direction = SortDirection::Ascending;
                     }
 
                     this.invalidate_track_indices();
@@ -1873,7 +2178,7 @@ impl TempoApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let active = track_ix == self.playing_track;
-        let selected = track_ix == self.selected_track;
+        let selected = track_ix == self.active_selected_track();
         let bg = if selected {
             0x30323a
         } else if active {
@@ -1895,7 +2200,7 @@ impl TempoApp {
             .cursor_pointer()
             .hover(|this| this.bg(rgb(0x202229)))
             .on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
-                this.selected_track = track_ix;
+                this.set_active_selected_track(track_ix);
                 this.context_menu_track = None;
 
                 if event.standard_click() && event.modifiers().control {
@@ -1913,7 +2218,7 @@ impl TempoApp {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
-                    this.selected_track = track_ix;
+                    this.set_active_selected_track(track_ix);
                     this.context_menu_track = Some(track_ix);
                     this.context_menu_row = row_ix;
                     cx.notify();
@@ -2917,6 +3222,9 @@ fn main() {
             KeyBinding::new("space", TogglePause, None),
             KeyBinding::new("left", MoveSelectionUp, None),
             KeyBinding::new("right", MoveSelectionDown, None),
+            KeyBinding::new("ctrl-t", NewTab, None),
+            KeyBinding::new("ctrl-f", FocusSearch, None),
+            KeyBinding::new("/", FocusSearch, None),
         ]);
 
         cx.activate(true);
