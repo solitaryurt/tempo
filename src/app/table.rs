@@ -722,6 +722,11 @@ impl TempoApp {
                 TABLE_SCROLLBAR_MARGIN,
                 (track_height - 18.0).max(TABLE_SCROLLBAR_MARGIN),
             );
+        let hints_opacity = if self.table_scrollbar_drag.is_some() {
+            1.0
+        } else {
+            0.0
+        };
 
         div()
             .id("table-scrollbar")
@@ -755,7 +760,41 @@ impl TempoApp {
                     }
                 }),
             )
-            .children(markers)
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .w(px(TABLE_SCROLLBAR_W))
+                    .opacity(hints_opacity)
+                    .hover(|this| this.opacity(1.0))
+                    .children(markers)
+                    .when(scrollable, |this| {
+                        this.when_some(current_label, |this, label| {
+                            this.child(
+                                div()
+                                    .absolute()
+                                    .top(px(current_label_top))
+                                    .right(px(15.0))
+                                    .max_w(px(36.0))
+                                    .h(px(18.0))
+                                    .px_1()
+                                    .rounded_sm()
+                                    .bg(rgb(colors.playing))
+                                    .border_1()
+                                    .border_color(rgb(colors.border_strong))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_xs()
+                                    .text_color(rgb(colors.text))
+                                    .overflow_hidden()
+                                    .child(label),
+                            )
+                        })
+                    }),
+            )
             .child(
                 div()
                     .absolute()
@@ -781,30 +820,6 @@ impl TempoApp {
                             })),
                     ),
             )
-            .when(scrollable, |this| {
-                this.when_some(current_label, |this, label| {
-                    this.child(
-                        div()
-                            .absolute()
-                            .top(px(current_label_top))
-                            .right(px(15.0))
-                            .max_w(px(36.0))
-                            .h(px(18.0))
-                            .px_1()
-                            .rounded_sm()
-                            .bg(rgb(colors.playing))
-                            .border_1()
-                            .border_color(rgb(colors.border_strong))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_xs()
-                            .text_color(rgb(colors.text))
-                            .overflow_hidden()
-                            .child(label),
-                    )
-                })
-            })
             .into_any_element()
     }
 

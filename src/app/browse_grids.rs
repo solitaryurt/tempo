@@ -21,6 +21,7 @@ impl TempoApp {
         let grid_columns = self.browse_grid_columns(window);
 
         div()
+            .id("artists-page")
             .flex_1()
             .min_w_0()
             .bg(rgb(colors.surface))
@@ -47,6 +48,7 @@ impl TempoApp {
         let grid_columns = self.browse_grid_columns(window);
 
         div()
+            .id("albums-page")
             .flex_1()
             .min_w_0()
             .bg(rgb(colors.surface))
@@ -125,7 +127,6 @@ impl TempoApp {
             .id(id)
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
             .p_4()
             .child(
                 uniform_list(
@@ -152,8 +153,8 @@ impl TempoApp {
         let end = (start + columns).min(self.artists.len());
 
         div()
+            .id(SharedString::from(format!("artist-grid-row-{row_ix}")))
             .flex()
-            .flex_wrap()
             .gap_4()
             .pb_4()
             .children(
@@ -174,8 +175,8 @@ impl TempoApp {
         let end = (start + columns).min(self.albums.len());
 
         div()
+            .id(SharedString::from(format!("album-grid-row-{row_ix}")))
             .flex()
-            .flex_wrap()
             .gap_4()
             .pb_4()
             .children(
@@ -281,23 +282,17 @@ impl TempoApp {
             })
             .when(row_count > 0, |this| {
                 this.child(
-                    div()
-                        .id(SharedString::from(format!("{list_id}-scroll")))
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .child(
-                            uniform_list(
-                                list_id,
-                                row_count,
-                                cx.processor(move |this, range: Range<usize>, _window, cx| {
-                                    range
-                                        .filter_map(|row_ix| render_row(this, row_ix, cx))
-                                        .collect()
-                                }),
-                            )
-                            .size_full(),
-                        ),
+                    uniform_list(
+                        list_id,
+                        row_count,
+                        cx.processor(move |this, range: Range<usize>, _window, cx| {
+                            range
+                                .filter_map(|row_ix| render_row(this, row_ix, cx))
+                                .collect()
+                        }),
+                    )
+                    .flex_1()
+                    .min_h_0(),
                 )
             })
             .into_any_element()
@@ -482,6 +477,7 @@ impl TempoApp {
             .cursor_pointer()
             .hover(move |this| this.bg(rgb(colors.hover)))
             .child(self.row_image(
+                SharedString::from(format!("artist-row-image-{}", artist.artist_id)),
                 artist.photo_path.as_ref(),
                 artist.initials.clone(),
                 artist.color,
@@ -557,6 +553,10 @@ impl TempoApp {
             .cursor_pointer()
             .hover(move |this| this.bg(rgb(colors.hover)))
             .child(self.row_image(
+                SharedString::from(format!(
+                    "album-row-image-{}-{}",
+                    album.artist_id, album.album_id
+                )),
                 album.artwork_path.as_ref(),
                 album.initials.clone(),
                 album.color,
@@ -630,6 +630,7 @@ impl TempoApp {
             })
             .active(|this| this.opacity(0.88))
             .child(self.square_grid_image(
+                SharedString::from(format!("artist-card-image-{}", artist.artist_id)),
                 artist.photo_path.as_ref(),
                 artist.initials.clone(),
                 artist.color,
@@ -699,6 +700,10 @@ impl TempoApp {
             })
             .active(|this| this.opacity(0.88))
             .child(self.square_grid_image(
+                SharedString::from(format!(
+                    "album-card-image-{}-{}",
+                    album.artist_id, album.album_id
+                )),
                 album.artwork_path.as_ref(),
                 album.initials.clone(),
                 album.color,
@@ -746,6 +751,7 @@ impl TempoApp {
 
     fn square_grid_image(
         &self,
+        id: SharedString,
         path: Option<&PathBuf>,
         initials: String,
         color: u32,
@@ -755,6 +761,7 @@ impl TempoApp {
         let fallback_initials = initials.clone();
 
         div()
+            .id(id)
             .w(px(size))
             .h(px(size))
             .border_b_1()
@@ -773,11 +780,18 @@ impl TempoApp {
             .into_any_element()
     }
 
-    fn row_image(&self, path: Option<&PathBuf>, initials: String, color: u32) -> AnyElement {
+    fn row_image(
+        &self,
+        id: SharedString,
+        path: Option<&PathBuf>,
+        initials: String,
+        color: u32,
+    ) -> AnyElement {
         let colors = *self.colors();
         let fallback_initials = initials.clone();
 
         div()
+            .id(id)
             .w(px(38.0))
             .h(px(38.0))
             .flex_none()
