@@ -116,6 +116,20 @@ impl TempoApp {
                 cx,
             ))
             .child(self.render_nav_item(
+                "Artists",
+                self.artists.len().to_string(),
+                self.page == Page::Artists,
+                Page::Artists,
+                cx,
+            ))
+            .child(self.render_nav_item(
+                "Albums",
+                self.albums.len().to_string(),
+                self.page == Page::Albums,
+                Page::Albums,
+                cx,
+            ))
+            .child(self.render_nav_item(
                 "Settings",
                 "",
                 self.page == Page::Settings,

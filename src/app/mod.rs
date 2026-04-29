@@ -16,6 +16,7 @@ use gpui::{
 use rodio::{Decoder, Source as _};
 use serde::{Deserialize, Serialize};
 use tempo::{
+    catalog::{CatalogAlbum, CatalogArtist, CatalogStore, CatalogTrack},
     library::{
         Artwork as LibraryArtwork, IndexingError, LibraryEvent, LibraryIndexer, LibraryWatcher,
         ScanProgress,
@@ -24,6 +25,7 @@ use tempo::{
 };
 
 mod artwork;
+mod browse_grids;
 mod library_state;
 mod library_view;
 mod player;
@@ -39,6 +41,8 @@ use theme::{Theme, ThemeColors, bundled_themes, default_theme_id, resolve_theme_
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Library,
+    Artists,
+    Albums,
     Settings,
 }
 
@@ -121,6 +125,31 @@ struct Track {
     artwork: Option<TrackArtwork>,
     album_initials: String,
     album_color: u32,
+}
+
+#[derive(Clone)]
+struct Artist {
+    artist_id: i64,
+    name: String,
+    bio: Option<String>,
+    photo_path: Option<PathBuf>,
+    album_count: usize,
+    track_count: usize,
+    initials: String,
+    color: u32,
+}
+
+#[derive(Clone)]
+struct Album {
+    album_id: i64,
+    artist_id: i64,
+    title: String,
+    artist: String,
+    year: Option<String>,
+    artwork_path: Option<PathBuf>,
+    track_count: usize,
+    initials: String,
+    color: u32,
 }
 
 #[derive(Clone)]
@@ -346,6 +375,8 @@ pub(crate) struct TempoApp {
     context_menu_track: Option<usize>,
     context_menu_row: usize,
     tracks: Vec<Track>,
+    artists: Vec<Artist>,
+    albums: Vec<Album>,
     queue: Vec<usize>,
     waveform_cache: Vec<Option<Vec<f32>>>,
     waveform_loading: Vec<bool>,
@@ -363,6 +394,7 @@ pub(crate) struct TempoApp {
     table_scrollbar_drag: Option<TableScrollbarDrag>,
     table_is_scrolling: bool,
     table_scroll_generation: u64,
+    catalog: Option<CatalogStore>,
     _library_watcher: Option<LibraryWatcher>,
     playback: Option<PlaybackController>,
 }
@@ -377,8 +409,20 @@ impl TempoApp {
         let theme_id = resolve_theme_id(state.theme_id, &themes);
         let roots = Self::default_library_roots(&state.library_roots);
         let library_root_label = Self::library_root_label(&roots);
+        let (catalog, catalog_status) = match CatalogStore::open_default() {
+            Ok(catalog) => (Some(catalog), None),
+            Err(error) => (None, Some(format!("Catalog cache unavailable: {error:#}"))),
+        };
+        let cached_tracks = Self::load_cached_tracks(catalog.as_ref(), &roots).unwrap_or_default();
+        let cached_artists =
+            Self::load_cached_artists(catalog.as_ref(), &roots).unwrap_or_default();
+        let cached_albums = Self::load_cached_albums(catalog.as_ref(), &roots).unwrap_or_default();
         let (event_tx, event_rx) = mpsc::channel();
-        let (library_status, library_watcher) = Self::start_watcher_for_roots(&roots, event_tx);
+        let (mut library_status, library_watcher) =
+            Self::start_watcher_for_roots(&roots, event_tx, catalog.clone());
+        if let Some(catalog_status) = catalog_status {
+            library_status = catalog_status;
+        }
         let playlists = state.playlists;
         let (playback, playback_status) = match PlaybackController::new() {
             Ok(playback) => (Some(playback), "Audio output ready".to_string()),
@@ -391,7 +435,7 @@ impl TempoApp {
             Page::Library
         };
 
-        let app = Self {
+        let mut app = Self {
             focus_handle,
             search_focus_handle,
             page: initial_page,
@@ -405,7 +449,9 @@ impl TempoApp {
             is_playing: false,
             context_menu_track: None,
             context_menu_row: 0,
-            tracks: Vec::new(),
+            tracks: cached_tracks,
+            artists: cached_artists,
+            albums: cached_albums,
             queue: Vec::new(),
             waveform_cache: Vec::new(),
             waveform_loading: Vec::new(),
@@ -423,10 +469,12 @@ impl TempoApp {
             table_scrollbar_drag: None,
             table_is_scrolling: false,
             table_scroll_generation: 0,
+            catalog,
             _library_watcher: library_watcher,
             playback,
         };
 
+        app.invalidate_track_indices();
         app.start_library_event_loop(event_rx, cx);
         app.start_playback_tick(cx);
         app
@@ -474,10 +522,11 @@ impl TempoApp {
     }
 
     fn open_page(&mut self, page: Page) {
-        self.page = if page == Page::Library && self.library_roots.is_empty() {
-            Page::Settings
-        } else {
-            page
+        self.page = match page {
+            Page::Library | Page::Artists | Page::Albums if self.library_roots.is_empty() => {
+                Page::Settings
+            }
+            page => page,
         };
         self.context_menu_track = None;
     }
@@ -617,6 +666,62 @@ impl From<tempo::library::Track> for Track {
             artwork: track.artwork.and_then(TrackArtwork::from_library),
             album_initials,
             album_color,
+        }
+    }
+}
+
+impl From<CatalogTrack> for Track {
+    fn from(track: CatalogTrack) -> Self {
+        let album_initials = TempoApp::album_initials_for(&track.album, &track.title);
+        let album_color = TempoApp::album_color_for(&track.album, &track.artist);
+
+        Self {
+            path: track.path,
+            title: track.title,
+            artist: track.artist,
+            album: track.album,
+            year: track.year.unwrap_or_else(|| "Unknown year".to_string()),
+            duration: format_duration(track.duration),
+            duration_value: track.duration,
+            codec: track.codec,
+            bitrate: track.bitrate,
+            file_size: track.file_size,
+            plays: "0".to_string(),
+            loved: false,
+            artwork: track.artwork_path.map(TrackArtwork::File),
+            album_initials,
+            album_color,
+        }
+    }
+}
+
+impl From<CatalogArtist> for Artist {
+    fn from(artist: CatalogArtist) -> Self {
+        Self {
+            artist_id: artist.artist_id,
+            initials: TempoApp::initials_for(&artist.name),
+            color: TempoApp::color_for(&artist.name, "artist"),
+            name: artist.name,
+            bio: artist.bio,
+            photo_path: artist.photo_path,
+            album_count: artist.album_count,
+            track_count: artist.track_count,
+        }
+    }
+}
+
+impl From<CatalogAlbum> for Album {
+    fn from(album: CatalogAlbum) -> Self {
+        Self {
+            album_id: album.album_id,
+            artist_id: album.artist_id,
+            initials: TempoApp::initials_for(&album.title),
+            color: TempoApp::album_color_for(&album.title, &album.artist),
+            title: album.title,
+            artist: album.artist,
+            year: album.year,
+            artwork_path: album.artwork_path,
+            track_count: album.track_count,
         }
     }
 }

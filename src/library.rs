@@ -7,6 +7,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use crate::catalog::{CatalogFileFingerprint, CatalogStore, CatalogTrack};
 use anyhow::{Context, Result, anyhow};
 use lofty::{
     file::{AudioFile, TaggedFileExt},
@@ -101,6 +102,7 @@ impl Default for IndexerOptions {
 pub struct LibraryIndexer {
     roots: Vec<PathBuf>,
     options: IndexerOptions,
+    catalog: Option<CatalogStore>,
 }
 
 impl LibraryIndexer {
@@ -112,7 +114,13 @@ impl LibraryIndexer {
         Self {
             roots: roots.into_iter().collect(),
             options,
+            catalog: None,
         }
+    }
+
+    pub fn with_catalog(mut self, catalog: CatalogStore) -> Self {
+        self.catalog = Some(catalog);
+        self
     }
 
     pub fn scan(&self) -> ScanReport {
@@ -170,6 +178,34 @@ impl LibraryIndexer {
         let batch_size = self.options.batch_size.max(1);
 
         let _ = events.send(LibraryEvent::ScanStarted);
+        let scan_id =
+            self.catalog
+                .as_ref()
+                .and_then(|catalog| match catalog.begin_scan(&self.roots) {
+                    Ok(scan_id) => Some(scan_id),
+                    Err(error) => {
+                        send_error(
+                            events,
+                            PathBuf::new(),
+                            format!("failed to start catalog scan: {error:#}"),
+                        );
+                        None
+                    }
+                });
+        let cached_tracks = self.catalog.as_ref().and_then(|catalog| {
+            match catalog.load_track_fingerprints(&self.roots) {
+                Ok(tracks) => Some(tracks),
+                Err(error) => {
+                    send_error(
+                        events,
+                        PathBuf::new(),
+                        format!("failed to load catalog fingerprints: {error:#}"),
+                    );
+                    None
+                }
+            }
+        });
+        let mut cached_seen_paths = Vec::new();
 
         for root in &self.roots {
             for entry in WalkDir::new(root)
@@ -203,8 +239,39 @@ impl LibraryIndexer {
 
                 progress.discovered += 1;
 
+                if let Some((stored_fingerprint, cached_track)) =
+                    cached_tracks.as_ref().and_then(|tracks| tracks.get(path))
+                {
+                    if CatalogFileFingerprint::from_path(path).is_some_and(|current_fingerprint| {
+                        stored_fingerprint.matches(&current_fingerprint)
+                    }) {
+                        progress.indexed += 1;
+                        report.tracks.push(track_from_catalog(cached_track.clone()));
+                        cached_seen_paths.push(path.to_path_buf());
+
+                        if report.tracks.len() % batch_size == 0 {
+                            let start = report.tracks.len() - batch_size;
+                            let _ = events
+                                .send(LibraryEvent::TracksIndexed(report.tracks[start..].to_vec()));
+                            let _ = events.send(LibraryEvent::ScanProgress(progress));
+                        }
+
+                        continue;
+                    }
+                }
+
                 match index_audio_file(path) {
                     Ok(track) => {
+                        if let Some(catalog) = &self.catalog {
+                            if let Err(error) = catalog.upsert_track(&track, scan_id) {
+                                send_error(
+                                    events,
+                                    track.path.clone(),
+                                    format!("failed to cache indexed metadata: {error:#}"),
+                                );
+                            }
+                        }
+
                         progress.indexed += 1;
                         report.tracks.push(track);
 
@@ -239,6 +306,22 @@ impl LibraryIndexer {
         report
             .tracks
             .sort_by(|left, right| left.path.cmp(&right.path));
+        if let (Some(catalog), Some(scan_id)) = (&self.catalog, scan_id) {
+            if let Err(error) = catalog.mark_paths_seen(scan_id, &cached_seen_paths) {
+                send_error(
+                    events,
+                    PathBuf::new(),
+                    format!("failed to mark cached files as seen: {error:#}"),
+                );
+            }
+            if let Err(error) = catalog.finish_scan(scan_id, &self.roots) {
+                send_error(
+                    events,
+                    PathBuf::new(),
+                    format!("failed to finish catalog scan: {error:#}"),
+                );
+            }
+        }
         let _ = events.send(LibraryEvent::ScanProgress(progress));
         let _ = events.send(LibraryEvent::ScanFinished);
         (report, true)
@@ -247,11 +330,12 @@ impl LibraryIndexer {
     pub fn start_watching(self, events: mpsc::Sender<LibraryEvent>) -> Result<LibraryWatcher> {
         let roots = self.roots.clone();
         let options = self.options.clone();
+        let catalog = self.catalog.clone();
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
 
         let handle = thread::Builder::new()
             .name("tempo-library-watcher".to_string())
-            .spawn(move || run_watcher(roots, options, events, shutdown_rx))
+            .spawn(move || run_watcher(roots, options, catalog, events, shutdown_rx))
             .context("failed to spawn library watcher thread")?;
 
         Ok(LibraryWatcher {
@@ -354,6 +438,24 @@ pub fn index_audio_file(path: impl AsRef<Path>) -> Result<Track> {
     })
 }
 
+fn track_from_catalog(track: CatalogTrack) -> Track {
+    Track {
+        path: track.path,
+        title: track.title,
+        artist: track.artist,
+        album: track.album,
+        year: track.year,
+        duration: track.duration,
+        codec: track.codec,
+        sample_rate: None,
+        channels: None,
+        bitrate: track.bitrate,
+        file_size: track.file_size,
+        modified: None,
+        artwork: track.artwork_path.map(Artwork::File),
+    }
+}
+
 fn find_artwork(path: &Path, tag: Option<&Tag>) -> Option<Artwork> {
     tag.and_then(embedded_artwork)
         .or_else(|| find_folder_artwork(path).map(Artwork::File))
@@ -403,10 +505,12 @@ fn find_folder_artwork(audio_path: &Path) -> Option<PathBuf> {
 fn run_watcher(
     roots: Vec<PathBuf>,
     options: IndexerOptions,
+    catalog: Option<CatalogStore>,
     events: mpsc::Sender<LibraryEvent>,
     shutdown_rx: mpsc::Receiver<()>,
 ) {
-    let indexer = LibraryIndexer::with_options(roots.clone(), options.clone());
+    let mut indexer = LibraryIndexer::with_options(roots.clone(), options.clone());
+    indexer.catalog = catalog.clone();
     let mut shutdown_requested = false;
     let (_, completed_scan) = indexer.scan_with_events_until(&events, || {
         if shutdown_requested {
@@ -460,7 +564,9 @@ fn run_watcher(
                 record_notify_event(event, &roots, options.ignore_hidden, &mut pending)
             }
             Ok(Err(error)) => send_error(&events, PathBuf::new(), error.to_string()),
-            Err(mpsc::RecvTimeoutError::Timeout) => flush_pending(&events, &mut pending),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                flush_pending(&events, catalog.as_ref(), &mut pending)
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
@@ -495,7 +601,11 @@ fn record_notify_event(
     }
 }
 
-fn flush_pending(events: &mpsc::Sender<LibraryEvent>, pending: &mut HashMap<PathBuf, PendingPath>) {
+fn flush_pending(
+    events: &mpsc::Sender<LibraryEvent>,
+    catalog: Option<&CatalogStore>,
+    pending: &mut HashMap<PathBuf, PendingPath>,
+) {
     let pending_paths = std::mem::take(pending);
     let mut indexed = Vec::new();
     let mut removed = HashSet::new();
@@ -503,10 +613,30 @@ fn flush_pending(events: &mpsc::Sender<LibraryEvent>, pending: &mut HashMap<Path
     for (path, action) in pending_paths {
         match action {
             PendingPath::Index if path.exists() => match index_audio_file(&path) {
-                Ok(track) => indexed.push(track),
+                Ok(track) => {
+                    if let Some(catalog) = catalog {
+                        if let Err(error) = catalog.upsert_track(&track, None) {
+                            send_error(
+                                events,
+                                path.clone(),
+                                format!("failed to cache indexed metadata: {error:#}"),
+                            );
+                        }
+                    }
+                    indexed.push(track);
+                }
                 Err(error) => send_error(events, path, error.to_string()),
             },
             PendingPath::Index | PendingPath::Remove => {
+                if let Some(catalog) = catalog {
+                    if let Err(error) = catalog.mark_file_removed(&path) {
+                        send_error(
+                            events,
+                            path.clone(),
+                            format!("failed to mark removed file in catalog: {error:#}"),
+                        );
+                    }
+                }
                 removed.insert(path);
             }
         }
@@ -645,7 +775,7 @@ mod tests {
             true,
             &mut pending,
         );
-        flush_pending(&tx, &mut pending);
+        flush_pending(&tx, None, &mut pending);
 
         assert!(matches!(
             rx.recv_timeout(Duration::from_secs(1)).unwrap(),
@@ -659,7 +789,7 @@ mod tests {
             true,
             &mut pending,
         );
-        flush_pending(&tx, &mut pending);
+        flush_pending(&tx, None, &mut pending);
 
         assert!(matches!(
             rx.recv_timeout(Duration::from_secs(1)).unwrap(),

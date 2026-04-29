@@ -76,7 +76,15 @@ impl TempoApp {
             album
         };
 
-        let mut initials = source
+        Self::initials_for(source)
+    }
+
+    pub(super) fn album_color_for(album: &str, artist: &str) -> u32 {
+        Self::color_for(album, artist)
+    }
+
+    pub(super) fn initials_for(value: &str) -> String {
+        let mut initials = value
             .split_whitespace()
             .filter_map(|word| word.chars().next())
             .take(2)
@@ -90,9 +98,9 @@ impl TempoApp {
         initials
     }
 
-    pub(super) fn album_color_for(album: &str, artist: &str) -> u32 {
+    pub(super) fn color_for(value: &str, salt: &str) -> u32 {
         let mut hash = 0xcbf29ce484222325_u64;
-        for byte in album.bytes().chain(artist.bytes()) {
+        for byte in value.bytes().chain(salt.bytes()) {
             hash ^= byte as u64;
             hash = hash.wrapping_mul(0x100000001b3);
         }

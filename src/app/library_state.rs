@@ -73,6 +73,7 @@ impl TempoApp {
     pub(super) fn start_watcher_for_roots(
         roots: &[PathBuf],
         event_tx: mpsc::Sender<LibraryEvent>,
+        catalog: Option<CatalogStore>,
     ) -> (String, Option<LibraryWatcher>) {
         if roots.is_empty() {
             return (
@@ -82,7 +83,12 @@ impl TempoApp {
         }
 
         let library_root_label = Self::library_root_label(roots);
-        match LibraryIndexer::new(roots.to_vec()).start_watching(event_tx) {
+        let mut indexer = LibraryIndexer::new(roots.to_vec());
+        if let Some(catalog) = catalog {
+            indexer = indexer.with_catalog(catalog);
+        }
+
+        match indexer.start_watching(event_tx) {
             Ok(watcher) => (format!("Scanning {library_root_label}"), Some(watcher)),
             Err(error) => (format!("Library watcher failed: {error}"), None),
         }
@@ -95,7 +101,9 @@ impl TempoApp {
 
         self.stop_current_playback();
         self.library_root_label = Self::library_root_label(&self.library_roots);
-        self.tracks.clear();
+        self.tracks = Self::load_cached_tracks(self.catalog.as_ref(), &self.library_roots)
+            .unwrap_or_default();
+        self.reload_catalog_browse_data();
         self.queue.clear();
         self.waveform_cache.clear();
         self.waveform_loading.clear();
@@ -110,7 +118,8 @@ impl TempoApp {
         self.is_scanning = false;
 
         let (event_tx, event_rx) = mpsc::channel();
-        let (status, watcher) = Self::start_watcher_for_roots(&self.library_roots, event_tx);
+        let (status, watcher) =
+            Self::start_watcher_for_roots(&self.library_roots, event_tx, self.catalog.clone());
         self.library_status = status;
         self._library_watcher = watcher;
         self.start_library_event_loop(event_rx, cx);
@@ -182,20 +191,63 @@ impl TempoApp {
         .detach();
     }
 
+    pub(super) fn load_cached_tracks(
+        catalog: Option<&CatalogStore>,
+        roots: &[PathBuf],
+    ) -> anyhow::Result<Vec<Track>> {
+        let Some(catalog) = catalog else {
+            return Ok(Vec::new());
+        };
+
+        Ok(catalog
+            .load_tracks(roots)?
+            .into_iter()
+            .map(Track::from)
+            .collect())
+    }
+
+    pub(super) fn load_cached_artists(
+        catalog: Option<&CatalogStore>,
+        roots: &[PathBuf],
+    ) -> anyhow::Result<Vec<Artist>> {
+        let Some(catalog) = catalog else {
+            return Ok(Vec::new());
+        };
+
+        Ok(catalog
+            .load_artists(roots)?
+            .into_iter()
+            .map(Artist::from)
+            .collect())
+    }
+
+    pub(super) fn load_cached_albums(
+        catalog: Option<&CatalogStore>,
+        roots: &[PathBuf],
+    ) -> anyhow::Result<Vec<Album>> {
+        let Some(catalog) = catalog else {
+            return Ok(Vec::new());
+        };
+
+        Ok(catalog
+            .load_albums(roots)?
+            .into_iter()
+            .map(Album::from)
+            .collect())
+    }
+
+    pub(super) fn reload_catalog_browse_data(&mut self) {
+        if let Ok(artists) = Self::load_cached_artists(self.catalog.as_ref(), &self.library_roots) {
+            self.artists = artists;
+        }
+        if let Ok(albums) = Self::load_cached_albums(self.catalog.as_ref(), &self.library_roots) {
+            self.albums = albums;
+        }
+    }
+
     pub(super) fn apply_library_event(&mut self, event: LibraryEvent) {
         match event {
             LibraryEvent::ScanStarted => {
-                self.stop_current_playback();
-                self.tracks.clear();
-                self.queue.clear();
-                self.waveform_cache.clear();
-                self.waveform_loading.clear();
-                self.invalidate_track_indices();
-                for tab in &mut self.tabs {
-                    tab.selected_track = 0;
-                }
-                self.playing_track = 0;
-                self.is_playing = false;
                 self.context_menu_track = None;
                 self.scan_progress = ScanProgress::default();
                 self.scan_errors.clear();
@@ -238,6 +290,9 @@ impl TempoApp {
             }
             LibraryEvent::TrackRemoved(path) => {
                 if let Some(ix) = self.tracks.iter().position(|track| track.path == path) {
+                    if let Some(catalog) = &self.catalog {
+                        let _ = catalog.mark_file_removed(&path);
+                    }
                     self.tracks.remove(ix);
                     if ix < self.waveform_cache.len() {
                         self.waveform_cache.remove(ix);
@@ -247,6 +302,7 @@ impl TempoApp {
                     }
                     self.remove_track_from_queue(ix);
                     self.invalidate_track_indices();
+                    self.reload_catalog_browse_data();
                     self.clamp_track_indices();
                     self.library_status = Self::scan_status(self.scan_progress, self.is_scanning);
                 }
@@ -257,6 +313,17 @@ impl TempoApp {
                 self.scan_errors.push(error);
             }
             LibraryEvent::ScanFinished => {
+                if self.catalog.is_some() {
+                    if let Ok(tracks) =
+                        Self::load_cached_tracks(self.catalog.as_ref(), &self.library_roots)
+                    {
+                        self.tracks = tracks;
+                        self.waveform_cache.clear();
+                        self.waveform_loading.clear();
+                        self.invalidate_track_indices();
+                    }
+                }
+                self.reload_catalog_browse_data();
                 self.clamp_track_indices();
                 self.is_scanning = false;
                 self.library_status = Self::scan_status(self.scan_progress, false);
