@@ -1621,12 +1621,12 @@ impl TempoApp {
     }
 
     fn can_close_tab(&self, tab_ix: usize) -> bool {
-        let Some(tab) = self.tabs.get(tab_ix) else {
-            return false;
-        };
-
-        self.tabs.len() > 1
-            && !(tab.source == TabSource::Library && tab.search_query.trim().is_empty())
+        // The very first tab is the permanent "All Music" anchor and is
+        // never closable. Every other tab (including additional All Music
+        // tabs the user has opened later) can be closed, regardless of
+        // source or search state. This is intentionally simpler than the
+        // older rule that exempted any empty-search Library tab.
+        tab_ix > 0 && tab_ix < self.tabs.len()
     }
 }
 
