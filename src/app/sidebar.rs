@@ -1,4 +1,16 @@
 use super::*;
+use std::sync::{Mutex, OnceLock};
+
+/// Process-wide cache of pre-rasterized sidebar nav icons. Keyed by
+/// `(target, active, color, accent)` so theme switches and the
+/// active/inactive state both invalidate the right entries while still
+/// giving every render after the first a cheap `Arc<Image>::clone`
+/// instead of a fresh SVG encode.
+type SidebarIconCacheKey = (Page, bool, u32, u32);
+fn sidebar_icon_cache() -> &'static Mutex<HashMap<SidebarIconCacheKey, Arc<Image>>> {
+    static CACHE: OnceLock<Mutex<HashMap<SidebarIconCacheKey, Arc<Image>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 impl TempoApp {
     pub(super) fn render_left_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -39,7 +51,7 @@ impl TempoApp {
                             .flex()
                             .justify_between()
                             .child(format!("{} tracks", self.tracks.len()))
-                            .child(Self::format_library_size(&self.tracks)),
+                            .child(Self::format_library_size_bytes(self.library_size_bytes)),
                     ),
             )
             .into_any_element()
@@ -214,40 +226,167 @@ impl TempoApp {
         } else {
             colors.text
         };
+        let renaming = self
+            .playlist_rename
+            .as_ref()
+            .is_some_and(|rename| rename.playlist_ix == ix);
 
-        div()
+        let mut row = div()
             .id(SharedString::from(format!("playlist-{ix}")))
             .h(px(22.0))
             .px_2()
             .rounded_md()
-            .cursor_pointer()
             .flex()
             .items_center()
             .justify_between()
             .bg(rgb(bg))
-            .text_color(rgb(fg))
-            .active(|this| this.opacity(0.82))
-            .child(
-                div()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .child(playlist.name.clone()),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(colors.text_faint))
-                    .child(playlist.track_paths.len().to_string()),
-            )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_playlist_tab(ix);
+            .text_color(rgb(fg));
+
+        if !renaming {
+            row = row.cursor_pointer().active(|this| this.opacity(0.82));
+        }
+
+        let label_child: AnyElement = if renaming {
+            self.render_playlist_rename_input(cx).into_any_element()
+        } else {
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(playlist.name.clone())
+                .into_any_element()
+        };
+
+        let count_child: AnyElement = div()
+            .text_xs()
+            .text_color(rgb(colors.text_faint))
+            .child(playlist.track_paths.len().to_string())
+            .into_any_element();
+
+        let row = row.child(label_child).child(count_child);
+
+        if renaming {
+            // While renaming, suppress click-to-open and drop targets so
+            // the input can take focus + accept text without triggering
+            // tab navigation underneath.
+            return row;
+        }
+
+        row.on_click(cx.listener(move |this, _, _, cx| {
+            this.open_playlist_tab(ix);
+            cx.notify();
+        }))
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                this.open_playlist_context_menu(ix, event.position);
+                cx.stop_propagation();
                 cx.notify();
+            }),
+        )
+        .on_drop(cx.listener(move |this, drag: &TrackDrag, _window, cx| {
+            this.add_track_to_playlist(drag.track_ix, ix);
+            cx.notify();
+        }))
+    }
+
+    /// Render the inline rename input that replaces the playlist label
+    /// while a rename is in progress. Mirrors the search-input pattern:
+    /// a focusable div that consumes key events and renders cursor /
+    /// selection by hand.
+    fn render_playlist_rename_input(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = *self.colors();
+        let Some(rename) = self.playlist_rename.as_ref() else {
+            return div().into_any_element();
+        };
+        let Some(focus_handle) = self.playlist_rename_focus_handle.as_ref() else {
+            return div().into_any_element();
+        };
+        let text = rename.input.text().to_string();
+        let selection = rename.input.selection_range();
+
+        let mut children: Vec<AnyElement> = Vec::new();
+        if let Some(range) = selection {
+            if range.start > 0 {
+                children.push(
+                    div()
+                        .flex_none()
+                        .child(text[..range.start].to_string())
+                        .into_any_element(),
+                );
+            }
+            children.push(
+                div()
+                    .flex_none()
+                    .rounded_sm()
+                    .bg(rgb(colors.selected))
+                    .text_color(rgb(colors.text_strong))
+                    .child(text[range.clone()].to_string())
+                    .into_any_element(),
+            );
+            if range.end < text.len() {
+                children.push(
+                    div()
+                        .flex_none()
+                        .child(text[range.end..].to_string())
+                        .into_any_element(),
+                );
+            }
+        } else {
+            let cursor = rename.input.cursor();
+            if cursor > 0 {
+                children.push(
+                    div()
+                        .flex_none()
+                        .child(text[..cursor].to_string())
+                        .into_any_element(),
+                );
+            }
+            // Block-style caret so the user can see where they are.
+            children.push(
+                div()
+                    .flex_none()
+                    .w(px(1.0))
+                    .h(px(14.0))
+                    .bg(rgb(colors.text_strong))
+                    .into_any_element(),
+            );
+            if cursor < text.len() {
+                children.push(
+                    div()
+                        .flex_none()
+                        .child(text[cursor..].to_string())
+                        .into_any_element(),
+                );
+            }
+        }
+
+        div()
+            .id("playlist-rename-input")
+            .min_w_0()
+            .flex_1()
+            .h(px(20.0))
+            .px_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(colors.accent))
+            .bg(rgb(colors.button))
+            .text_color(rgb(colors.text_strong))
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .track_focus(focus_handle)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                this.handle_playlist_rename_key_down(event, cx);
             }))
-            .on_drop(cx.listener(move |this, drag: &TrackDrag, _window, cx| {
-                this.add_track_to_playlist(drag.track_ix, ix);
-                cx.notify();
-            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .children(children)
+            .into_any_element()
     }
 
     pub(super) fn render_nav_item(
@@ -309,15 +448,29 @@ impl TempoApp {
     }
 
     pub(super) fn sidebar_nav_icon(target: Page, active: bool, colors: ThemeColors) -> AnyElement {
-        let color = format!(
-            "#{:06x}",
-            if active {
-                colors.text_strong
-            } else {
-                colors.text_muted
-            }
-        );
-        let accent = format!("#{:06x}", colors.accent);
+        // Cache key uses the raw u32 colors so we don't have to format
+        // strings before the lookup. The cache lives for the process
+        // lifetime; theme changes simply add a few new entries.
+        let color_u32 = if active {
+            colors.text_strong
+        } else {
+            colors.text_muted
+        };
+        let accent_u32 = colors.accent;
+        let cache_key = (target, active, color_u32, accent_u32);
+
+        if let Ok(cache) = sidebar_icon_cache().lock()
+            && let Some(image) = cache.get(&cache_key)
+        {
+            return img(Arc::clone(image))
+                .w(px(15.0))
+                .h(px(15.0))
+                .flex_none()
+                .into_any_element();
+        }
+
+        let color = format!("#{:06x}", color_u32);
+        let accent = format!("#{:06x}", accent_u32);
         let accent_stroke = if active {
             accent.as_str()
         } else {
@@ -360,14 +513,16 @@ impl TempoApp {
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">{paths}</svg>"#
         );
 
-        img(Arc::new(Image::from_bytes(
-            ImageFormat::Svg,
-            svg.into_bytes(),
-        )))
-        .w(px(15.0))
-        .h(px(15.0))
-        .flex_none()
-        .into_any_element()
+        let image = Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes()));
+        if let Ok(mut cache) = sidebar_icon_cache().lock() {
+            cache.insert(cache_key, Arc::clone(&image));
+        }
+
+        img(image)
+            .w(px(15.0))
+            .h(px(15.0))
+            .flex_none()
+            .into_any_element()
     }
 
     pub(super) fn render_queue(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -492,6 +647,214 @@ impl TempoApp {
                     .text_xs()
                     .text_color(rgb(colors.text_faint))
                     .child(track.duration.clone()),
+            )
+    }
+
+    /// Right-click context menu for sidebar playlist nav items. The
+    /// menu itself is anchored at the mouse-down position; a
+    /// transparent full-window backdrop sits behind it so any
+    /// mouse-down outside the menu dismisses it.
+    pub(super) fn render_playlist_context_menu(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let menu = self
+            .playlist_context_menu
+            .expect("called only when context menu is open");
+        let playlist_ix = menu.playlist_ix;
+        let name = self
+            .playlists
+            .get(playlist_ix)
+            .map(|playlist| playlist.name.clone())
+            .unwrap_or_default();
+
+        let panel =
+            self.menu_panel(190.0)
+                .child(self.menu_header(name))
+                .child(self.context_menu_item("Open").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.close_playlist_context_menu();
+                        this.open_playlist_tab(playlist_ix);
+                        cx.notify();
+                    },
+                )))
+                .child(self.context_menu_item("Rename").on_click(cx.listener(
+                    move |this, _, window, cx| {
+                        this.start_playlist_rename(playlist_ix, window, cx);
+                        cx.notify();
+                    },
+                )))
+                .child(self.context_menu_item("Delete").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.request_delete_playlist(playlist_ix);
+                        cx.notify();
+                    },
+                )));
+
+        // Transparent full-window click-eater behind the anchored menu.
+        // Any mouse-down here dismisses the menu without triggering
+        // whatever is underneath. The menu itself stops propagation on
+        // its own mouse-down so item clicks still work.
+        div()
+            .id("playlist-context-menu-backdrop")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.close_playlist_context_menu();
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.close_playlist_context_menu();
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .child(self.menu_at(
+                menu.position,
+                Corner::TopLeft,
+                point(px(2.0), px(2.0)),
+                panel.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                    }),
+                ),
+            ))
+    }
+
+    /// Centered modal dialog asking the user to confirm playlist
+    /// deletion. The backdrop intercepts mouse-down events so clicking
+    /// outside the dialog dismisses it without triggering whatever was
+    /// behind it (sidebar buttons, table rows, etc.).
+    pub(super) fn render_playlist_delete_confirm(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let playlist_ix = self
+            .playlist_delete_confirm
+            .expect("called only when delete confirm is open");
+        let name = self
+            .playlists
+            .get(playlist_ix)
+            .map(|playlist| playlist.name.clone())
+            .unwrap_or_default();
+        let colors = *self.colors();
+
+        // Full-window backdrop. We layer the dialog inside it (centered
+        // via flex) instead of using `anchored()` because the dialog is
+        // modal -- we want it pinned to viewport center, not anchored
+        // near the click site.
+        div()
+            .id("playlist-delete-confirm-backdrop")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::rgba(0x00000080))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.cancel_delete_playlist();
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .id("playlist-delete-confirm-dialog")
+                    .w(px(360.0))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(colors.border_strong))
+                    .bg(rgb(colors.elevated))
+                    .shadow_lg()
+                    .overflow_hidden()
+                    // Eat clicks inside the dialog so they don't bubble
+                    // up to the backdrop and trigger a cancel.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .px_4()
+                            .py_3()
+                            .border_b_1()
+                            .border_color(rgb(colors.border))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(colors.text_strong))
+                            .child("Delete playlist?"),
+                    )
+                    .child(
+                        div()
+                            .px_4()
+                            .py_3()
+                            .text_color(rgb(colors.text))
+                            .child(format!(
+                                "\"{name}\" will be removed from your library. \
+                                 The audio files on disk are unchanged."
+                            )),
+                    )
+                    .child(
+                        div()
+                            .px_4()
+                            .py_3()
+                            .border_t_1()
+                            .border_color(rgb(colors.border))
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("playlist-delete-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(colors.border))
+                                    .bg(rgb(colors.button))
+                                    .text_color(rgb(colors.text))
+                                    .cursor_pointer()
+                                    .hover(move |this| {
+                                        this.bg(rgb(colors.button_hover))
+                                            .text_color(rgb(colors.text_strong))
+                                    })
+                                    .child("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cancel_delete_playlist();
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("playlist-delete-confirm")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(colors.accent))
+                                    .text_color(rgb(colors.text_strong))
+                                    .cursor_pointer()
+                                    .hover(|this| this.opacity(0.85))
+                                    .child("Delete")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.confirm_delete_playlist();
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
             )
     }
 }

@@ -2295,7 +2295,19 @@ impl TempoApp {
                         ))
                 })
                 .child(self.context_menu_item("Go to album"))
-                .child(self.context_menu_item("Show file")),
+                .child(self.context_menu_item("Show file").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        // Capture the path before closing the menu so
+                        // we don't dereference the index-based
+                        // `context_menu_track` after we've cleared it.
+                        let path = this.tracks.get(track_ix).map(|track| track.path.clone());
+                        this.context_menu_track = None;
+                        if let Some(path) = path {
+                            reveal_in_file_manager(&path);
+                        }
+                        cx.notify();
+                    },
+                ))),
         )
     }
 
