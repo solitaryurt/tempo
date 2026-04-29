@@ -10,15 +10,13 @@ impl TempoApp {
 
                 if this
                     .update(cx, |app, cx| {
-                        if app.is_playing {
-                            if app
+                        if app.is_playing
+                            && app
                                 .playback
                                 .as_ref()
                                 .is_some_and(|playback| playback.is_empty())
-                            {
-                                app.is_playing = false;
-                                app.playback_status = "Playback finished".to_string();
-                            }
+                        {
+                            app.play_finished_track();
                             cx.notify();
                         }
                     })
@@ -214,6 +212,60 @@ impl TempoApp {
             .unwrap_or(0);
         let next = (position as isize + delta).clamp(0, indices.len().saturating_sub(1) as isize);
         self.play_track(indices[next as usize]);
+    }
+
+    pub(super) fn play_finished_track(&mut self) {
+        match self.playback_mode {
+            PlaybackMode::Loop => self.play_track(self.playing_track),
+            PlaybackMode::Shuffle => self.play_random_track(),
+            PlaybackMode::Straight => {
+                if let Some(next) = self.next_track_after(self.playing_track) {
+                    self.play_track(next);
+                } else {
+                    self.is_playing = false;
+                    self.playback_status = "Playback finished".to_string();
+                }
+            }
+        }
+    }
+
+    pub(super) fn next_track_after(&self, track_ix: usize) -> Option<usize> {
+        let indices = self.current_track_indices();
+        let position = indices.iter().position(|ix| *ix == track_ix)?;
+        indices.get(position + 1).copied()
+    }
+
+    pub(super) fn play_random_track(&mut self) {
+        let indices = self.current_track_indices();
+        if indices.is_empty() {
+            return;
+        }
+
+        let seed = Self::shuffle_seed();
+        let next = indices
+            .iter()
+            .copied()
+            .filter(|track_ix| indices.len() == 1 || *track_ix != self.playing_track)
+            .min_by_key(|track_ix| Self::shuffle_key(&self.tracks[*track_ix], *track_ix, seed))
+            .unwrap_or(self.playing_track);
+        self.play_track(next);
+    }
+
+    pub(super) fn cycle_playback_mode(&mut self) {
+        self.playback_mode = match self.playback_mode {
+            PlaybackMode::Straight => PlaybackMode::Loop,
+            PlaybackMode::Loop => PlaybackMode::Shuffle,
+            PlaybackMode::Shuffle => PlaybackMode::Straight,
+        };
+        self.playback_status = format!("{} mode", self.playback_mode_label());
+    }
+
+    pub(super) fn playback_mode_label(&self) -> &'static str {
+        match self.playback_mode {
+            PlaybackMode::Straight => "Straight play",
+            PlaybackMode::Loop => "Loop",
+            PlaybackMode::Shuffle => "Shuffle",
+        }
     }
 
     pub(super) fn playback_position(&self) -> Duration {
@@ -469,6 +521,7 @@ impl TempoApp {
             window.request_animation_frame();
         }
         let playback_position = self.playback_position();
+        let playing_track_ix = self.playing_track;
         let track = &self.tracks[self.playing_track];
         let playback_position = playback_position.min(track.duration_value);
         let playback_progress = if track.duration_value.is_zero() {
@@ -487,7 +540,16 @@ impl TempoApp {
             .border_t_1()
             .border_color(rgb(colors.button_hover))
             .bg(rgb(colors.player))
-            .child(self.album_tile(track, 54.0))
+            .child(
+                div()
+                    .id("now-playing-album-link")
+                    .cursor_pointer()
+                    .child(self.album_tile(track, 54.0))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_album_tab_for_track(playing_track_ix);
+                        cx.notify();
+                    })),
+            )
             .child(
                 div()
                     .w(px(220.0))
@@ -496,14 +558,45 @@ impl TempoApp {
                     .gap_1()
                     .child(
                         div()
+                            .id("now-playing-title-link")
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(rgb(colors.text_strong))
+                            .cursor_pointer()
+                            .hover(move |this| this.text_color(rgb(colors.accent_soft)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.select_track_in_all_music(playing_track_ix);
+                                cx.notify();
+                            }))
                             .child(track.title.clone()),
                     )
                     .child(
                         div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
                             .text_color(rgb(colors.text_muted))
-                            .child(format!("{} - {}", track.artist, track.album)),
+                            .child(
+                                div()
+                                    .id("now-playing-artist-link")
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .cursor_pointer()
+                                    .hover(move |this| this.text_color(rgb(colors.accent_soft)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_artist_tab_for_track(playing_track_ix);
+                                        cx.notify();
+                                    }))
+                                    .child(track.artist.clone()),
+                            )
+                            .child(div().text_color(rgb(colors.text_faint)).child("-"))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(track.album.clone()),
+                            ),
                     )
                     .child(
                         div()
@@ -545,7 +638,18 @@ impl TempoApp {
                             .flex()
                             .items_center()
                             .gap_3()
-                            .child("☰")
+                            .child(
+                                self.seek_side_button(
+                                    self.playback_mode_icon(),
+                                    self.playback_mode != PlaybackMode::Straight,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.cycle_playback_mode();
+                                        cx.notify();
+                                    },
+                                )),
+                            )
                             .child("♩")
                             .child(
                                 div()
@@ -560,10 +664,24 @@ impl TempoApp {
                                             .rounded_full()
                                             .bg(rgb(colors.text)),
                                     ),
-                            ),
+                            )
+                            .child(self.seek_side_button("⤨", false).on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.play_random_track();
+                                    cx.notify();
+                                },
+                            ))),
                     ),
             )
             .into_any_element()
+    }
+
+    pub(super) fn playback_mode_icon(&self) -> &'static str {
+        match self.playback_mode {
+            PlaybackMode::Straight => "→",
+            PlaybackMode::Loop => "↻",
+            PlaybackMode::Shuffle => "⤨",
+        }
     }
 
     pub(super) fn bitrate_label(track: &Track) -> String {
@@ -792,6 +910,37 @@ impl TempoApp {
                     .bg(rgb(colors.text_strong))
                     .text_color(rgb(colors.app))
             })
+            .child(label)
+    }
+
+    pub(super) fn seek_side_button(
+        &self,
+        label: &'static str,
+        active: bool,
+    ) -> gpui::Stateful<gpui::Div> {
+        let colors = *self.colors();
+        div()
+            .id(SharedString::from(format!("seek-side-{label}")))
+            .w(px(20.0))
+            .h(px(20.0))
+            .rounded_full()
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_xs()
+            .font_weight(gpui::FontWeight::BOLD)
+            .bg(rgb(if active {
+                colors.text_strong
+            } else {
+                colors.player
+            }))
+            .text_color(rgb(if active {
+                colors.app
+            } else {
+                colors.text_muted
+            }))
+            .hover(move |this| this.bg(rgb(colors.text_strong)).text_color(rgb(colors.app)))
             .child(label)
     }
 }

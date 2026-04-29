@@ -34,6 +34,7 @@ impl TempoApp {
             .when(self.tabs.len() > 1, |this| {
                 this.child(self.render_tab_bar(cx))
             })
+            .when_some(self.render_detail_hero(cx), |this, hero| this.child(hero))
             .child(self.render_table(cx))
             .when(
                 self.show_scan_errors && !self.scan_errors.is_empty(),
@@ -166,7 +167,7 @@ impl TempoApp {
             .when_some(
                 match tab.source {
                     TabSource::Playlist(playlist_ix) => Some(playlist_ix),
-                    TabSource::Library => None,
+                    TabSource::Library | TabSource::Artist(_) | TabSource::Album(_) => None,
                 },
                 |this, playlist_ix| {
                     this.on_drop(cx.listener(move |this, drag: &TrackDrag, _window, cx| {

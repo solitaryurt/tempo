@@ -7,6 +7,178 @@ struct BrowseTableColumn {
 }
 
 impl TempoApp {
+    pub(super) fn render_detail_hero(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        match self.active_tab().source {
+            TabSource::Artist(artist_id) => self.render_artist_detail_hero(artist_id, cx),
+            TabSource::Album(album_id) => self.render_album_detail_hero(album_id, cx),
+            TabSource::Library | TabSource::Playlist(_) => None,
+        }
+    }
+
+    fn render_artist_detail_hero(
+        &self,
+        artist_id: i64,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let artist = self.artist_by_id(artist_id)?;
+        let colors = *self.colors();
+        let albums = self.albums_for_artist(artist.artist_id);
+
+        Some(
+            div()
+                .id(SharedString::from(format!("artist-hero-{artist_id}")))
+                .flex_none()
+                .px_4()
+                .py_3()
+                .border_b_1()
+                .border_color(rgb(colors.border))
+                .bg(rgb(colors.elevated))
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .gap_4()
+                        .items_center()
+                        .child(self.hero_image(
+                            SharedString::from(format!("artist-hero-image-{artist_id}")),
+                            artist.photo_path.as_ref(),
+                            artist.initials.clone(),
+                            artist.color,
+                        ))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(colors.accent))
+                                        .child("ARTIST"),
+                                )
+                                .child(
+                                    div()
+                                        .text_lg()
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .text_color(rgb(colors.text_strong))
+                                        .child(artist.name.clone()),
+                                )
+                                .child(div().text_color(rgb(colors.text_muted)).child(format!(
+                                    "{} albums  ·  {} tracks",
+                                    artist.album_count, artist.track_count
+                                )))
+                                .child(div().text_color(rgb(colors.text)).child(
+                                    artist.bio.clone().unwrap_or_else(|| {
+                                        format!(
+                                            "{} is represented by {} local albums in your library.",
+                                            artist.name, artist.album_count
+                                        )
+                                    }),
+                                )),
+                        ),
+                )
+                .when(!albums.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(colors.text_faint))
+                                    .child("ALBUMS"),
+                            )
+                            .child(self.render_artist_album_grid(&albums, cx)),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn render_album_detail_hero(
+        &self,
+        album_id: i64,
+        _cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let album = self.album_by_id(album_id)?;
+        let colors = *self.colors();
+        let artist_bio = self
+            .artist_by_id(album.artist_id)
+            .and_then(|artist| artist.bio.clone());
+        let description = artist_bio.unwrap_or_else(|| {
+            album
+                .year
+                .as_ref()
+                .map(|year| {
+                    format!(
+                        "A {year} local album by {}, collected in your library with {} tracks.",
+                        album.artist, album.track_count
+                    )
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "A local album by {}, collected in your library with {} tracks.",
+                        album.artist, album.track_count
+                    )
+                })
+        });
+
+        Some(
+            div()
+                .id(SharedString::from(format!("album-hero-{album_id}")))
+                .flex_none()
+                .px_4()
+                .py_3()
+                .border_b_1()
+                .border_color(rgb(colors.border))
+                .bg(rgb(colors.elevated))
+                .flex()
+                .gap_4()
+                .items_center()
+                .child(self.hero_image(
+                    SharedString::from(format!("album-hero-image-{album_id}")),
+                    album.artwork_path.as_ref(),
+                    album.initials.clone(),
+                    album.color,
+                ))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(colors.accent))
+                                .child("ALBUM"),
+                        )
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(rgb(colors.text_strong))
+                                .child(album.title.clone()),
+                        )
+                        .child(div().text_color(rgb(colors.text_muted)).child(format!(
+                                "{}  ·  {}  ·  {} tracks",
+                                album.artist,
+                                album.year.clone().unwrap_or_else(|| "Unknown year".to_string()),
+                                album.track_count
+                            )))
+                        .child(div().text_color(rgb(colors.text)).child(description)),
+                )
+                .into_any_element(),
+        )
+    }
+
     pub(super) fn render_artists_page(
         &self,
         window: &mut Window,
@@ -459,7 +631,7 @@ impl TempoApp {
         } else {
             colors.panel_alt
         };
-        let name = artist.name.clone();
+        let artist_id = artist.artist_id;
 
         div()
             .id(SharedString::from(format!(
@@ -519,8 +691,7 @@ impl TempoApp {
                     .child(artist.track_count.to_string()),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_all_music_tab();
-                this.set_search_query(name.clone());
+                this.open_artist_tab(artist_id);
                 cx.notify();
             }))
             .into_any_element()
@@ -535,7 +706,7 @@ impl TempoApp {
         } else {
             colors.panel_alt
         };
-        let search = format!("{} {}", album.artist, album.title);
+        let album_id = album.album_id;
 
         div()
             .id(SharedString::from(format!(
@@ -592,8 +763,7 @@ impl TempoApp {
                     .child(album.track_count.to_string()),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_all_music_tab();
-                this.set_search_query(search.clone());
+                this.open_album_tab(album_id);
                 cx.notify();
             }))
             .into_any_element()
@@ -610,7 +780,7 @@ impl TempoApp {
 
     fn render_artist_card(&self, artist: &Artist, cx: &mut Context<Self>) -> AnyElement {
         let colors = *self.colors();
-        let name = artist.name.clone();
+        let artist_id = artist.artist_id;
 
         div()
             .id(SharedString::from(format!(
@@ -671,8 +841,7 @@ impl TempoApp {
                     }),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_all_music_tab();
-                this.set_search_query(name.clone());
+                this.open_artist_tab(artist_id);
                 cx.notify();
             }))
             .into_any_element()
@@ -680,7 +849,7 @@ impl TempoApp {
 
     fn render_album_card(&self, album: &Album, cx: &mut Context<Self>) -> AnyElement {
         let colors = *self.colors();
-        let search = format!("{} {}", album.artist, album.title);
+        let album_id = album.album_id;
 
         div()
             .id(SharedString::from(format!(
@@ -742,10 +911,65 @@ impl TempoApp {
                     ),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_all_music_tab();
-                this.set_search_query(search.clone());
+                this.open_album_tab(album_id);
                 cx.notify();
             }))
+            .into_any_element()
+    }
+
+    fn render_artist_album_grid(&self, albums: &[&Album], cx: &mut Context<Self>) -> AnyElement {
+        let rows = albums
+            .chunks(4)
+            .enumerate()
+            .map(|(row_ix, row)| {
+                div()
+                    .id(SharedString::from(format!(
+                        "artist-album-hero-row-{row_ix}"
+                    )))
+                    .flex()
+                    .gap_3()
+                    .children(row.iter().map(|album| self.render_album_card(album, cx)))
+            })
+            .collect::<Vec<_>>();
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .children(rows)
+            .into_any_element()
+    }
+
+    fn hero_image(
+        &self,
+        id: SharedString,
+        path: Option<&PathBuf>,
+        initials: String,
+        color: u32,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let fallback_initials = initials.clone();
+
+        div()
+            .id(id)
+            .w(px(132.0))
+            .h(px(132.0))
+            .flex_none()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(colors.border_strong))
+            .overflow_hidden()
+            .shadow_lg()
+            .child(match path {
+                Some(path) => img(path.clone())
+                    .size_full()
+                    .object_fit(ObjectFit::Cover)
+                    .with_fallback(move || {
+                        Self::album_tile_fallback(fallback_initials.clone(), color, colors)
+                    })
+                    .into_any_element(),
+                None => Self::album_tile_fallback(initials, color, colors),
+            })
             .into_any_element()
     }
 

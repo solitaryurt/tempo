@@ -347,11 +347,12 @@ impl CatalogStore {
         let mut connection = self.connect()?;
         let transaction = connection.transaction()?;
         let now = now_millis();
-        let artist_id = upsert_artist(&transaction, &track.artist, now)?;
+        let primary_artist = primary_artist_name(&track.artist);
+        let artist_id = upsert_artist(&transaction, &primary_artist, now)?;
         let album_id = upsert_album(
             &transaction,
             &track.album,
-            &track.artist,
+            &primary_artist,
             artist_id,
             track.year.as_deref(),
             now,
@@ -927,6 +928,23 @@ impl CatalogStore {
             return Ok(Vec::new());
         }
 
+        struct ArtistAggregate {
+            artist_id: i64,
+            name: String,
+            bio: Option<String>,
+            photo_path: Option<PathBuf>,
+            album_keys: Vec<String>,
+            track_count: usize,
+        }
+        struct ArtistRow {
+            artist_id: i64,
+            name: String,
+            bio: Option<String>,
+            photo_path: Option<PathBuf>,
+            album_name: String,
+            track_artist: String,
+        }
+
         let connection = self.connect()?;
         let (root_filter, root_params) = root_path_filter(roots);
         let mut statement = connection.prepare(&format!(
@@ -934,9 +952,10 @@ impl CatalogStore {
                 artists.id,
                 artists.name,
                 artists.bio,
-                COALESCE(photo_assets.cache_path, MAX(COALESCE(cover_assets.cache_path, tracks.artwork_path))),
-                COUNT(DISTINCT tracks.album_id),
-                COUNT(tracks.id)
+                photo_assets.cache_path,
+                COALESCE(cover_assets.cache_path, tracks.artwork_path),
+                tracks.album_name,
+                tracks.artist_name
              FROM artists
              JOIN tracks ON tracks.artist_id = artists.id
              JOIN files ON files.id = tracks.file_id
@@ -944,27 +963,88 @@ impl CatalogStore {
              LEFT JOIN assets AS photo_assets ON photo_assets.id = artists.photo_asset_id
              LEFT JOIN assets AS cover_assets ON cover_assets.id = albums.cover_asset_id
              WHERE files.status = 'present' AND ({root_filter})
-             GROUP BY artists.id
-             ORDER BY lower(artists.name)",
+              ORDER BY lower(tracks.artist_name), tracks.album_name, tracks.title",
         ))?;
         let rows = statement.query_map(params_from_iter(root_params), |row| {
             let photo_path: Option<String> = row.get(3)?;
-            Ok(CatalogArtist {
+            let fallback_photo_path: Option<String> = row.get(4)?;
+            Ok(ArtistRow {
                 artist_id: row.get(0)?,
                 name: row.get(1)?,
                 bio: row.get(2)?,
-                photo_path: photo_path.map(PathBuf::from),
-                album_count: row.get::<_, i64>(4)?.max(0) as usize,
-                track_count: row.get::<_, i64>(5)?.max(0) as usize,
+                photo_path: photo_path.or(fallback_photo_path).map(PathBuf::from),
+                album_name: row.get::<_, String>(5)?,
+                track_artist: row.get::<_, String>(6)?,
             })
         })?;
 
-        Ok(rows.filter_map(|row| row.ok()).collect())
+        let mut artists = HashMap::<String, ArtistAggregate>::new();
+        for row in rows.filter_map(|row| row.ok()) {
+            let album_key = normalize_key(&row.album_name);
+            for artist_name in individual_artist_names(&row.track_artist) {
+                let key = normalize_key(&artist_name);
+                let aggregate = artists.entry(key).or_insert_with(|| ArtistAggregate {
+                    artist_id: synthetic_artist_id(&artist_name),
+                    name: artist_name,
+                    bio: None,
+                    photo_path: None,
+                    album_keys: Vec::new(),
+                    track_count: 0,
+                });
+
+                if normalize_key(&row.name) == normalize_key(&aggregate.name) {
+                    aggregate.artist_id = row.artist_id;
+                    aggregate.name = row.name.clone();
+                }
+                if aggregate.bio.is_none() {
+                    aggregate.bio = row.bio.clone();
+                }
+                if aggregate.photo_path.is_none() {
+                    aggregate.photo_path = row.photo_path.clone();
+                }
+                if !aggregate.album_keys.contains(&album_key) {
+                    aggregate.album_keys.push(album_key.clone());
+                }
+                aggregate.track_count += 1;
+            }
+        }
+
+        let mut artists = artists
+            .into_values()
+            .map(|artist| CatalogArtist {
+                artist_id: artist.artist_id,
+                name: artist.name,
+                bio: artist.bio,
+                photo_path: artist.photo_path,
+                album_count: artist.album_keys.len(),
+                track_count: artist.track_count,
+            })
+            .collect::<Vec<_>>();
+        artists.sort_by_key(|artist| artist.name.to_lowercase());
+        Ok(artists)
     }
 
     pub fn load_albums(&self, roots: &[PathBuf]) -> Result<Vec<CatalogAlbum>> {
         if roots.is_empty() {
             return Ok(Vec::new());
+        }
+
+        struct AlbumAggregate {
+            album_id: i64,
+            artist_id: i64,
+            title: String,
+            artist: String,
+            year: Option<String>,
+            artwork_path: Option<PathBuf>,
+            track_count: usize,
+        }
+        struct AlbumRow {
+            album_id: i64,
+            artist_id: i64,
+            title: String,
+            track_artist: String,
+            year: Option<String>,
+            artwork_path: Option<PathBuf>,
         }
 
         let connection = self.connect()?;
@@ -974,32 +1054,72 @@ impl CatalogStore {
                 albums.id,
                 albums.artist_id,
                 albums.title,
-                albums.artist_name,
+                tracks.artist_name,
                 albums.year,
-                COALESCE(cover_assets.cache_path, MAX(tracks.artwork_path)),
-                COUNT(tracks.id)
+                COALESCE(cover_assets.cache_path, tracks.artwork_path)
              FROM albums
              JOIN tracks ON tracks.album_id = albums.id
              JOIN files ON files.id = tracks.file_id
              LEFT JOIN assets AS cover_assets ON cover_assets.id = albums.cover_asset_id
              WHERE files.status = 'present' AND ({root_filter})
-             GROUP BY albums.id
-             ORDER BY lower(albums.artist_name), albums.year, lower(albums.title)",
+              ORDER BY lower(tracks.artist_name), albums.year, lower(albums.title), tracks.title",
         ))?;
         let rows = statement.query_map(params_from_iter(root_params), |row| {
             let artwork_path: Option<String> = row.get(5)?;
-            Ok(CatalogAlbum {
+            Ok(AlbumRow {
                 album_id: row.get(0)?,
                 artist_id: row.get(1)?,
                 title: row.get(2)?,
-                artist: row.get(3)?,
+                track_artist: row.get::<_, String>(3)?,
                 year: row.get(4)?,
                 artwork_path: artwork_path.map(PathBuf::from),
-                track_count: row.get::<_, i64>(6)?.max(0) as usize,
             })
         })?;
 
-        Ok(rows.filter_map(|row| row.ok()).collect())
+        let mut albums = HashMap::<String, AlbumAggregate>::new();
+        for row in rows.filter_map(|row| row.ok()) {
+            let primary_artist = primary_artist_name(&row.track_artist);
+            let key = format!(
+                "{}:{}",
+                normalize_key(&primary_artist),
+                normalize_key(&row.title)
+            );
+            let aggregate = albums.entry(key).or_insert_with(|| AlbumAggregate {
+                album_id: row.album_id,
+                artist_id: row.artist_id,
+                title: row.title,
+                artist: primary_artist,
+                year: row.year,
+                artwork_path: None,
+                track_count: 0,
+            });
+
+            if aggregate.artwork_path.is_none() {
+                aggregate.artwork_path = row.artwork_path;
+            }
+            aggregate.track_count += 1;
+        }
+
+        let mut albums = albums
+            .into_values()
+            .map(|album| CatalogAlbum {
+                album_id: album.album_id,
+                artist_id: album.artist_id,
+                title: album.title,
+                artist: album.artist,
+                year: album.year,
+                artwork_path: album.artwork_path,
+                track_count: album.track_count,
+            })
+            .collect::<Vec<_>>();
+        albums.sort_by(|left, right| {
+            left.artist
+                .to_lowercase()
+                .cmp(&right.artist.to_lowercase())
+                .then(left.year.cmp(&right.year))
+                .then(left.title.to_lowercase().cmp(&right.title.to_lowercase()))
+        });
+        Ok(albums)
     }
 
     fn persist_artwork(
@@ -1152,6 +1272,96 @@ fn normalize_key(value: &str) -> String {
         .to_lowercase()
 }
 
+pub fn primary_artist_name(artist: &str) -> String {
+    let artist = artist.trim();
+    if artist.is_empty() {
+        return String::new();
+    }
+
+    let lower = artist.to_ascii_lowercase();
+    let split_at = feature_artist_marker(&lower)
+        .map(|(split_at, _)| split_at)
+        .unwrap_or(artist.len());
+    let primary = artist[..split_at].trim();
+
+    if primary.is_empty() {
+        artist.to_string()
+    } else {
+        primary.to_string()
+    }
+}
+
+pub fn individual_artist_names(artist: &str) -> Vec<String> {
+    let artist = artist.trim();
+    if artist.is_empty() {
+        return Vec::new();
+    }
+
+    let lower = artist.to_ascii_lowercase();
+    let Some((split_at, marker_len)) = feature_artist_marker(&lower) else {
+        return vec![artist.to_string()];
+    };
+
+    let mut artists = Vec::new();
+    let primary = artist[..split_at].trim();
+    if !primary.is_empty() {
+        artists.push(primary.to_string());
+    }
+
+    let featured = artist[split_at + marker_len..].trim_matches(|ch: char| {
+        ch.is_whitespace() || matches!(ch, '.' | '/' | ':' | '-' | '(' | '[')
+    });
+    for name in featured.split([',', ';']) {
+        for name in name.split(" & ") {
+            for name in name.split(" and ") {
+                let name = name.trim();
+                if !name.is_empty() && !artists.iter().any(|artist| artist == name) {
+                    artists.push(name.to_string());
+                }
+            }
+        }
+    }
+
+    if artists.is_empty() {
+        vec![artist.to_string()]
+    } else {
+        artists
+    }
+}
+
+fn feature_artist_marker(lower_artist: &str) -> Option<(usize, usize)> {
+    let markers = [
+        " feat. ",
+        " feat ",
+        " feat/",
+        " feat.",
+        " ft. ",
+        " ft ",
+        " ft/",
+        " ft.",
+        " featuring ",
+        " featuring/",
+        " featuring.",
+        " (feat",
+        " [feat",
+    ];
+
+    markers
+        .iter()
+        .filter_map(|marker| lower_artist.find(marker).map(|ix| (ix, marker.len())))
+        .min_by_key(|(ix, _)| *ix)
+}
+
+fn synthetic_artist_id(name: &str) -> i64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in normalize_key(name).bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+
+    -((hash & 0x3fff_ffff_ffff_ffff) as i64).max(1)
+}
+
 fn now_millis() -> i64 {
     system_time_to_millis(SystemTime::now()).unwrap_or_default()
 }
@@ -1260,6 +1470,30 @@ mod tests {
     #[test]
     fn normalizes_keys_for_matching() {
         assert_eq!(normalize_key("  The   Cure "), "the cure");
+    }
+
+    #[test]
+    fn extracts_primary_artist_from_featured_credit() {
+        assert_eq!(primary_artist_name("A$AP Rocky feat/ Skepta"), "A$AP Rocky");
+        assert_eq!(primary_artist_name("A$AP Rocky feat. Skepta"), "A$AP Rocky");
+        assert_eq!(primary_artist_name("A$AP Rocky ft Skepta"), "A$AP Rocky");
+        assert_eq!(
+            primary_artist_name("A$AP Rocky featuring Skepta"),
+            "A$AP Rocky"
+        );
+        assert_eq!(primary_artist_name("The Features"), "The Features");
+    }
+
+    #[test]
+    fn extracts_individual_artists_from_featured_credit() {
+        assert_eq!(
+            individual_artist_names("A$AP Rocky feat/ Skepta & FKA twigs"),
+            vec!["A$AP Rocky", "Skepta", "FKA twigs"]
+        );
+        assert_eq!(
+            individual_artist_names("The Features"),
+            vec!["The Features"]
+        );
     }
 
     #[test]
@@ -1391,5 +1625,84 @@ mod tests {
         assert_eq!(albums[0].title, "First");
         assert_eq!(albums[0].artwork_path.as_ref(), Some(&cover_path));
         assert_eq!(albums[0].track_count, 2);
+    }
+
+    #[test]
+    fn groups_featured_track_credits_under_primary_artist() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = CatalogStore {
+            db_path: temp_dir.path().join("tempo.sqlite"),
+            cache_dir: temp_dir.path().join("cache"),
+        };
+        store.migrate().unwrap();
+
+        let root = temp_dir.path().join("library");
+        store
+            .upsert_track(
+                &Track {
+                    path: root.join("solo.flac"),
+                    title: "Solo".to_string(),
+                    artist: "A$AP Rocky".to_string(),
+                    album: "Testing".to_string(),
+                    year: Some("2018".to_string()),
+                    duration: Duration::from_secs(60),
+                    codec: "FLAC".to_string(),
+                    sample_rate: None,
+                    channels: None,
+                    bitrate: None,
+                    file_size: 10,
+                    modified: None,
+                    artwork: None,
+                },
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_track(
+                &Track {
+                    path: root.join("featured.flac"),
+                    title: "Featured".to_string(),
+                    artist: "A$AP Rocky feat/ Skepta".to_string(),
+                    album: "Testing".to_string(),
+                    year: Some("2018".to_string()),
+                    duration: Duration::from_secs(60),
+                    codec: "FLAC".to_string(),
+                    sample_rate: None,
+                    channels: None,
+                    bitrate: None,
+                    file_size: 10,
+                    modified: None,
+                    artwork: None,
+                },
+                None,
+            )
+            .unwrap();
+
+        let artists = store.load_artists(&[root.clone()]).unwrap();
+        assert_eq!(artists.len(), 2);
+        let rocky = artists
+            .iter()
+            .find(|artist| artist.name == "A$AP Rocky")
+            .unwrap();
+        assert_eq!(rocky.album_count, 1);
+        assert_eq!(rocky.track_count, 2);
+        let skepta = artists
+            .iter()
+            .find(|artist| artist.name == "Skepta")
+            .unwrap();
+        assert_eq!(skepta.album_count, 1);
+        assert_eq!(skepta.track_count, 1);
+
+        let albums = store.load_albums(&[root.clone()]).unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].artist, "A$AP Rocky");
+        assert_eq!(albums[0].track_count, 2);
+
+        let tracks = store.load_tracks(&[root]).unwrap();
+        assert!(
+            tracks
+                .iter()
+                .any(|track| track.artist == "A$AP Rocky feat/ Skepta")
+        );
     }
 }

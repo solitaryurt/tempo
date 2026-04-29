@@ -229,13 +229,48 @@ impl TempoApp {
                         .collect()
                 })
                 .unwrap_or_default(),
+            TabSource::Artist(artist_id) => {
+                let artist_name = self
+                    .artist_by_id(artist_id)
+                    .map(|artist| artist.name.as_str());
+                self.tracks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(ix, track)| {
+                        (track.artist_id == Some(artist_id)
+                            || artist_name.is_some_and(|name| {
+                                individual_artist_names(&track.artist)
+                                    .iter()
+                                    .any(|artist| artist == name)
+                            }))
+                        .then_some(ix)
+                    })
+                    .collect()
+            }
+            TabSource::Album(album_id) => {
+                let album = self.album_by_id(album_id);
+                self.tracks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(ix, track)| {
+                        (track.album_id == Some(album_id)
+                            || album.is_some_and(|album| {
+                                track.album == album.title
+                                    && primary_artist_name(&track.artist) == album.artist
+                            }))
+                        .then_some(ix)
+                    })
+                    .collect()
+            }
         }
     }
 
     pub(super) fn source_track_count(&self, source: TabSource) -> usize {
         match source {
             TabSource::Library => self.tracks.len(),
-            TabSource::Playlist(_) => self.source_track_indices(source).len(),
+            TabSource::Playlist(_) | TabSource::Artist(_) | TabSource::Album(_) => {
+                self.source_track_indices(source).len()
+            }
         }
     }
 

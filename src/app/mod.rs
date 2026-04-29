@@ -16,7 +16,10 @@ use gpui::{
 use rodio::{Decoder, Source as _};
 use serde::{Deserialize, Serialize};
 use tempo::{
-    catalog::{CatalogAlbum, CatalogArtist, CatalogStore, CatalogTrack},
+    catalog::{
+        CatalogAlbum, CatalogArtist, CatalogStore, CatalogTrack, individual_artist_names,
+        primary_artist_name,
+    },
     library::{
         Artwork as LibraryArtwork, IndexingError, LibraryEvent, LibraryIndexer, LibraryWatcher,
         ScanProgress,
@@ -80,6 +83,13 @@ enum SortDirection {
     Descending,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlaybackMode {
+    Straight,
+    Loop,
+    Shuffle,
+}
+
 #[derive(Clone, Copy)]
 struct ColumnWidths {
     index: f32,
@@ -116,6 +126,8 @@ struct ColumnResize {
 
 #[derive(Clone)]
 struct Track {
+    artist_id: Option<i64>,
+    album_id: Option<i64>,
     path: PathBuf,
     title: String,
     artist: String,
@@ -259,6 +271,8 @@ struct Playlist {
 enum TabSource {
     Library,
     Playlist(usize),
+    Artist(i64),
+    Album(i64),
 }
 
 struct BrowseTab {
@@ -310,6 +324,32 @@ impl BrowseTab {
     fn playlist(playlist_ix: usize) -> Self {
         Self {
             source: TabSource::Playlist(playlist_ix),
+            search_query: String::new(),
+            sort_column: SortColumn::Index,
+            sort_direction: SortDirection::Ascending,
+            selected_track: 0,
+            table_scroll_handle: UniformListScrollHandle::new(),
+            track_indices: Vec::new(),
+            scrollbar_markers: Vec::new(),
+        }
+    }
+
+    fn artist(artist_id: i64) -> Self {
+        Self {
+            source: TabSource::Artist(artist_id),
+            search_query: String::new(),
+            sort_column: SortColumn::Album,
+            sort_direction: SortDirection::Ascending,
+            selected_track: 0,
+            table_scroll_handle: UniformListScrollHandle::new(),
+            track_indices: Vec::new(),
+            scrollbar_markers: Vec::new(),
+        }
+    }
+
+    fn album(album_id: i64) -> Self {
+        Self {
+            source: TabSource::Album(album_id),
             search_query: String::new(),
             sort_column: SortColumn::Index,
             sort_direction: SortDirection::Ascending,
@@ -381,6 +421,7 @@ pub(crate) struct TempoApp {
     active_tab: usize,
     playing_track: usize,
     is_playing: bool,
+    playback_mode: PlaybackMode,
     context_menu_track: Option<usize>,
     context_menu_row: usize,
     tracks: Vec<Track>,
@@ -458,6 +499,7 @@ impl TempoApp {
             active_tab: 0,
             playing_track: 0,
             is_playing: false,
+            playback_mode: PlaybackMode::Straight,
             context_menu_track: None,
             context_menu_row: 0,
             tracks: cached_tracks,
@@ -596,6 +638,14 @@ impl TempoApp {
                 .get(playlist_ix)
                 .map(|playlist| playlist.name.clone())
                 .unwrap_or_else(|| "Missing Playlist".to_string()),
+            TabSource::Artist(artist_id) => self
+                .artist_by_id(artist_id)
+                .map(|artist| artist.name.clone())
+                .unwrap_or_else(|| "Missing Artist".to_string()),
+            TabSource::Album(album_id) => self
+                .album_by_id(album_id)
+                .map(|album| album.title.clone())
+                .unwrap_or_else(|| "Missing Album".to_string()),
         }
     }
 
@@ -643,6 +693,125 @@ impl TempoApp {
         self.open_page(Page::Library);
     }
 
+    fn open_artist_tab(&mut self, artist_id: i64) {
+        if let Some(tab_ix) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.source == TabSource::Artist(artist_id))
+        {
+            self.active_tab = tab_ix;
+        } else {
+            self.tabs.push(BrowseTab::artist(artist_id));
+            self.active_tab = self.tabs.len() - 1;
+            self.rebuild_track_indices_for_tab(self.active_tab);
+        }
+
+        self.open_page(Page::Library);
+    }
+
+    fn open_album_tab(&mut self, album_id: i64) {
+        if let Some(tab_ix) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.source == TabSource::Album(album_id))
+        {
+            self.active_tab = tab_ix;
+        } else {
+            self.tabs.push(BrowseTab::album(album_id));
+            self.active_tab = self.tabs.len() - 1;
+            self.rebuild_track_indices_for_tab(self.active_tab);
+        }
+
+        self.open_page(Page::Library);
+    }
+
+    fn artist_by_id(&self, artist_id: i64) -> Option<&Artist> {
+        self.artists
+            .iter()
+            .find(|artist| artist.artist_id == artist_id)
+    }
+
+    fn album_by_id(&self, album_id: i64) -> Option<&Album> {
+        self.albums.iter().find(|album| album.album_id == album_id)
+    }
+
+    fn albums_for_artist(&self, artist_id: i64) -> Vec<&Album> {
+        let artist_name = self
+            .artist_by_id(artist_id)
+            .map(|artist| artist.name.as_str());
+        self.albums
+            .iter()
+            .filter(|album| {
+                album.artist_id == artist_id || artist_name.is_some_and(|name| album.artist == name)
+            })
+            .collect()
+    }
+
+    fn open_artist_tab_for_track(&mut self, track_ix: usize) {
+        let Some(track) = self.tracks.get(track_ix) else {
+            return;
+        };
+        let artist_name = primary_artist_name(&track.artist);
+        let artist_id = track
+            .artist_id
+            .or_else(|| {
+                self.artists
+                    .iter()
+                    .find(|artist| artist.name == artist_name)
+                    .map(|artist| artist.artist_id)
+            })
+            .unwrap_or_else(|| Self::synthetic_tab_entity_id(&artist_name));
+        self.open_artist_tab(artist_id);
+    }
+
+    fn open_album_tab_for_track(&mut self, track_ix: usize) {
+        let Some(track) = self.tracks.get(track_ix) else {
+            return;
+        };
+        let primary_artist = primary_artist_name(&track.artist);
+        let album_id = track
+            .album_id
+            .or_else(|| {
+                self.albums
+                    .iter()
+                    .find(|album| album.title == track.album && album.artist == primary_artist)
+                    .map(|album| album.album_id)
+            })
+            .unwrap_or_else(|| {
+                Self::synthetic_tab_entity_id(&format!("{}:{}", primary_artist, track.album))
+            });
+        self.open_album_tab(album_id);
+    }
+
+    fn select_track_in_all_music(&mut self, track_ix: usize) {
+        if track_ix >= self.tracks.len() {
+            return;
+        }
+
+        self.open_all_music_tab();
+        self.set_active_selected_track(track_ix);
+        if let Some(row_ix) = self
+            .current_track_indices()
+            .iter()
+            .position(|ix| *ix == track_ix)
+        {
+            self.active_tab()
+                .table_scroll_handle
+                .scroll_to_item(row_ix, ScrollStrategy::Center);
+        }
+        self.context_menu_track = None;
+    }
+
+    fn synthetic_tab_entity_id(value: &str) -> i64 {
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in value.to_lowercase().bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+
+        -((hash & 0x3fff_ffff_ffff_ffff) as i64).max(1)
+    }
+
     fn close_tab(&mut self, tab_ix: usize) {
         if self.tabs.len() <= 1 || tab_ix >= self.tabs.len() {
             return;
@@ -664,6 +833,8 @@ impl From<tempo::library::Track> for Track {
         let album_color = TempoApp::album_color_for(&track.album, &track.artist);
 
         Self {
+            artist_id: None,
+            album_id: None,
             path: track.path,
             title: track.title,
             artist: track.artist,
@@ -689,6 +860,8 @@ impl From<CatalogTrack> for Track {
         let album_color = TempoApp::album_color_for(&track.album, &track.artist);
 
         Self {
+            artist_id: Some(track.artist_id),
+            album_id: Some(track.album_id),
             path: track.path,
             title: track.title,
             artist: track.artist,
