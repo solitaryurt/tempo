@@ -752,8 +752,10 @@ impl TempoApp {
             )
     }
 
-    pub(super) fn format_library_size(tracks: &[Track]) -> String {
-        let bytes = tracks.iter().map(|track| track.file_size).sum::<u64>();
+    /// Format a precomputed library byte total. `TempoApp::library_size_bytes`
+    /// is updated incrementally on every track add/update/remove, so the
+    /// sidebar can call this on every render without iterating tracks.
+    pub(super) fn format_library_size_bytes(bytes: u64) -> String {
         if bytes >= 1_000_000_000 {
             format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
         } else if bytes >= 1_000_000 {

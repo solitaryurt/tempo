@@ -46,8 +46,13 @@ use crate::{
 };
 
 const MAGIC: &[u8; 8] = b"TEMPO_S1";
-const SNAPSHOT_VERSION: u32 = 2;
-const SNAPSHOT_FILE: &str = "startup_snapshot.v2.bin";
+// v3: collaboration splitter now treats `/`, `\`, and `;` as artist
+// separators (e.g. "John Lennon/Yoko Ono" -> ["John Lennon", "Yoko Ono"]).
+// Bumped to invalidate snapshots written by builds that used the
+// feat-only splitter, so upgraded users see the corrected Artists view
+// without waiting for a rescan.
+const SNAPSHOT_VERSION: u32 = 3;
+const SNAPSHOT_FILE: &str = "startup_snapshot.v3.bin";
 
 pub struct StartupSnapshot {
     pub tracks: Vec<CatalogTrack>,

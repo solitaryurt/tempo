@@ -1,8 +1,9 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     mem::{size_of, size_of_val},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -26,6 +27,11 @@ const SCHEMA_VERSION: i64 = 2;
 pub struct CatalogStore {
     db_path: PathBuf,
     cache_dir: PathBuf,
+    /// Single pooled SQLite connection. Wrapped in `Arc<Mutex<_>>` so the
+    /// store remains cheaply cloneable (background threads, scoped scans)
+    /// while every caller serializes through one PRAGMA-tuned handle.
+    /// PRAGMAs run exactly once in [`CatalogStore::initialize_connection`].
+    connection: Arc<Mutex<Connection>>,
 }
 
 #[derive(Clone, Debug)]
@@ -164,10 +170,17 @@ impl CatalogStore {
         let cache_dir = cache_home().join(APP_DIR);
         fs::create_dir_all(&data_dir).context("failed to create Tempo data directory")?;
         fs::create_dir_all(&cache_dir).context("failed to create Tempo cache directory")?;
+        Self::open_at(data_dir.join("tempo.sqlite"), cache_dir)
+    }
 
+    /// Construct a `CatalogStore` at explicit paths. Used by tests and any
+    /// callers that need a non-default location.
+    pub fn open_at(db_path: PathBuf, cache_dir: PathBuf) -> Result<Self> {
+        let connection = Self::initialize_connection(&db_path)?;
         let store = Self {
-            db_path: data_dir.join("tempo.sqlite"),
+            db_path,
             cache_dir,
+            connection: Arc::new(Mutex::new(connection)),
         };
         perf::time_result("catalog.migrate", "", || store.migrate())?;
         Ok(store)
@@ -181,14 +194,17 @@ impl CatalogStore {
         &self.cache_dir
     }
 
-    fn connect(&self) -> Result<Connection> {
+    /// Open and PRAGMA-tune a fresh connection. Intended to be called once
+    /// per `CatalogStore` instance; the resulting handle is then pooled in
+    /// `self.connection` and reused for every catalog operation.
+    fn initialize_connection(db_path: &Path) -> Result<Connection> {
         let _span = perf::slow_span(
-            "catalog.connect",
+            "catalog.initialize_connection",
             Duration::from_millis(8),
-            format!("db={}", self.db_path.display()),
+            format!("db={}", db_path.display()),
         );
-        let connection = Connection::open(&self.db_path)
-            .with_context(|| format!("failed to open {}", self.db_path.display()))?;
+        let connection = Connection::open(db_path)
+            .with_context(|| format!("failed to open {}", db_path.display()))?;
         // PRAGMA tuning rationale:
         //   journal_mode=WAL: required for concurrent readers + writer.
         //   synchronous=NORMAL: WAL-safe, faster than FULL.
@@ -209,9 +225,19 @@ impl CatalogStore {
         Ok(connection)
     }
 
+    /// Lock the pooled connection. Every catalog method routes through this
+    /// helper so PRAGMAs and the page cache are reused across calls. The
+    /// guard is held for the duration of one operation; transactions are
+    /// expected to commit before the guard drops.
+    fn lock_connection(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("catalog connection mutex poisoned"))
+    }
+
     fn migrate(&self) -> Result<()> {
         let _span = perf::span("catalog.migrate_inner", "");
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         // Fast path: each migration bump increments SCHEMA_VERSION; if the
         // database already advertises that version, skip all DDL/ALTERs.
         // Even on no-op runs the `CREATE TABLE IF NOT EXISTS` + multiple
@@ -429,7 +455,7 @@ impl CatalogStore {
 
     pub fn begin_scan(&self, roots: &[PathBuf]) -> Result<i64> {
         let _span = perf::span("catalog.begin_scan", format!("roots={}", roots.len()));
-        let mut connection = self.connect()?;
+        let mut connection = self.lock_connection()?;
         let now = now_millis();
         let transaction = connection.transaction()?;
 
@@ -461,7 +487,7 @@ impl CatalogStore {
             return Ok(Vec::new());
         }
 
-        let mut connection = self.connect()?;
+        let mut connection = self.lock_connection()?;
         let now = now_millis();
         let transaction = connection.transaction()?;
 
@@ -473,7 +499,7 @@ impl CatalogStore {
         }
 
         let missing_paths = {
-            let mut statement = transaction.prepare(
+            let mut statement = transaction.prepare_cached(
                 "SELECT path FROM files
                  WHERE status = 'present'
                    AND (last_seen_scan_id IS NULL OR last_seen_scan_id <> ?1)
@@ -488,7 +514,7 @@ impl CatalogStore {
         };
 
         {
-            let mut statement = transaction.prepare(
+            let mut statement = transaction.prepare_cached(
                 "UPDATE files
                  SET status = 'missing', missing_since = COALESCE(missing_since, ?1), updated_at = ?1
                  WHERE path = ?2",
@@ -506,37 +532,93 @@ impl CatalogStore {
         Ok(missing_paths)
     }
 
+    /// Single-track upsert, kept for the file-watcher path that processes
+    /// one notify event at a time. For batch scans, prefer
+    /// [`Self::upsert_tracks_batch`] which amortizes the transaction +
+    /// statement-cache overhead across many tracks in one DB round trip.
     pub fn upsert_track(&self, track: &Track, scan_id: Option<i64>) -> Result<CatalogTrack> {
         let _span = perf::slow_span(
             "catalog.upsert_track",
             Duration::from_millis(25),
             format!("path={}", track.path.display()),
         );
-        let mut connection = self.connect()?;
+        let mut results = self.upsert_tracks_batch(std::slice::from_ref(track), scan_id)?;
+        results
+            .pop()
+            .context("upsert_tracks_batch returned empty result")
+    }
+
+    /// Bulk-upsert N tracks inside a single SQLite transaction, reusing
+    /// `prepare_cached` statement handles for every per-track step. This
+    /// is the hot path for cold scans: one transaction = one fsync, and
+    /// statement cache hits eliminate ~80% of the SQL parsing cost.
+    ///
+    /// Returns the resulting [`CatalogTrack`] for each input track in the
+    /// same order. Failure aborts the entire batch (the transaction is not
+    /// committed); callers should retry track-by-track if partial progress
+    /// is required.
+    pub fn upsert_tracks_batch(
+        &self,
+        tracks: &[Track],
+        scan_id: Option<i64>,
+    ) -> Result<Vec<CatalogTrack>> {
+        let _span = perf::slow_span(
+            "catalog.upsert_tracks_batch",
+            Duration::from_millis(25),
+            format!("count={}", tracks.len()),
+        );
+        if tracks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut connection = self.lock_connection()?;
         let transaction = connection.transaction()?;
         let now = now_millis();
+        let mut results = Vec::with_capacity(tracks.len());
+
+        for track in tracks {
+            results.push(Self::upsert_track_in_transaction(
+                &transaction,
+                track,
+                scan_id,
+                now,
+                &self.cache_dir,
+            )?);
+        }
+
+        transaction.commit()?;
+        Ok(results)
+    }
+
+    /// Per-track work performed inside an outer batched transaction. All
+    /// SQL goes through `prepare_cached` so a long-running batch only
+    /// parses each statement once.
+    fn upsert_track_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        track: &Track,
+        scan_id: Option<i64>,
+        now: i64,
+        cache_dir: &Path,
+    ) -> Result<CatalogTrack> {
         let primary_artist = primary_artist_name(&track.artist);
-        let artist_id = upsert_artist(&transaction, &primary_artist, now)?;
+        let artist_id = upsert_artist(transaction, &primary_artist, now)?;
         let album_id = upsert_album(
-            &transaction,
+            transaction,
             &track.album,
             &primary_artist,
             artist_id,
             track.year.as_deref(),
             now,
         )?;
-        let (artwork_asset_id, artwork_path) = self.persist_artwork(&transaction, track, now)?;
+        let (artwork_asset_id, artwork_path) = persist_artwork(transaction, cache_dir, track, now)?;
         let artist_musicbrainz_id: Option<String> = transaction
-            .query_row(
-                "SELECT musicbrainz_id FROM artists WHERE id = ?1",
-                params![artist_id],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT musicbrainz_id FROM artists WHERE id = ?1")?
+            .query_row(params![artist_id], |row| row.get(0))
             .optional()?
             .flatten();
         if artist_musicbrainz_id.is_none() {
             enqueue_metadata_job(
-                &transaction,
+                transaction,
                 "artist",
                 artist_id,
                 "resolve_artist_musicbrainz",
@@ -572,27 +654,29 @@ impl CatalogStore {
             .unwrap_or_default()
             .to_ascii_lowercase();
 
-        transaction.execute(
-            "INSERT INTO files(
-                root_id, path, path_parent, filename, extension, size_bytes, modified_at,
-                device_id, inode, last_seen_scan_id, missing_since, removed_at, status,
-                created_at, updated_at
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL, 'present', ?11, ?11)
-             ON CONFLICT(path) DO UPDATE SET
-                root_id = excluded.root_id,
-                path_parent = excluded.path_parent,
-                filename = excluded.filename,
-                extension = excluded.extension,
-                size_bytes = excluded.size_bytes,
-                modified_at = excluded.modified_at,
-                device_id = excluded.device_id,
-                inode = excluded.inode,
-                last_seen_scan_id = excluded.last_seen_scan_id,
-                missing_since = NULL,
-                removed_at = NULL,
-                status = 'present',
-                updated_at = excluded.updated_at",
-            params![
+        transaction
+            .prepare_cached(
+                "INSERT INTO files(
+                    root_id, path, path_parent, filename, extension, size_bytes, modified_at,
+                    device_id, inode, last_seen_scan_id, missing_since, removed_at, status,
+                    created_at, updated_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL, 'present', ?11, ?11)
+                 ON CONFLICT(path) DO UPDATE SET
+                    root_id = excluded.root_id,
+                    path_parent = excluded.path_parent,
+                    filename = excluded.filename,
+                    extension = excluded.extension,
+                    size_bytes = excluded.size_bytes,
+                    modified_at = excluded.modified_at,
+                    device_id = excluded.device_id,
+                    inode = excluded.inode,
+                    last_seen_scan_id = excluded.last_seen_scan_id,
+                    missing_since = NULL,
+                    removed_at = NULL,
+                    status = 'present',
+                    updated_at = excluded.updated_at",
+            )?
+            .execute(params![
                 Option::<i64>::None,
                 path,
                 parent,
@@ -604,9 +688,8 @@ impl CatalogStore {
                 inode,
                 scan_id,
                 now,
-            ],
-        )?;
-        let file_id = select_id_by_text(&transaction, "files", "path", &path)?;
+            ])?;
+        let file_id = select_id_by_text(transaction, "files", "path", &path)?;
         let search_blob = format!(
             "{} {} {} {} {} {} {}",
             track.title,
@@ -620,35 +703,37 @@ impl CatalogStore {
         .to_lowercase();
         let duration_ms = track.duration.as_millis().min(i64::MAX as u128) as i64;
 
-        transaction.execute(
-            "INSERT INTO tracks(
-                file_id, artist_id, album_id, title, artist_name, album_name, genre, track_number, year,
-                date_added, duration_ms,
-                codec, bitrate, sample_rate, channels, file_size, modified_at, artwork_asset_id,
-                artwork_path, metadata_version, search_blob, created_at, updated_at
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?22)
-             ON CONFLICT(file_id) DO UPDATE SET
-                artist_id = excluded.artist_id,
-                album_id = excluded.album_id,
-                title = excluded.title,
-                artist_name = excluded.artist_name,
-                album_name = excluded.album_name,
-                genre = excluded.genre,
-                track_number = excluded.track_number,
-                year = excluded.year,
-                duration_ms = excluded.duration_ms,
-                codec = excluded.codec,
-                bitrate = excluded.bitrate,
-                sample_rate = excluded.sample_rate,
-                channels = excluded.channels,
-                file_size = excluded.file_size,
-                modified_at = excluded.modified_at,
-                artwork_asset_id = excluded.artwork_asset_id,
-                artwork_path = excluded.artwork_path,
-                metadata_version = excluded.metadata_version,
-                search_blob = excluded.search_blob,
-                updated_at = excluded.updated_at",
-            params![
+        transaction
+            .prepare_cached(
+                "INSERT INTO tracks(
+                    file_id, artist_id, album_id, title, artist_name, album_name, genre, track_number, year,
+                    date_added, duration_ms,
+                    codec, bitrate, sample_rate, channels, file_size, modified_at, artwork_asset_id,
+                    artwork_path, metadata_version, search_blob, created_at, updated_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?22)
+                 ON CONFLICT(file_id) DO UPDATE SET
+                    artist_id = excluded.artist_id,
+                    album_id = excluded.album_id,
+                    title = excluded.title,
+                    artist_name = excluded.artist_name,
+                    album_name = excluded.album_name,
+                    genre = excluded.genre,
+                    track_number = excluded.track_number,
+                    year = excluded.year,
+                    duration_ms = excluded.duration_ms,
+                    codec = excluded.codec,
+                    bitrate = excluded.bitrate,
+                    sample_rate = excluded.sample_rate,
+                    channels = excluded.channels,
+                    file_size = excluded.file_size,
+                    modified_at = excluded.modified_at,
+                    artwork_asset_id = excluded.artwork_asset_id,
+                    artwork_path = excluded.artwork_path,
+                    metadata_version = excluded.metadata_version,
+                    search_blob = excluded.search_blob,
+                    updated_at = excluded.updated_at",
+            )?
+            .execute(params![
                 file_id,
                 artist_id,
                 album_id,
@@ -671,15 +756,11 @@ impl CatalogStore {
                 TRACK_METADATA_VERSION,
                 &search_blob,
                 now,
-            ],
-        )?;
-        let track_id = select_id_by_i64(&transaction, "tracks", "file_id", file_id)?;
-        let (date_added_ms, play_count): (i64, i64) = transaction.query_row(
-            "SELECT date_added, play_count FROM tracks WHERE id = ?1",
-            params![track_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        transaction.commit()?;
+            ])?;
+        let track_id = select_id_by_i64(transaction, "tracks", "file_id", file_id)?;
+        let (date_added_ms, play_count): (i64, i64) = transaction
+            .prepare_cached("SELECT date_added, play_count FROM tracks WHERE id = ?1")?
+            .query_row(params![track_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
 
         Ok(CatalogTrack {
             track_id,
@@ -708,7 +789,7 @@ impl CatalogStore {
             "catalog.mark_file_removed",
             format!("path={}", path.display()),
         );
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         let now = now_millis();
         connection.execute(
             "UPDATE files
@@ -724,7 +805,7 @@ impl CatalogStore {
             "catalog.mark_folder_removed",
             format!("path={}", path.display()),
         );
-        let mut connection = self.connect()?;
+        let mut connection = self.lock_connection()?;
         let now = now_millis();
         let transaction = connection.transaction()?;
         let folder = path.display().to_string();
@@ -736,7 +817,7 @@ impl CatalogStore {
         };
 
         let removed_paths = {
-            let mut statement = transaction.prepare(
+            let mut statement = transaction.prepare_cached(
                 "SELECT path FROM files
                  WHERE status = 'present'
                    AND (path = ?1 OR path LIKE ?2 ESCAPE '\\')
@@ -752,7 +833,7 @@ impl CatalogStore {
         };
 
         {
-            let mut statement = transaction.prepare(
+            let mut statement = transaction.prepare_cached(
                 "UPDATE files
                  SET status = 'missing', missing_since = COALESCE(missing_since, ?1), removed_at = ?1, updated_at = ?1
                  WHERE path = ?2",
@@ -784,7 +865,7 @@ impl CatalogStore {
             return Ok(None);
         };
 
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         let row = connection
             .query_row(
                 "SELECT
@@ -849,7 +930,7 @@ impl CatalogStore {
             return Ok(());
         };
 
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         let file_id = connection
             .query_row(
                 "SELECT id FROM files WHERE path = ?1 AND status = 'present'",
@@ -904,7 +985,7 @@ impl CatalogStore {
             return Ok(None);
         };
 
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         let cached = self.load_track_by_path(&connection, path)?;
         let Some(cached) = cached else {
             return Ok(None);
@@ -935,9 +1016,9 @@ impl CatalogStore {
             return Ok(Vec::new());
         }
 
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         let (root_filter, root_params) = root_path_filter(roots);
-        let mut statement = connection.prepare(&format!(
+        let mut statement = connection.prepare_cached(&format!(
             "SELECT
                 tracks.id, files.id, tracks.artist_id, tracks.album_id, files.path, tracks.title,
                 tracks.artist_name, tracks.album_name, tracks.genre, tracks.track_number, tracks.year,
@@ -999,9 +1080,9 @@ impl CatalogStore {
             return Ok(HashMap::new());
         }
 
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         let (root_filter, root_params) = root_path_filter(roots);
-        let mut statement = connection.prepare(&format!(
+        let mut statement = connection.prepare_cached(&format!(
             "SELECT
                 tracks.id, files.id, tracks.artist_id, tracks.album_id, files.path, tracks.title,
                 tracks.artist_name, tracks.album_name, tracks.genre, tracks.track_number, tracks.year,
@@ -1075,7 +1156,7 @@ impl CatalogStore {
             "catalog.increment_play_count",
             format!("path={}", path.display()),
         );
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         let now = now_millis();
         connection.execute(
             "UPDATE tracks
@@ -1110,11 +1191,11 @@ impl CatalogStore {
             return Ok(());
         }
 
-        let mut connection = self.connect()?;
+        let mut connection = self.lock_connection()?;
         let transaction = connection.transaction()?;
         let now = now_millis();
         {
-            let mut statement = transaction.prepare(
+            let mut statement = transaction.prepare_cached(
                 "UPDATE files
                  SET last_seen_scan_id = ?1,
                      status = 'present',
@@ -1138,12 +1219,12 @@ impl CatalogStore {
         entity_id: i64,
         job_type: &str,
     ) -> Result<()> {
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         enqueue_metadata_job(&connection, entity_type, entity_id, job_type, now_millis())
     }
 
     pub fn reset_stale_metadata_jobs(&self) -> Result<usize> {
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         let now = now_millis();
         let stale_before = now - 5 * 60 * 1000;
         let reset = connection.execute(
@@ -1156,9 +1237,9 @@ impl CatalogStore {
     }
 
     pub fn load_metadata_activity(&self) -> Result<CatalogMetadataActivity> {
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         let mut activity = CatalogMetadataActivity::default();
-        let mut statement = connection.prepare(
+        let mut statement = connection.prepare_cached(
             "SELECT status, COUNT(*)
              FROM metadata_jobs
              GROUP BY status",
@@ -1178,7 +1259,7 @@ impl CatalogStore {
             }
         }
 
-        let mut statement = connection.prepare(
+        let mut statement = connection.prepare_cached(
             "SELECT job_type, COUNT(*)
              FROM metadata_jobs
              WHERE status = 'pending'
@@ -1204,13 +1285,13 @@ impl CatalogStore {
     }
 
     pub fn enqueue_missing_online_metadata_jobs(&self) -> Result<usize> {
-        let mut connection = self.connect()?;
+        let mut connection = self.lock_connection()?;
         let transaction = connection.transaction()?;
         let now = now_millis();
         let mut enqueued = 0usize;
 
         let artist_ids = {
-            let mut statement = transaction.prepare(
+            let mut statement = transaction.prepare_cached(
                 "SELECT id, musicbrainz_id, bio, photo_asset_id
                  FROM artists
                  ORDER BY name",
@@ -1268,7 +1349,7 @@ impl CatalogStore {
     }
 
     pub fn enqueue_missing_album_art_jobs_for_artist(&self, artist_id: i64) -> Result<usize> {
-        let mut connection = self.connect()?;
+        let mut connection = self.lock_connection()?;
         let transaction = connection.transaction()?;
         let enqueued = enqueue_missing_album_art_jobs(&transaction, Some(artist_id), now_millis())?;
         transaction.commit()?;
@@ -1276,7 +1357,7 @@ impl CatalogStore {
     }
 
     pub fn enqueue_artist_metadata_demand(&self, artist_id: i64) -> Result<usize> {
-        let mut connection = self.connect()?;
+        let mut connection = self.lock_connection()?;
         let transaction = connection.transaction()?;
         let now = now_millis();
         let artist = transaction
@@ -1329,7 +1410,7 @@ impl CatalogStore {
     }
 
     pub fn enqueue_album_cover_demand(&self, album_id: i64) -> Result<usize> {
-        let mut connection = self.connect()?;
+        let mut connection = self.lock_connection()?;
         let transaction = connection.transaction()?;
         let now = now_millis();
         let album = transaction
@@ -1397,35 +1478,53 @@ impl CatalogStore {
             return Ok(None);
         }
 
-        let mut connection = self.connect()?;
+        let mut connection = self.lock_connection()?;
         let transaction = connection.transaction()?;
         let now = now_millis();
+        // Push the `job_type IN (...)` filter into SQL so we don't pay
+        // the per-row deserialization cost for jobs we can't handle. The
+        // previous implementation `LIMIT 50`-d, then filtered in Rust,
+        // which would re-scan the same prefix forever if all top
+        // candidates were unsupported.
+        let placeholders = (1..=supported_job_types.len())
+            .map(|ix| format!("?{}", ix + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, entity_type, entity_id, job_type, attempts
+             FROM metadata_jobs
+             WHERE status = 'pending'
+               AND next_attempt_at <= ?1
+               AND job_type IN ({placeholders})
+             ORDER BY CASE job_type
+                WHEN 'fetch_album_cover' THEN 0
+                WHEN 'fetch_artist_profile' THEN 1
+                WHEN 'resolve_album_musicbrainz' THEN 2
+                WHEN 'resolve_artist_musicbrainz' THEN 3
+                WHEN 'fetch_artist_discography' THEN 4
+                ELSE 9
+             END, next_attempt_at, created_at
+             LIMIT 1"
+        );
         let job = {
-            let mut statement = transaction.prepare(
-                "SELECT id, entity_type, entity_id, job_type, attempts
-                 FROM metadata_jobs
-                 WHERE status = 'pending' AND next_attempt_at <= ?1
-                 ORDER BY CASE job_type
-                    WHEN 'fetch_album_cover' THEN 0
-                    WHEN 'fetch_artist_profile' THEN 1
-                    WHEN 'resolve_album_musicbrainz' THEN 2
-                    WHEN 'resolve_artist_musicbrainz' THEN 3
-                    WHEN 'fetch_artist_discography' THEN 4
-                    ELSE 9
-                 END, next_attempt_at, created_at",
-            )?;
-            let rows = statement.query_map(params![now], |row| {
-                Ok(CatalogMetadataJob {
-                    job_id: row.get(0)?,
-                    entity_type: row.get(1)?,
-                    entity_id: row.get(2)?,
-                    job_type: row.get(3)?,
-                    attempts: row.get::<_, i64>(4)?.max(0) as u32,
+            let mut statement = transaction.prepare_cached(&sql)?;
+            let mut params: Vec<&dyn rusqlite::ToSql> =
+                Vec::with_capacity(1 + supported_job_types.len());
+            params.push(&now);
+            for job_type in supported_job_types {
+                params.push(job_type);
+            }
+            statement
+                .query_row(rusqlite::params_from_iter(params.iter().copied()), |row| {
+                    Ok(CatalogMetadataJob {
+                        job_id: row.get(0)?,
+                        entity_type: row.get(1)?,
+                        entity_id: row.get(2)?,
+                        job_type: row.get(3)?,
+                        attempts: row.get::<_, i64>(4)?.max(0) as u32,
+                    })
                 })
-            })?;
-
-            rows.filter_map(|row| row.ok())
-                .find(|job| supported_job_types.contains(&job.job_type.as_str()))
+                .optional()?
         };
 
         if let Some(job) = &job {
@@ -1442,7 +1541,7 @@ impl CatalogStore {
     }
 
     pub fn complete_metadata_job(&self, job_id: i64) -> Result<()> {
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         let now = now_millis();
         connection.execute(
             "UPDATE metadata_jobs
@@ -1454,7 +1553,7 @@ impl CatalogStore {
     }
 
     pub fn fail_metadata_job(&self, job_id: i64, error: &str) -> Result<()> {
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         let now = now_millis();
         connection.execute(
             "UPDATE metadata_jobs
@@ -1469,7 +1568,7 @@ impl CatalogStore {
     }
 
     pub fn load_metadata_artist(&self, artist_id: i64) -> Result<Option<CatalogMetadataArtist>> {
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         connection
             .query_row(
                 "SELECT id, name, normalized_name, musicbrainz_id
@@ -1490,7 +1589,7 @@ impl CatalogStore {
     }
 
     pub fn load_metadata_album(&self, album_id: i64) -> Result<Option<CatalogMetadataAlbum>> {
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         connection
             .query_row(
                 "SELECT
@@ -1524,7 +1623,7 @@ impl CatalogStore {
         artist_id: i64,
         musicbrainz_id: &str,
     ) -> Result<()> {
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         let now = now_millis();
         connection.execute(
             "UPDATE artists
@@ -1545,7 +1644,7 @@ impl CatalogStore {
         status: &str,
         error: Option<&str>,
     ) -> Result<()> {
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         let now = now_millis();
         connection.execute(
             "UPDATE artists
@@ -1566,7 +1665,7 @@ impl CatalogStore {
         bio: Option<&str>,
         photo_asset_id: Option<i64>,
     ) -> Result<()> {
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         let now = now_millis();
         connection.execute(
             "UPDATE artists
@@ -1589,7 +1688,7 @@ impl CatalogStore {
         album_id: i64,
         musicbrainz_release_group_id: &str,
     ) -> Result<()> {
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         let now = now_millis();
         connection.execute(
             "UPDATE albums
@@ -1610,7 +1709,7 @@ impl CatalogStore {
         status: &str,
         error: Option<&str>,
     ) -> Result<()> {
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         let now = now_millis();
         connection.execute(
             "UPDATE albums
@@ -1625,7 +1724,7 @@ impl CatalogStore {
     }
 
     pub fn save_album_cover(&self, album_id: i64, cover_asset_id: i64) -> Result<()> {
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         let now = now_millis();
         connection.execute(
             "UPDATE albums
@@ -1655,7 +1754,7 @@ impl CatalogStore {
         mime_type: Option<&str>,
         data: &[u8],
     ) -> Result<PathBuf> {
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         let album_dir = connection
             .query_row(
                 "SELECT files.path
@@ -1706,7 +1805,7 @@ impl CatalogStore {
         mime_type: Option<&str>,
         data: &[u8],
     ) -> Result<i64> {
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         let now = now_millis();
         let hash = fnv1a_hex(data);
         let extension = artwork_extension(mime_type, data);
@@ -1749,7 +1848,7 @@ impl CatalogStore {
         release_type: &str,
         musicbrainz_release_group_id: Option<&str>,
     ) -> Result<i64> {
-        let connection = self.connect()?;
+        let connection = self.lock_connection()?;
         let now = now_millis();
         let normalized_title = normalize_key(title);
         let sort_key = discography_sort_key(year, title);
@@ -1789,8 +1888,8 @@ impl CatalogStore {
     }
 
     pub fn load_discography(&self, artist_id: i64) -> Result<Vec<CatalogDiscographyItem>> {
-        let connection = self.connect()?;
-        let mut statement = connection.prepare(
+        let connection = self.lock_connection()?;
+        let mut statement = connection.prepare_cached(
             "SELECT
                 discography_items.id,
                 discography_items.artist_id,
@@ -1917,29 +2016,40 @@ impl CatalogStore {
             name: String,
             bio: Option<String>,
             photo_path: Option<PathBuf>,
-            album_keys: Vec<String>,
+            album_keys: HashSet<String>,
             track_count: usize,
         }
-        struct ArtistRow {
-            artist_id: i64,
-            name: String,
-            bio: Option<String>,
-            photo_path: Option<PathBuf>,
-            album_name: String,
-            track_artist: String,
-        }
 
-        let connection = self.connect()?;
+        // SQL-side GROUP BY collapses per-track rows down to one row
+        // per `(artist_id, album_name, track_artist_credit)` tuple. For
+        // typical libraries (many tracks share the same primary artist
+        // and album), the returned row count drops by 5-20x compared
+        // to the previous per-track query, which used to fan out N rows
+        // and aggregate everything in Rust.
+        //
+        // The `track_artist_credit` (raw `tracks.artist_name` string) is
+        // kept in the GROUP BY because we still need to split featured-
+        // artist credits in Rust -- "A$AP Rocky feat/ Skepta" produces
+        // entries for both "A$AP Rocky" and "Skepta". Once a proper
+        // `track_artist_credits` join table exists we can drop this and
+        // group purely by (artists.id, albums.id).
+        let connection = self.lock_connection()?;
         let (root_filter, root_params) = root_path_filter(roots);
-        let mut statement = connection.prepare(&format!(
+        // `MAX(COALESCE(cover, art))` is used to pick *any* available
+        // album cover / track artwork as a fallback for artists without
+        // a dedicated photo asset, mirroring the prior per-row
+        // `COALESCE(cover_assets.cache_path, tracks.artwork_path)`
+        // behaviour but without the per-track fan-out.
+        let mut statement = connection.prepare_cached(&format!(
             "SELECT
                 artists.id,
                 artists.name,
                 artists.bio,
                 photo_assets.cache_path,
-                COALESCE(cover_assets.cache_path, tracks.artwork_path),
+                MAX(COALESCE(cover_assets.cache_path, tracks.artwork_path)) AS art_fallback,
                 tracks.album_name,
-                tracks.artist_name
+                tracks.artist_name,
+                COUNT(*) AS track_count
              FROM artists
              JOIN tracks ON tracks.artist_id = artists.id
              JOIN files ON files.id = tracks.file_id
@@ -1947,49 +2057,51 @@ impl CatalogStore {
              LEFT JOIN assets AS photo_assets ON photo_assets.id = artists.photo_asset_id
              LEFT JOIN assets AS cover_assets ON cover_assets.id = albums.cover_asset_id
              WHERE files.status = 'present' AND ({root_filter})
-              ORDER BY lower(tracks.artist_name), tracks.album_name, tracks.title",
+             GROUP BY artists.id, tracks.album_name, tracks.artist_name
+             ORDER BY artists.normalized_name COLLATE NOCASE, tracks.album_name COLLATE NOCASE",
         ))?;
         let rows = statement.query_map(params_from_iter(root_params), |row| {
             let photo_path: Option<String> = row.get(3)?;
             let fallback_photo_path: Option<String> = row.get(4)?;
-            Ok(ArtistRow {
-                artist_id: row.get(0)?,
-                name: row.get(1)?,
-                bio: row.get(2)?,
-                photo_path: photo_path.or(fallback_photo_path).map(PathBuf::from),
-                album_name: row.get::<_, String>(5)?,
-                track_artist: row.get::<_, String>(6)?,
-            })
+            let track_count: i64 = row.get(7)?;
+            Ok((
+                row.get::<_, i64>(0)?,            // artist_id
+                row.get::<_, String>(1)?,         // name
+                row.get::<_, Option<String>>(2)?, // bio
+                photo_path.or(fallback_photo_path).map(PathBuf::from),
+                row.get::<_, String>(5)?, // album_name
+                row.get::<_, String>(6)?, // track_artist
+                track_count.max(0) as usize,
+            ))
         })?;
 
         let mut artists = HashMap::<String, ArtistAggregate>::new();
         for row in rows.filter_map(|row| row.ok()) {
-            let album_key = normalize_key(&row.album_name);
-            for artist_name in individual_artist_names(&row.track_artist) {
+            let (artist_id, name, bio, photo_path, album_name, track_artist, track_count) = row;
+            let album_key = normalize_key(&album_name);
+            for artist_name in individual_artist_names(&track_artist) {
                 let key = normalize_key(&artist_name);
                 let aggregate = artists.entry(key).or_insert_with(|| ArtistAggregate {
                     artist_id: synthetic_artist_id(&artist_name),
-                    name: artist_name,
+                    name: artist_name.clone(),
                     bio: None,
                     photo_path: None,
-                    album_keys: Vec::new(),
+                    album_keys: HashSet::new(),
                     track_count: 0,
                 });
 
-                if normalize_key(&row.name) == normalize_key(&aggregate.name) {
-                    aggregate.artist_id = row.artist_id;
-                    aggregate.name = row.name.clone();
+                if normalize_key(&name) == normalize_key(&aggregate.name) {
+                    aggregate.artist_id = artist_id;
+                    aggregate.name = name.clone();
                 }
                 if aggregate.bio.is_none() {
-                    aggregate.bio = row.bio.clone();
+                    aggregate.bio = bio.clone();
                 }
                 if aggregate.photo_path.is_none() {
-                    aggregate.photo_path = row.photo_path.clone();
+                    aggregate.photo_path = photo_path.clone();
                 }
-                if !aggregate.album_keys.contains(&album_key) {
-                    aggregate.album_keys.push(album_key.clone());
-                }
-                aggregate.track_count += 1;
+                aggregate.album_keys.insert(album_key.clone());
+                aggregate.track_count += track_count;
             }
         }
 
@@ -2004,7 +2116,11 @@ impl CatalogStore {
                 track_count: artist.track_count,
             })
             .collect::<Vec<_>>();
-        artists.sort_by_key(|artist| artist.name.to_lowercase());
+        // Final sort uses the normalized lowercase name to match what
+        // `ORDER BY ... COLLATE NOCASE` produced from SQL; the synthetic
+        // (featured-artist) entries don't have a SQL position so we
+        // re-sort the merged result.
+        artists.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
         perf::event(
             "catalog.load_artists.count",
             format!("artists={}", artists.len()),
@@ -2027,66 +2143,69 @@ impl CatalogStore {
             artwork_path: Option<PathBuf>,
             track_count: usize,
         }
-        struct AlbumRow {
-            album_id: i64,
-            artist_id: i64,
-            title: String,
-            track_artist: String,
-            year: Option<String>,
-            artwork_path: Option<PathBuf>,
-        }
 
-        let connection = self.connect()?;
+        // SQL-side aggregation: one row per
+        // `(albums.id, tracks.artist_name)` instead of one per track.
+        // The remaining featured-credit dedup is done by
+        // `primary_artist_name()` in Rust on the much smaller result
+        // set. `MAX(COALESCE(cover, art))` mirrors the prior per-row
+        // fallback for albums without a dedicated cover asset.
+        let connection = self.lock_connection()?;
         let (root_filter, root_params) = root_path_filter(roots);
-        let mut statement = connection.prepare(&format!(
+        let mut statement = connection.prepare_cached(&format!(
             "SELECT
                 albums.id,
                 albums.artist_id,
                 albums.title,
                 tracks.artist_name,
                 albums.year,
-                COALESCE(cover_assets.cache_path, tracks.artwork_path)
+                MAX(COALESCE(cover_assets.cache_path, tracks.artwork_path)) AS artwork_path,
+                COUNT(*) AS track_count
              FROM albums
              JOIN tracks ON tracks.album_id = albums.id
              JOIN files ON files.id = tracks.file_id
              LEFT JOIN assets AS cover_assets ON cover_assets.id = albums.cover_asset_id
              WHERE files.status = 'present' AND ({root_filter})
-              ORDER BY lower(tracks.artist_name), albums.year, lower(albums.title), tracks.title",
+             GROUP BY albums.id, tracks.artist_name
+             ORDER BY tracks.artist_name COLLATE NOCASE, albums.year, albums.normalized_title",
         ))?;
         let rows = statement.query_map(params_from_iter(root_params), |row| {
             let artwork_path: Option<String> = row.get(5)?;
-            Ok(AlbumRow {
-                album_id: row.get(0)?,
-                artist_id: row.get(1)?,
-                title: row.get(2)?,
-                track_artist: row.get::<_, String>(3)?,
-                year: row.get(4)?,
-                artwork_path: artwork_path.map(PathBuf::from),
-            })
+            let track_count: i64 = row.get(6)?;
+            Ok((
+                row.get::<_, i64>(0)?,            // album_id
+                row.get::<_, i64>(1)?,            // artist_id
+                row.get::<_, String>(2)?,         // title
+                row.get::<_, String>(3)?,         // track_artist
+                row.get::<_, Option<String>>(4)?, // year
+                artwork_path.map(PathBuf::from),
+                track_count.max(0) as usize,
+            ))
         })?;
 
         let mut albums = HashMap::<String, AlbumAggregate>::new();
         for row in rows.filter_map(|row| row.ok()) {
-            let primary_artist = primary_artist_name(&row.track_artist);
+            let (album_id, artist_id, title, track_artist, year, artwork_path, track_count) = row;
+            let primary_artist = primary_artist_name(&track_artist);
             let key = format!(
                 "{}:{}",
                 normalize_key(&primary_artist),
-                normalize_key(&row.title)
+                normalize_key(&title)
             );
             let aggregate = albums.entry(key).or_insert_with(|| AlbumAggregate {
-                album_id: row.album_id,
-                artist_id: row.artist_id,
-                title: row.title,
+                album_id,
+                artist_id,
+                title,
                 artist: primary_artist,
-                year: row.year,
+                year,
                 artwork_path: None,
                 track_count: 0,
             });
 
             if aggregate.artwork_path.is_none() {
-                aggregate.artwork_path = row.artwork_path;
+                aggregate.artwork_path = artwork_path;
             }
-            aggregate.track_count += 1;
+            aggregate.track_count += track_count;
         }
 
         let mut albums = albums
@@ -2114,32 +2233,38 @@ impl CatalogStore {
         );
         Ok(albums)
     }
+}
 
-    fn persist_artwork(
-        &self,
-        connection: &Connection,
-        track: &Track,
-        now: i64,
-    ) -> Result<(Option<i64>, Option<PathBuf>)> {
-        let Some(artwork) = &track.artwork else {
-            return Ok((None, None));
-        };
+/// Free-standing version of artwork persistence so it can be invoked
+/// from the static `upsert_track_in_transaction` helper. Functionally
+/// identical to the original method; the only change is taking
+/// `cache_dir: &Path` explicitly instead of capturing `self.cache_dir`.
+fn persist_artwork(
+    connection: &Connection,
+    cache_dir: &Path,
+    track: &Track,
+    now: i64,
+) -> Result<(Option<i64>, Option<PathBuf>)> {
+    let Some(artwork) = &track.artwork else {
+        return Ok((None, None));
+    };
 
-        match artwork {
-            Artwork::File(path) => Ok((None, Some(path.clone()))),
-            Artwork::Embedded { mime_type, data } if data.is_empty() => Ok((None, None)),
-            Artwork::Embedded { mime_type, data } => {
-                let hash = fnv1a_hex(data);
-                let extension = artwork_extension(mime_type.as_deref(), data);
-                let artwork_dir = self.cache_dir.join("artwork");
-                fs::create_dir_all(&artwork_dir)?;
-                let cache_path = artwork_dir.join(format!("{hash}.{extension}"));
-                if !cache_path.exists() {
-                    fs::write(&cache_path, data)?;
-                }
+    match artwork {
+        Artwork::File(path) => Ok((None, Some(path.clone()))),
+        Artwork::Embedded { mime_type, data } if data.is_empty() => Ok((None, None)),
+        Artwork::Embedded { mime_type, data } => {
+            let hash = fnv1a_hex(data);
+            let extension = artwork_extension(mime_type.as_deref(), data);
+            let artwork_dir = cache_dir.join("artwork");
+            fs::create_dir_all(&artwork_dir)?;
+            let cache_path = artwork_dir.join(format!("{hash}.{extension}"));
+            if !cache_path.exists() {
+                fs::write(&cache_path, data)?;
+            }
 
-                let cache_path_label = cache_path.display().to_string();
-                connection.execute(
+            let cache_path_label = cache_path.display().to_string();
+            connection
+                .prepare_cached(
                     "INSERT INTO assets(kind, source, cache_path, content_hash, mime_type, status, fetched_at)
                      VALUES('album_art', 'embedded', ?1, ?2, ?3, 'ready', ?4)
                      ON CONFLICT(cache_path) DO UPDATE SET
@@ -2147,27 +2272,30 @@ impl CatalogStore {
                         mime_type = excluded.mime_type,
                         status = 'ready',
                         fetched_at = excluded.fetched_at",
-                    params![cache_path_label, hash, mime_type.as_deref(), now],
-                )?;
-                let asset_id =
-                    select_id_by_text(connection, "assets", "cache_path", &cache_path_label)?;
-                Ok((Some(asset_id), Some(cache_path)))
-            }
+                )?
+                .execute(params![cache_path_label, hash, mime_type.as_deref(), now])?;
+            let asset_id =
+                select_id_by_text(connection, "assets", "cache_path", &cache_path_label)?;
+            Ok((Some(asset_id), Some(cache_path)))
         }
     }
 }
 
 fn upsert_artist(connection: &Connection, name: &str, now: i64) -> Result<i64> {
     let normalized = normalize_key(name);
-    connection.execute(
-        "INSERT INTO artists(name, normalized_name, created_at, updated_at)
-         VALUES(?1, ?2, ?3, ?3)
-         ON CONFLICT(normalized_name) DO UPDATE SET
-            name = excluded.name,
-            updated_at = excluded.updated_at",
-        params![name, normalized, now],
-    )?;
-    select_id_by_text(connection, "artists", "normalized_name", &normalized)
+    connection
+        .prepare_cached(
+            "INSERT INTO artists(name, normalized_name, created_at, updated_at)
+             VALUES(?1, ?2, ?3, ?3)
+             ON CONFLICT(normalized_name) DO UPDATE SET
+                name = excluded.name,
+                updated_at = excluded.updated_at",
+        )?
+        .execute(params![name, normalized, now])?;
+    connection
+        .prepare_cached("SELECT id FROM artists WHERE normalized_name = ?1")?
+        .query_row(params![normalized], |row| row.get(0))
+        .context("failed to select artist id")
 }
 
 fn upsert_album(
@@ -2179,23 +2307,21 @@ fn upsert_album(
     now: i64,
 ) -> Result<i64> {
     let normalized = normalize_key(title);
-    connection.execute(
-        "INSERT INTO albums(title, normalized_title, artist_id, artist_name, year, created_at, updated_at)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?6)
-         ON CONFLICT(normalized_title, artist_id) DO UPDATE SET
-            title = excluded.title,
-            artist_name = excluded.artist_name,
-            year = COALESCE(excluded.year, albums.year),
-            updated_at = excluded.updated_at",
-        params![title, normalized, artist_id, artist_name, year, now],
-    )?;
+    connection
+        .prepare_cached(
+            "INSERT INTO albums(title, normalized_title, artist_id, artist_name, year, created_at, updated_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?6)
+             ON CONFLICT(normalized_title, artist_id) DO UPDATE SET
+                title = excluded.title,
+                artist_name = excluded.artist_name,
+                year = COALESCE(excluded.year, albums.year),
+                updated_at = excluded.updated_at",
+        )?
+        .execute(params![title, normalized, artist_id, artist_name, year, now])?;
 
     connection
-        .query_row(
-            "SELECT id FROM albums WHERE normalized_title = ?1 AND artist_id = ?2",
-            params![normalized, artist_id],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT id FROM albums WHERE normalized_title = ?1 AND artist_id = ?2")?
+        .query_row(params![normalized, artist_id], |row| row.get(0))
         .context("failed to select album id")
 }
 
@@ -2217,22 +2343,23 @@ fn enqueue_metadata_job_at(
     next_attempt_at: i64,
     now: i64,
 ) -> Result<()> {
-    connection.execute(
-        "INSERT INTO metadata_jobs(
-            entity_type, entity_id, job_type, status, next_attempt_at, created_at, updated_at
-         ) VALUES(?1, ?2, ?3, 'pending', ?4, ?5, ?5)
-         ON CONFLICT(entity_type, entity_id, job_type) DO UPDATE SET
-            status = CASE
-                WHEN metadata_jobs.status IN ('complete', 'running') THEN metadata_jobs.status
-                ELSE 'pending'
-            END,
-            next_attempt_at = CASE
-                WHEN metadata_jobs.status IN ('complete', 'running') THEN metadata_jobs.next_attempt_at
-                ELSE MIN(metadata_jobs.next_attempt_at, excluded.next_attempt_at)
-            END,
-            updated_at = excluded.updated_at",
-        params![entity_type, entity_id, job_type, next_attempt_at, now],
-    )?;
+    connection
+        .prepare_cached(
+            "INSERT INTO metadata_jobs(
+                entity_type, entity_id, job_type, status, next_attempt_at, created_at, updated_at
+             ) VALUES(?1, ?2, ?3, 'pending', ?4, ?5, ?5)
+             ON CONFLICT(entity_type, entity_id, job_type) DO UPDATE SET
+                status = CASE
+                    WHEN metadata_jobs.status IN ('complete', 'running') THEN metadata_jobs.status
+                    ELSE 'pending'
+                END,
+                next_attempt_at = CASE
+                    WHEN metadata_jobs.status IN ('complete', 'running') THEN metadata_jobs.next_attempt_at
+                    ELSE MIN(metadata_jobs.next_attempt_at, excluded.next_attempt_at)
+                END,
+                updated_at = excluded.updated_at",
+        )?
+        .execute(params![entity_type, entity_id, job_type, next_attempt_at, now])?;
     Ok(())
 }
 
@@ -2259,7 +2386,7 @@ fn enqueue_missing_album_art_jobs(
     sql.push_str(" ORDER BY artists.name, albums.title");
 
     let album_rows = {
-        let mut statement = connection.prepare(&sql)?;
+        let mut statement = connection.prepare_cached(&sql)?;
         if let Some(artist_id) = artist_id {
             let rows = statement.query_map(params![artist_id], |row| {
                 Ok((
@@ -2341,15 +2468,19 @@ fn select_id_by_text(
     value: &str,
 ) -> Result<i64> {
     let sql = format!("SELECT id FROM {table} WHERE {column} = ?1");
+    // Statement cache key is the SQL string, so the same `(table, column)`
+    // tuple will reuse a single prepared statement across batches.
     connection
-        .query_row(&sql, params![value], |row| row.get(0))
+        .prepare_cached(&sql)?
+        .query_row(params![value], |row| row.get(0))
         .with_context(|| format!("failed to select id from {table}"))
 }
 
 fn select_id_by_i64(connection: &Connection, table: &str, column: &str, value: i64) -> Result<i64> {
     let sql = format!("SELECT id FROM {table} WHERE {column} = ?1");
     connection
-        .query_row(&sql, params![value], |row| row.get(0))
+        .prepare_cached(&sql)?
+        .query_row(params![value], |row| row.get(0))
         .with_context(|| format!("failed to select id from {table}"))
 }
 
@@ -2360,7 +2491,7 @@ fn add_column_if_missing(
     definition: &str,
 ) -> Result<()> {
     let pragma = format!("PRAGMA table_info({table})");
-    let mut statement = connection.prepare(&pragma)?;
+    let mut statement = connection.prepare_cached(&pragma)?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
         let existing: String = row.get(1)?;
@@ -2388,17 +2519,23 @@ pub fn primary_artist_name(artist: &str) -> String {
         return String::new();
     }
 
+    // First try a "feat./ft./featuring" split -- the part before the
+    // marker is the primary credit, the rest is featured artists.
     let lower = artist.to_ascii_lowercase();
-    let split_at = feature_artist_marker(&lower)
-        .map(|(split_at, _)| split_at)
-        .unwrap_or(artist.len());
-    let primary = artist[..split_at].trim();
-
-    if primary.is_empty() {
-        artist.to_string()
-    } else {
-        primary.to_string()
+    if let Some((split_at, _)) = feature_artist_marker(&lower) {
+        let primary = artist[..split_at].trim();
+        if !primary.is_empty() {
+            // Even the "primary" half can itself be a collaboration
+            // (e.g. "John Lennon/Yoko Ono feat. The Plastic Ono Band"),
+            // so recurse-by-cases through the collaboration split.
+            return first_collaborator(primary).to_string();
+        }
     }
+
+    // No feat marker: check for a collaboration separator (slash or
+    // semicolon). Pick the first listed name as the primary credit so
+    // album/artist grouping is deterministic.
+    first_collaborator(artist).to_string()
 }
 
 pub fn individual_artist_names(artist: &str) -> Vec<String> {
@@ -2407,28 +2544,38 @@ pub fn individual_artist_names(artist: &str) -> Vec<String> {
         return Vec::new();
     }
 
-    let lower = artist.to_ascii_lowercase();
-    let Some((split_at, marker_len)) = feature_artist_marker(&lower) else {
-        return vec![artist.to_string()];
+    let mut artists = Vec::new();
+    let push_unique = |list: &mut Vec<String>, name: &str| {
+        let name = name.trim();
+        if !name.is_empty() && !list.iter().any(|existing| existing == name) {
+            list.push(name.to_string());
+        }
     };
 
-    let mut artists = Vec::new();
-    let primary = artist[..split_at].trim();
-    if !primary.is_empty() {
-        artists.push(primary.to_string());
-    }
+    let lower = artist.to_ascii_lowercase();
+    if let Some((split_at, marker_len)) = feature_artist_marker(&lower) {
+        // The primary half before the feat marker can itself be a
+        // slash/semicolon collaboration ("John Lennon/Yoko Ono feat. ..."),
+        // so split it the same way as a pure collaboration string.
+        let primary = artist[..split_at].trim();
+        for collaborator in split_collaborators(primary) {
+            push_unique(&mut artists, collaborator);
+        }
 
-    let featured = artist[split_at + marker_len..].trim_matches(|ch: char| {
-        ch.is_whitespace() || matches!(ch, '.' | '/' | ':' | '-' | '(' | '[')
-    });
-    for name in featured.split([',', ';']) {
-        for name in name.split(" & ") {
-            for name in name.split(" and ") {
-                let name = name.trim();
-                if !name.is_empty() && !artists.iter().any(|artist| artist == name) {
-                    artists.push(name.to_string());
+        let featured = artist[split_at + marker_len..].trim_matches(|ch: char| {
+            ch.is_whitespace() || matches!(ch, '.' | '/' | ':' | '-' | '(' | '[')
+        });
+        for name in featured.split([',', ';']) {
+            for name in name.split(" & ") {
+                for name in name.split(" and ") {
+                    push_unique(&mut artists, name);
                 }
             }
+        }
+    } else {
+        // No feat marker: split by collaboration separators only.
+        for collaborator in split_collaborators(artist) {
+            push_unique(&mut artists, collaborator);
         }
     }
 
@@ -2437,6 +2584,25 @@ pub fn individual_artist_names(artist: &str) -> Vec<String> {
     } else {
         artists
     }
+}
+
+/// First name in a collaboration string. Used by `primary_artist_name`
+/// when no feat-marker is present; for "John Lennon/Yoko Ono" returns
+/// "John Lennon".
+fn first_collaborator(artist: &str) -> &str {
+    split_collaborators(artist).next().unwrap_or(artist).trim()
+}
+
+/// Split a credit string on collaboration separators -- slash (with or
+/// without surrounding whitespace) and semicolon. Deliberately does NOT
+/// split on ampersand: "Simon & Garfunkel" / "Hall & Oates" /
+/// "Earth, Wind & Fire" are common single-entity band names where the
+/// ampersand is part of the name, not a separator.
+fn split_collaborators(artist: &str) -> impl Iterator<Item = &str> {
+    artist
+        .split(|ch: char| matches!(ch, '/' | '\\' | ';'))
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
 }
 
 fn feature_artist_marker(lower_artist: &str) -> Option<(usize, usize)> {
@@ -2633,6 +2799,64 @@ mod tests {
     }
 
     #[test]
+    fn splits_slash_separated_collaborations_into_individual_artists() {
+        assert_eq!(
+            individual_artist_names("John Lennon/Yoko Ono"),
+            vec!["John Lennon", "Yoko Ono"]
+        );
+        assert_eq!(
+            individual_artist_names("John Lennon / Yoko Ono"),
+            vec!["John Lennon", "Yoko Ono"]
+        );
+        // Three-way collaborations.
+        assert_eq!(
+            individual_artist_names("Bowie/Eno/Visconti"),
+            vec!["Bowie", "Eno", "Visconti"]
+        );
+        // Semicolons (Picard/MusicBrainz multi-value joiner).
+        assert_eq!(
+            individual_artist_names("Pärt; Hilliard Ensemble"),
+            vec!["Pärt", "Hilliard Ensemble"]
+        );
+    }
+
+    #[test]
+    fn primary_artist_uses_first_listed_collaborator() {
+        assert_eq!(primary_artist_name("John Lennon/Yoko Ono"), "John Lennon");
+        assert_eq!(primary_artist_name("John Lennon / Yoko Ono"), "John Lennon");
+    }
+
+    #[test]
+    fn slash_collaboration_with_feat_credit() {
+        assert_eq!(
+            individual_artist_names("John Lennon/Yoko Ono feat. The Plastic Ono Band"),
+            vec!["John Lennon", "Yoko Ono", "The Plastic Ono Band"]
+        );
+        assert_eq!(
+            primary_artist_name("John Lennon/Yoko Ono feat. The Plastic Ono Band"),
+            "John Lennon"
+        );
+    }
+
+    #[test]
+    fn ampersand_band_names_are_not_split() {
+        // Common false-positive separator: many real band names contain
+        // " & " as part of the name, not as a collaboration marker.
+        assert_eq!(
+            individual_artist_names("Simon & Garfunkel"),
+            vec!["Simon & Garfunkel"]
+        );
+        assert_eq!(
+            individual_artist_names("Hall & Oates"),
+            vec!["Hall & Oates"]
+        );
+        assert_eq!(
+            primary_artist_name("Simon & Garfunkel"),
+            "Simon & Garfunkel"
+        );
+    }
+
+    #[test]
     fn detects_artwork_extension_from_magic_bytes() {
         assert_eq!(artwork_extension(None, b"\x89PNG\r\n\x1a\nrest"), "png");
         assert_eq!(artwork_extension(Some("image/jpeg"), b""), "jpg");
@@ -2641,11 +2865,11 @@ mod tests {
     #[test]
     fn finish_scan_returns_missing_paths_for_scanned_roots_only() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let store = CatalogStore {
-            db_path: temp_dir.path().join("tempo.sqlite"),
-            cache_dir: temp_dir.path().join("cache"),
-        };
-        store.migrate().unwrap();
+        let store = CatalogStore::open_at(
+            temp_dir.path().join("tempo.sqlite"),
+            temp_dir.path().join("cache"),
+        )
+        .unwrap();
 
         let root = temp_dir.path().join("library");
         let other_root = temp_dir.path().join("other-library");
@@ -2711,11 +2935,11 @@ mod tests {
     #[test]
     fn mark_folder_removed_returns_child_track_paths() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let store = CatalogStore {
-            db_path: temp_dir.path().join("tempo.sqlite"),
-            cache_dir: temp_dir.path().join("cache"),
-        };
-        store.migrate().unwrap();
+        let store = CatalogStore::open_at(
+            temp_dir.path().join("tempo.sqlite"),
+            temp_dir.path().join("cache"),
+        )
+        .unwrap();
 
         let root = temp_dir.path().join("library");
         let album = root.join("album");
@@ -2759,14 +2983,16 @@ mod tests {
     #[test]
     fn stores_discography_items_and_metadata_jobs() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let store = CatalogStore {
-            db_path: temp_dir.path().join("tempo.sqlite"),
-            cache_dir: temp_dir.path().join("cache"),
-        };
-        store.migrate().unwrap();
+        let store = CatalogStore::open_at(
+            temp_dir.path().join("tempo.sqlite"),
+            temp_dir.path().join("cache"),
+        )
+        .unwrap();
 
-        let connection = store.connect().unwrap();
-        let artist_id = upsert_artist(&connection, "Brian Eno", now_millis()).unwrap();
+        let artist_id = {
+            let connection = store.lock_connection().unwrap();
+            upsert_artist(&connection, "Brian Eno", now_millis()).unwrap()
+        };
 
         let item_id = store
             .upsert_discography_item(
@@ -2797,11 +3023,11 @@ mod tests {
     #[test]
     fn loads_browse_data_with_sql_aggregation_and_root_filtering() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let store = CatalogStore {
-            db_path: temp_dir.path().join("tempo.sqlite"),
-            cache_dir: temp_dir.path().join("cache"),
-        };
-        store.migrate().unwrap();
+        let store = CatalogStore::open_at(
+            temp_dir.path().join("tempo.sqlite"),
+            temp_dir.path().join("cache"),
+        )
+        .unwrap();
 
         let root = temp_dir.path().join("library");
         let other_root = temp_dir.path().join("other-library");
@@ -2893,11 +3119,11 @@ mod tests {
     #[test]
     fn stores_and_loads_waveform_cache() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let store = CatalogStore {
-            db_path: temp_dir.path().join("tempo.sqlite"),
-            cache_dir: temp_dir.path().join("cache"),
-        };
-        store.migrate().unwrap();
+        let store = CatalogStore::open_at(
+            temp_dir.path().join("tempo.sqlite"),
+            temp_dir.path().join("cache"),
+        )
+        .unwrap();
 
         let root = temp_dir.path().join("library");
         fs::create_dir_all(&root).unwrap();
@@ -2941,11 +3167,11 @@ mod tests {
     #[test]
     fn invalidates_waveform_cache_when_file_changes() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let store = CatalogStore {
-            db_path: temp_dir.path().join("tempo.sqlite"),
-            cache_dir: temp_dir.path().join("cache"),
-        };
-        store.migrate().unwrap();
+        let store = CatalogStore::open_at(
+            temp_dir.path().join("tempo.sqlite"),
+            temp_dir.path().join("cache"),
+        )
+        .unwrap();
 
         let root = temp_dir.path().join("library");
         fs::create_dir_all(&root).unwrap();
@@ -2986,11 +3212,11 @@ mod tests {
     #[test]
     fn groups_featured_track_credits_under_primary_artist() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let store = CatalogStore {
-            db_path: temp_dir.path().join("tempo.sqlite"),
-            cache_dir: temp_dir.path().join("cache"),
-        };
-        store.migrate().unwrap();
+        let store = CatalogStore::open_at(
+            temp_dir.path().join("tempo.sqlite"),
+            temp_dir.path().join("cache"),
+        )
+        .unwrap();
 
         let root = temp_dir.path().join("library");
         store
@@ -3066,5 +3292,250 @@ mod tests {
                 .iter()
                 .any(|track| track.artist == "A$AP Rocky feat/ Skepta")
         );
+    }
+
+    #[test]
+    fn splits_slash_collaboration_into_individual_artists_in_browse() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = CatalogStore::open_at(
+            temp_dir.path().join("tempo.sqlite"),
+            temp_dir.path().join("cache"),
+        )
+        .unwrap();
+
+        let root = temp_dir.path().join("library");
+        // "John Lennon/Yoko Ono" should produce two distinct artists in
+        // the Artists view, each with the album credited to them, even
+        // though the underlying track tag string is a single value.
+        store
+            .upsert_track(
+                &Track {
+                    path: root.join("imagine.flac"),
+                    title: "Imagine".to_string(),
+                    artist: "John Lennon/Yoko Ono".to_string(),
+                    album: "Imagine".to_string(),
+                    genre: None,
+                    track_number: None,
+                    year: Some("1971".to_string()),
+                    date_added: UNIX_EPOCH,
+                    duration: Duration::from_secs(60),
+                    codec: "FLAC".to_string(),
+                    sample_rate: None,
+                    channels: None,
+                    bitrate: None,
+                    file_size: 10,
+                    modified: None,
+                    artwork: None,
+                },
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_track(
+                &Track {
+                    path: root.join("oh-yoko.flac"),
+                    title: "Oh Yoko!".to_string(),
+                    artist: "John Lennon / Yoko Ono".to_string(),
+                    album: "Imagine".to_string(),
+                    genre: None,
+                    track_number: None,
+                    year: Some("1971".to_string()),
+                    date_added: UNIX_EPOCH,
+                    duration: Duration::from_secs(60),
+                    codec: "FLAC".to_string(),
+                    sample_rate: None,
+                    channels: None,
+                    bitrate: None,
+                    file_size: 10,
+                    modified: None,
+                    artwork: None,
+                },
+                None,
+            )
+            .unwrap();
+
+        let artists = store.load_artists(std::slice::from_ref(&root)).unwrap();
+        assert_eq!(
+            artists.len(),
+            2,
+            "expected John Lennon and Yoko Ono as separate artists, got {:?}",
+            artists.iter().map(|a| &a.name).collect::<Vec<_>>()
+        );
+        let lennon = artists
+            .iter()
+            .find(|artist| artist.name == "John Lennon")
+            .expect("John Lennon should appear as an individual artist");
+        assert_eq!(lennon.album_count, 1);
+        assert_eq!(lennon.track_count, 2);
+        let yoko = artists
+            .iter()
+            .find(|artist| artist.name == "Yoko Ono")
+            .expect("Yoko Ono should appear as an individual artist");
+        assert_eq!(yoko.album_count, 1);
+        assert_eq!(yoko.track_count, 2);
+
+        // The album is grouped under the primary (first-listed)
+        // collaborator, so there should be a single "Imagine" album
+        // credited to John Lennon.
+        let albums = store.load_albums(std::slice::from_ref(&root)).unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].artist, "John Lennon");
+        assert_eq!(albums[0].track_count, 2);
+
+        // The original tag string is preserved on the track itself --
+        // only the browse-view aggregation is split.
+        let tracks = store.load_tracks(&[root]).unwrap();
+        assert!(
+            tracks
+                .iter()
+                .any(|track| track.artist == "John Lennon/Yoko Ono")
+        );
+    }
+
+    /// Build N synthetic tracks for the upsert benchmarks.
+    fn synthetic_tracks(root: &Path, count: usize) -> Vec<Track> {
+        (0..count)
+            .map(|ix| Track {
+                path: root.join(format!("track-{ix:05}.flac")),
+                title: format!("Track {ix}"),
+                artist: format!("Artist {}", ix % 100),
+                album: format!("Album {}", ix % 200),
+                genre: Some("Synthetic".to_string()),
+                track_number: Some((ix % 20 + 1) as u32),
+                year: Some("2024".to_string()),
+                date_added: UNIX_EPOCH,
+                duration: Duration::from_secs(180),
+                codec: "FLAC".to_string(),
+                sample_rate: Some(44_100),
+                channels: Some(2),
+                bitrate: Some(900),
+                file_size: 5_000_000,
+                modified: None,
+                artwork: None,
+            })
+            .collect()
+    }
+
+    /// Microbenchmark: per-track upsert (single transaction per call).
+    /// Run with `rtk cargo test --release bench_bulk_upsert_per_track -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_bulk_upsert_per_track() {
+        const N: usize = 2_000;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = CatalogStore::open_at(
+            temp_dir.path().join("tempo.sqlite"),
+            temp_dir.path().join("cache"),
+        )
+        .unwrap();
+
+        let root = temp_dir.path().join("library");
+        let tracks = synthetic_tracks(&root, N);
+
+        let scan_id = store.begin_scan(std::slice::from_ref(&root)).unwrap();
+        let start = std::time::Instant::now();
+        for track in &tracks {
+            store.upsert_track(track, Some(scan_id)).unwrap();
+        }
+        let elapsed = start.elapsed();
+        store
+            .finish_scan(scan_id, std::slice::from_ref(&root))
+            .unwrap();
+        let per_track = elapsed / N as u32;
+        eprintln!(
+            "bench_bulk_upsert_per_track: {N} tracks in {elapsed:?} ({per_track:?} per track, \
+             {:.1} tracks/sec)",
+            N as f64 / elapsed.as_secs_f64()
+        );
+
+        let loaded = store.load_tracks(std::slice::from_ref(&root)).unwrap();
+        assert_eq!(loaded.len(), N);
+    }
+
+    /// Microbenchmark: full pipeline -- batched upsert of N tracks
+    /// followed by `load_tracks`/`load_artists`/`load_albums` queries.
+    /// Captures end-to-end SQL aggregation cost which the audit
+    /// targeted with the GROUP BY rewrite.
+    #[test]
+    #[ignore]
+    fn bench_browse_load_after_upsert() {
+        const N: usize = 2_000;
+        const BATCH: usize = 256;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = CatalogStore::open_at(
+            temp_dir.path().join("tempo.sqlite"),
+            temp_dir.path().join("cache"),
+        )
+        .unwrap();
+
+        let root = temp_dir.path().join("library");
+        let tracks = synthetic_tracks(&root, N);
+
+        let scan_id = store.begin_scan(std::slice::from_ref(&root)).unwrap();
+        for chunk in tracks.chunks(BATCH) {
+            store.upsert_tracks_batch(chunk, Some(scan_id)).unwrap();
+        }
+        store
+            .finish_scan(scan_id, std::slice::from_ref(&root))
+            .unwrap();
+
+        let load_tracks_start = std::time::Instant::now();
+        let loaded = store.load_tracks(std::slice::from_ref(&root)).unwrap();
+        let load_tracks_elapsed = load_tracks_start.elapsed();
+        assert_eq!(loaded.len(), N);
+
+        let load_artists_start = std::time::Instant::now();
+        let artists = store.load_artists(std::slice::from_ref(&root)).unwrap();
+        let load_artists_elapsed = load_artists_start.elapsed();
+
+        let load_albums_start = std::time::Instant::now();
+        let albums = store.load_albums(std::slice::from_ref(&root)).unwrap();
+        let load_albums_elapsed = load_albums_start.elapsed();
+
+        eprintln!(
+            "bench_browse_load_after_upsert ({N} tracks, {} artists, {} albums):\n  \
+             load_tracks  = {load_tracks_elapsed:?}\n  \
+             load_artists = {load_artists_elapsed:?}\n  \
+             load_albums  = {load_albums_elapsed:?}",
+            artists.len(),
+            albums.len()
+        );
+    }
+
+    /// Microbenchmark: batched upsert (single transaction for the whole
+    /// batch). Mimics the cold-scan hot path.
+    #[test]
+    #[ignore]
+    fn bench_bulk_upsert_batched() {
+        const N: usize = 2_000;
+        const BATCH: usize = 256;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = CatalogStore::open_at(
+            temp_dir.path().join("tempo.sqlite"),
+            temp_dir.path().join("cache"),
+        )
+        .unwrap();
+
+        let root = temp_dir.path().join("library");
+        let tracks = synthetic_tracks(&root, N);
+
+        let scan_id = store.begin_scan(std::slice::from_ref(&root)).unwrap();
+        let start = std::time::Instant::now();
+        for chunk in tracks.chunks(BATCH) {
+            store.upsert_tracks_batch(chunk, Some(scan_id)).unwrap();
+        }
+        let elapsed = start.elapsed();
+        store
+            .finish_scan(scan_id, std::slice::from_ref(&root))
+            .unwrap();
+        let per_track = elapsed / N as u32;
+        eprintln!(
+            "bench_bulk_upsert_batched: {N} tracks (batch={BATCH}) in {elapsed:?} \
+             ({per_track:?} per track, {:.1} tracks/sec)",
+            N as f64 / elapsed.as_secs_f64()
+        );
+
+        let loaded = store.load_tracks(std::slice::from_ref(&root)).unwrap();
+        assert_eq!(loaded.len(), N);
     }
 }

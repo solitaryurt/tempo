@@ -675,7 +675,11 @@ impl TempoApp {
         self.active_tab_mut().search_query = query.clone();
         self.search_input.set_text(query);
         self.context_menu_track = None;
-        self.invalidate_track_indices();
+        // Search-query changes only affect the active tab; don't waste
+        // work rebuilding indices for every other tab as the prior
+        // global `invalidate_track_indices()` did.
+        let active_tab = self.active_tab;
+        self.rebuild_track_indices_for_tab(active_tab);
         let selected_track = self.active_selected_track();
         let replacement_track = {
             let indices = self.current_track_indices();
@@ -942,56 +946,69 @@ impl TempoApp {
             return true;
         }
 
-        let searchable = format!(
-            "{} {} {} {} {} {} {}",
-            track.title,
-            track.artist,
-            track.album,
-            track.genre,
-            track.year,
-            track.codec,
-            track.path.display()
-        )
-        .to_lowercase();
-
-        terms.iter().all(|term| searchable.contains(term))
+        // Pre-lowercased blob is built once at `Track` construction
+        // (see `track_searchable_lower`), so this match is allocation-
+        // free and runs at memcmp speed per keystroke. Previously this
+        // routine `format!()`-d + `to_lowercase()`-d for every track on
+        // every filter rebuild -- catastrophic on a 50k-track library.
+        terms
+            .iter()
+            .all(|term| track.searchable_lower.contains(term))
     }
 
     pub(super) fn artist_indices_for_search_query(&self, query: &str) -> Vec<usize> {
+        let cache_key = (query.to_string(), self.artists_generation);
+        {
+            let cache = self.artist_filter_cache.borrow();
+            if cache.key.as_ref() == Some(&cache_key) {
+                return cache.indices.clone();
+            }
+        }
         let terms = Self::search_terms(query);
-        self.artists
+        let indices: Vec<usize> = self
+            .artists
             .iter()
             .enumerate()
             .filter_map(|(ix, artist)| {
                 Self::artist_matches_search_terms(artist, &terms).then_some(ix)
             })
-            .collect()
+            .collect();
+        let mut cache = self.artist_filter_cache.borrow_mut();
+        cache.key = Some(cache_key);
+        cache.indices = indices.clone();
+        indices
     }
 
     pub(super) fn album_indices_for_search_query(&self, query: &str) -> Vec<usize> {
+        let cache_key = (query.to_string(), self.albums_generation);
+        {
+            let cache = self.album_filter_cache.borrow();
+            if cache.key.as_ref() == Some(&cache_key) {
+                return cache.indices.clone();
+            }
+        }
         let terms = Self::search_terms(query);
-        self.albums
+        let indices: Vec<usize> = self
+            .albums
             .iter()
             .enumerate()
             .filter_map(|(ix, album)| Self::album_matches_search_terms(album, &terms).then_some(ix))
-            .collect()
+            .collect();
+        let mut cache = self.album_filter_cache.borrow_mut();
+        cache.key = Some(cache_key);
+        cache.indices = indices.clone();
+        indices
     }
 
     pub(super) fn artist_matches_search_terms(artist: &Artist, terms: &[String]) -> bool {
         if terms.is_empty() {
             return true;
         }
-
-        let searchable = format!(
-            "{} {} {} {}",
-            artist.name,
-            artist.bio.as_deref().unwrap_or_default(),
-            artist.album_count,
-            artist.track_count
-        )
-        .to_lowercase();
-
-        terms.iter().all(|term| searchable.contains(term))
+        // See `track_matches_search_terms` for the rationale: searchable
+        // blob is pre-lowercased at `Artist` construction.
+        terms
+            .iter()
+            .all(|term| artist.searchable_lower.contains(term))
     }
 
     pub(super) fn album_matches_search_terms(album: &Album, terms: &[String]) -> bool {
@@ -999,15 +1016,10 @@ impl TempoApp {
             return true;
         }
 
-        let searchable = format!(
-            "{} {} {} {}",
-            album.title,
-            album.artist,
-            album.year.as_deref().unwrap_or_default(),
-            album.track_count
-        )
-        .to_lowercase();
-
-        terms.iter().all(|term| searchable.contains(term))
+        // See `track_matches_search_terms` for the rationale: searchable
+        // blob is pre-lowercased at `Album` construction.
+        terms
+            .iter()
+            .all(|term| album.searchable_lower.contains(term))
     }
 }

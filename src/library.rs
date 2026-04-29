@@ -19,6 +19,7 @@ use lofty::{
     tag::{Accessor, ItemKey, ItemValue, Tag},
 };
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use rayon::prelude::*;
 use walkdir::{DirEntry, WalkDir};
 
 const AUDIO_EXTENSIONS: &[&str] = &[
@@ -196,7 +197,6 @@ impl LibraryIndexer {
         let mut report = ScanReport::default();
         let mut progress = ScanProgress::default();
         let batch_size = self.options.batch_size.max(1);
-        let mut emitted_tracks = Vec::new();
 
         let _ = events.send(LibraryEvent::ScanStarted);
         let scan_id =
@@ -231,6 +231,99 @@ impl LibraryIndexer {
             }
         });
         let mut cached_seen_paths = Vec::new();
+
+        // Buffer of paths whose fingerprint did NOT match the catalog --
+        // these need a fresh `index_audio_file` parse. Filled by the
+        // walker loop; flushed (in parallel) when it grows past
+        // `batch_size`.
+        let mut pending_parse: Vec<PathBuf> = Vec::with_capacity(batch_size);
+
+        // Helper: parse a batch of paths in parallel using rayon, run
+        // the batched DB upsert, and emit events. Returns whether any
+        // tracks were actually emitted.
+        let flush_pending_parse = |pending: &mut Vec<PathBuf>,
+                                   progress: &mut ScanProgress,
+                                   report: &mut ScanReport,
+                                   events: &mpsc::Sender<LibraryEvent>|
+         -> bool {
+            if pending.is_empty() {
+                return false;
+            }
+            let parse_count = pending.len();
+            let parse_start = std::time::Instant::now();
+            // Rayon parallel parse: lofty's `read_from_path` is CPU-bound
+            // (FLAC/MP3 header parse) and easily saturates 4-8 cores on
+            // a cold scan. Each worker uses Result<Track, IndexingError>
+            // so failures don't poison the batch.
+            let results: Vec<Result<Track, IndexingError>> = pending
+                .par_drain(..)
+                .map(|path| {
+                    index_audio_file(&path).map_err(|error| IndexingError {
+                        path: path.to_path_buf(),
+                        message: error.to_string(),
+                    })
+                })
+                .collect();
+            perf::log_duration(
+                "library.scan.parse_batch_parallel",
+                parse_start.elapsed(),
+                format!("count={parse_count}"),
+            );
+
+            let mut batch_tracks = Vec::with_capacity(parse_count);
+            for result in results {
+                match result {
+                    Ok(track) => {
+                        progress.indexed += 1;
+                        report.tracks.push(track.clone());
+                        batch_tracks.push(track);
+                    }
+                    Err(error) => {
+                        progress.errors += 1;
+                        report.errors.push(error.clone());
+                        let _ = events.send(LibraryEvent::ScanError(error));
+                    }
+                }
+            }
+
+            if batch_tracks.is_empty() {
+                let _ = events.send(LibraryEvent::ScanProgress(*progress));
+                return false;
+            }
+
+            if let Some(catalog) = &self.catalog
+                && let Err(error) = catalog.upsert_tracks_batch(&batch_tracks, scan_id)
+            {
+                send_error(
+                    events,
+                    PathBuf::new(),
+                    format!("failed to cache indexed batch: {error:#}"),
+                );
+            }
+            perf::event(
+                "library.scan.emit_batch",
+                format!(
+                    "kind=indexed batch={} indexed={} discovered={} errors={}",
+                    batch_tracks.len(),
+                    progress.indexed,
+                    progress.discovered,
+                    progress.errors
+                ),
+            );
+            // Strip embedded artwork bytes before sending the event:
+            // catalog already persisted them, and the UI reads
+            // `artwork_path` from the catalog -- shipping the raw bytes
+            // through the channel just bloats memory for no benefit.
+            let mut event_tracks = batch_tracks;
+            for track in &mut event_tracks {
+                if matches!(track.artwork, Some(Artwork::Embedded { .. })) {
+                    track.artwork = None;
+                }
+            }
+            let _ = events.send(LibraryEvent::TracksIndexed(event_tracks));
+            let _ = events.send(LibraryEvent::ScanProgress(*progress));
+            true
+        };
 
         for root in &self.roots {
             for entry in WalkDir::new(root)
@@ -288,61 +381,15 @@ impl LibraryIndexer {
                     continue;
                 }
 
-                match index_audio_file(path) {
-                    Ok(track) => {
-                        if let Some(catalog) = &self.catalog
-                            && let Err(error) = catalog.upsert_track(&track, scan_id)
-                        {
-                            send_error(
-                                events,
-                                track.path.clone(),
-                                format!("failed to cache indexed metadata: {error:#}"),
-                            );
-                        }
-
-                        progress.indexed += 1;
-                        report.tracks.push(track.clone());
-                        emitted_tracks.push(track);
-
-                        if emitted_tracks.len() % batch_size == 0 {
-                            let start = emitted_tracks.len() - batch_size;
-                            perf::event(
-                                "library.scan.emit_batch",
-                                format!(
-                                    "kind=indexed batch={batch_size} indexed={} discovered={} errors={}",
-                                    progress.indexed, progress.discovered, progress.errors
-                                ),
-                            );
-                            let _ = events.send(LibraryEvent::TracksIndexed(
-                                emitted_tracks[start..].to_vec(),
-                            ));
-                            let _ = events.send(LibraryEvent::ScanProgress(progress));
-                        }
-                    }
-                    Err(error) => {
-                        progress.errors += 1;
-                        let indexing_error = IndexingError {
-                            path: path.to_path_buf(),
-                            message: error.to_string(),
-                        };
-                        report.errors.push(indexing_error.clone());
-                        let _ = events.send(LibraryEvent::ScanError(indexing_error));
-                        let _ = events.send(LibraryEvent::ScanProgress(progress));
-                    }
+                pending_parse.push(path.to_path_buf());
+                if pending_parse.len() >= batch_size {
+                    flush_pending_parse(&mut pending_parse, &mut progress, &mut report, events);
                 }
             }
         }
 
-        let sent_full_batches = emitted_tracks.len() / batch_size * batch_size;
-        if sent_full_batches < emitted_tracks.len() {
-            perf::event(
-                "library.scan.emit_final_batch",
-                format!("batch={}", emitted_tracks.len() - sent_full_batches),
-            );
-            let _ = events.send(LibraryEvent::TracksIndexed(
-                emitted_tracks[sent_full_batches..].to_vec(),
-            ));
-        }
+        // Final flush: any remainder parse + commit.
+        flush_pending_parse(&mut pending_parse, &mut progress, &mut report, events);
 
         report
             .tracks
@@ -758,7 +805,16 @@ fn flush_pending(
     }
 
     if !indexed.is_empty() {
-        let _ = events.send(LibraryEvent::TracksIndexed(indexed));
+        // Same artwork-bytes stripping as the cold scan path: catalog
+        // already persisted embedded artwork to disk, so we don't need
+        // to ship the raw bytes through the event channel.
+        let mut event_tracks = indexed;
+        for track in &mut event_tracks {
+            if matches!(track.artwork, Some(Artwork::Embedded { .. })) {
+                track.artwork = None;
+            }
+        }
+        let _ = events.send(LibraryEvent::TracksIndexed(event_tracks));
     }
 
     if removed.len() == 1 {
