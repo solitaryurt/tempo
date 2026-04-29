@@ -116,6 +116,11 @@ pub struct CatalogMetadataActivity {
     pub pending: usize,
     pub running: usize,
     pub failed: usize,
+    pub pending_artist_resolve: usize,
+    pub pending_artist_profile: usize,
+    pub pending_artist_discography: usize,
+    pub pending_album_resolve: usize,
+    pub pending_album_cover: usize,
 }
 
 impl CatalogMetadataActivity {
@@ -1169,6 +1174,29 @@ impl CatalogStore {
                 "pending" => activity.pending = row.1,
                 "running" => activity.running = row.1,
                 "failed" => activity.failed = row.1,
+                _ => {}
+            }
+        }
+
+        let mut statement = connection.prepare(
+            "SELECT job_type, COUNT(*)
+             FROM metadata_jobs
+             WHERE status = 'pending'
+             GROUP BY job_type",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?.max(0) as usize,
+            ))
+        })?;
+        for row in rows.filter_map(|row| row.ok()) {
+            match row.0.as_str() {
+                "resolve_artist_musicbrainz" => activity.pending_artist_resolve = row.1,
+                "fetch_artist_profile" => activity.pending_artist_profile = row.1,
+                "fetch_artist_discography" => activity.pending_artist_discography = row.1,
+                "resolve_album_musicbrainz" => activity.pending_album_resolve = row.1,
+                "fetch_album_cover" => activity.pending_album_cover = row.1,
                 _ => {}
             }
         }

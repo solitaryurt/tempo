@@ -480,7 +480,12 @@ impl TempoApp {
         let active = self.metadata_activity.running.max(1);
         let pending = self.metadata_activity.pending;
         let label = if pending > 0 {
-            format!("Syncing metadata: {active} active, {pending} queued")
+            format!(
+                "Syncing metadata: {active} active, {pending} queued{}",
+                self.metadata_sync_eta_label()
+                    .map(|eta| format!(" · about {eta} left"))
+                    .unwrap_or_default()
+            )
         } else {
             format!("Syncing metadata: {active} active")
         };
@@ -489,11 +494,11 @@ impl TempoApp {
             div()
                 .id("metadata-sync-status")
                 .text_xs()
-                .text_color(rgb(colors.accent))
+                .text_color(rgb(colors.text_strong))
                 .h(px(26.0))
                 .px_2()
                 .rounded_full()
-                .bg(rgb(colors.selected))
+                .bg(rgb(colors.elevated))
                 .border_1()
                 .border_color(rgb(colors.border))
                 .flex()
@@ -504,7 +509,7 @@ impl TempoApp {
                 .when(self.metadata_status_expanded, |this| {
                     this.child(
                         div()
-                            .text_color(rgb(colors.accent_soft))
+                            .text_color(rgb(colors.text_strong))
                             .whitespace_nowrap()
                             .child(label),
                     )
@@ -517,16 +522,13 @@ impl TempoApp {
     }
 
     fn metadata_sync_glyph(&self, colors: ThemeColors) -> AnyElement {
-        let color = format!("#{:06x}", colors.accent);
-        let muted = format!("#{:06x}", colors.text_muted);
+        let color = format!("#{:06x}", colors.text_strong);
         let svg = format!(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24">
-<g>
+<g transform-origin="12 12">
 <animateTransform attributeName="transform" attributeType="XML" type="rotate" from="0 12 12" to="360 12 12" dur="1.1s" repeatCount="indefinite"/>
-<path d="M19.2 8.2A8 8 0 0 0 5.7 5.7" fill="none" stroke="{muted}" stroke-width="2" stroke-linecap="round" opacity="0.45"/>
-<path d="M4.8 15.8A8 8 0 0 0 18.3 18.3" fill="none" stroke="{muted}" stroke-width="2" stroke-linecap="round" opacity="0.45"/>
-<path d="M18.8 4.8V8.8H14.8" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<path d="M5.2 19.2V15.2H9.2" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M12 4A8 8 0 1 1 4 12" fill="none" stroke="{color}" stroke-width="2.4" stroke-linecap="round"/>
+<path d="M4 12L7 9M4 12L7 15" fill="none" stroke="{color}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
 </g>
 </svg>"#
         );
@@ -539,6 +541,43 @@ impl TempoApp {
         .h(px(16.0))
         .flex_none()
         .into_any_element()
+    }
+
+    fn metadata_sync_eta_label(&self) -> Option<String> {
+        let activity = &self.metadata_activity;
+        let estimated_seconds = activity.pending_artist_resolve
+            + activity.pending_artist_discography
+            + activity.pending_album_resolve
+            + activity.pending_album_cover
+            + (activity.pending_artist_profile * 2);
+
+        if estimated_seconds == 0 {
+            return None;
+        }
+
+        Some(Self::metadata_duration_label(Duration::from_secs(
+            estimated_seconds as u64,
+        )))
+    }
+
+    fn metadata_duration_label(duration: Duration) -> String {
+        let seconds = duration.as_secs();
+        if seconds < 60 {
+            return format!("{}s", seconds.max(1));
+        }
+
+        let minutes = seconds.div_ceil(60);
+        if minutes < 60 {
+            return format!("{minutes}m");
+        }
+
+        let hours = minutes / 60;
+        let remaining_minutes = minutes % 60;
+        if remaining_minutes == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {remaining_minutes}m")
+        }
     }
 
     pub(super) fn render_scan_errors_page(
