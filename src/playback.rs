@@ -1,4 +1,4 @@
-use std::{fs::File, path::Path, time::Duration};
+use std::{fs::File, path::Path, path::PathBuf, sync::Arc, thread, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use cpal::{Device, traits::DeviceTrait as _, traits::HostTrait as _};
@@ -14,7 +14,9 @@ pub struct PlaybackOutputDevice {
 
 pub struct PlaybackController {
     _device: MixerDeviceSink,
-    player: Player,
+    /// `Arc` so we can hand the player to background decode threads
+    /// without blocking the UI on file open + `Decoder::try_from`.
+    player: Arc<Player>,
     output_name: String,
 }
 
@@ -25,7 +27,7 @@ impl PlaybackController {
             format!("preferred_output={}", preferred_output.unwrap_or("default")),
         );
         let (device, output_name) = Self::open_output(preferred_output)?;
-        let player = Player::connect_new(device.mixer());
+        let player = Arc::new(Player::connect_new(device.mixer()));
         player.set_volume(volume);
 
         Ok(Self {
@@ -64,7 +66,7 @@ impl PlaybackController {
     pub fn set_output(&mut self, output_name: &str, volume: f32) -> Result<()> {
         let _span = perf::span("playback.set_output", format!("output={output_name}"));
         let (device, output_name) = Self::open_output(Some(output_name))?;
-        let player = Player::connect_new(device.mixer());
+        let player = Arc::new(Player::connect_new(device.mixer()));
         player.set_volume(volume);
 
         self.player.stop();
@@ -110,16 +112,53 @@ impl PlaybackController {
             .unwrap_or_else(|_| "Unknown output".to_string())
     }
 
+    /// Begin playback of `path` without blocking the calling thread on
+    /// file open + decoder construction. Stops the current source
+    /// synchronously (so the previous track is silenced immediately) and
+    /// hands off the slow `Decoder::try_from` work to a short-lived
+    /// worker thread that calls `player.append` once the decoder is ready.
+    ///
+    /// The previous synchronous implementation could spend tens to
+    /// hundreds of milliseconds parsing FLAC/MP3 headers on the UI
+    /// thread; this version returns near-instantly so click-to-audio
+    /// latency no longer hitches the rendering loop.
     pub fn play_path(&self, path: &Path) -> Result<()> {
         let _span = perf::span("playback.play_path", format!("path={}", path.display()));
-        let file =
-            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        let source = Decoder::try_from(file)
-            .with_context(|| format!("failed to decode {}", path.display()))?;
-
+        // Stop synchronously so the *previous* source is silenced before
+        // we return to the caller; the *next* source's decode work
+        // happens off-thread.
         self.player.stop();
-        self.player.append(source);
-        self.player.play();
+
+        let player = Arc::clone(&self.player);
+        let path: PathBuf = path.to_path_buf();
+        thread::Builder::new()
+            .name("tempo-decode".into())
+            .spawn(move || {
+                let _span = perf::span("playback.decode_async", format!("path={}", path.display()));
+                let file = match File::open(&path) {
+                    Ok(file) => file,
+                    Err(error) => {
+                        perf::event(
+                            "playback.decode_async.open_error",
+                            format!("path={} error={error}", path.display()),
+                        );
+                        return;
+                    }
+                };
+                let source = match Decoder::try_from(file) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        perf::event(
+                            "playback.decode_async.decode_error",
+                            format!("path={} error={error}", path.display()),
+                        );
+                        return;
+                    }
+                };
+                player.append(source);
+                player.play();
+            })
+            .context("failed to spawn audio decode thread")?;
 
         Ok(())
     }

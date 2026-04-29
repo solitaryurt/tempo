@@ -84,6 +84,13 @@ impl TempoApp {
 
     pub(super) fn start_playback_tick(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
+            // Track the last broadcast position in whole seconds so we
+            // only notify when the visible progress label actually
+            // changes. The waveform highlight + progress bar update at
+            // the same coarse granularity, so finer-grained ticks
+            // produced no visible difference but forced the entire root
+            // view to re-render four times a second.
+            let mut last_emitted_seconds: i64 = -1;
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(250))
@@ -102,9 +109,23 @@ impl TempoApp {
 
                         if playback_finished {
                             app.play_finished_track();
+                            // Track transitions always need a repaint;
+                            // reset the throttle so the next render
+                            // doesn't compare against a stale time.
+                            last_emitted_seconds = -1;
+                            cx.notify();
+                            return;
                         }
 
-                        cx.notify();
+                        let current_seconds = app
+                            .playback
+                            .as_ref()
+                            .map(|playback| playback.position().as_secs() as i64)
+                            .unwrap_or(0);
+                        if current_seconds != last_emitted_seconds {
+                            last_emitted_seconds = current_seconds;
+                            cx.notify();
+                        }
                     })
                     .is_err()
                 {
@@ -380,7 +401,14 @@ impl TempoApp {
             playback.set_volume(self.volume);
         }
 
-        self.save_app_state();
+        // Skip the persistence request while the user is mid-drag; the
+        // background save thread already coalesces high-frequency calls,
+        // but skipping the snapshot allocation entirely costs nothing and
+        // shaves the per-frame work to almost zero. `finish_volume_drag`
+        // saves once when the drag ends.
+        if !self.volume_dragging {
+            self.save_app_state();
+        }
     }
 
     pub(super) fn toggle_mute(&mut self) {
@@ -423,6 +451,10 @@ impl TempoApp {
 
         self.volume_dragging = false;
         self.hide_tooltip_now("volume-tooltip", cx);
+        // Persist the final volume once the drag ends. While dragging,
+        // `set_playback_volume` deliberately skips the save request; this
+        // catches up with one debounced write at drop.
+        self.save_app_state();
         true
     }
 
