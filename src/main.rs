@@ -13,7 +13,12 @@ actions!(
         MoveSelectionUp,
         MoveSelectionDown,
         NewTab,
-        FocusSearch
+        CloseTab,
+        FocusSearch,
+        OpenSettings,
+        PlayRandomTrack,
+        NavigateBack,
+        NavigateForward
     ]
 );
 
@@ -37,8 +42,13 @@ fn main() {
             KeyBinding::new("left", MoveSelectionUp, None),
             KeyBinding::new("right", MoveSelectionDown, None),
             KeyBinding::new("ctrl-t", NewTab, None),
+            KeyBinding::new("ctrl-w", CloseTab, None),
             KeyBinding::new("ctrl-f", FocusSearch, None),
+            KeyBinding::new("ctrl-s", OpenSettings, None),
+            KeyBinding::new("ctrl-r", PlayRandomTrack, None),
             KeyBinding::new("/", FocusSearch, None),
+            KeyBinding::new("alt-left", NavigateBack, None),
+            KeyBinding::new("alt-right", NavigateForward, None),
         ]);
 
         cx.activate(true);
