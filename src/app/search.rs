@@ -275,7 +275,8 @@ impl TempoApp {
     }
 
     pub(super) fn set_search_query(&mut self, query: String) {
-        self.active_tab_mut().search_query = query;
+        self.active_tab_mut().search_query = query.clone();
+        self.top_search_query = query;
         self.context_menu_track = None;
         self.invalidate_track_indices();
         let selected_track = self.active_selected_track();
@@ -298,20 +299,60 @@ impl TempoApp {
     pub(super) fn clear_search_query(&mut self) {
         if !self.active_search_query().is_empty() {
             self.set_search_query(String::new());
+        } else if !self.top_search_query.is_empty() {
+            self.top_search_query.clear();
+        }
+    }
+
+    fn should_live_filter_active_tab(&self) -> bool {
+        self.page == Page::Library
+            && (self.active_tab().source == TabSource::Library
+                || !self.active_search_query().trim().is_empty())
+    }
+
+    fn set_search_input(&mut self, query: String) {
+        self.top_search_query = query.clone();
+        if self.should_live_filter_active_tab() {
+            self.set_search_query(query);
+        }
+    }
+
+    fn submit_search(&mut self, new_tab: bool, force_current_tab: bool) {
+        let query = self.top_search_query.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+
+        if new_tab {
+            self.new_search_tab(query);
+        } else if force_current_tab || self.active_tab().source == TabSource::Library {
+            self.open_page(Page::Library);
+            self.set_search_query(query);
+        } else {
+            self.open_all_music_tab();
+            self.set_search_query(query);
         }
     }
 
     pub(super) fn handle_search_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let modifiers = event.keystroke.modifiers;
-        if modifiers.control || modifiers.platform || modifiers.alt || modifiers.function {
-            return;
-        }
 
         match event.keystroke.key.as_str() {
+            "enter" => {
+                if modifiers.alt || modifiers.function {
+                    return;
+                }
+                self.submit_search(modifiers.control || modifiers.platform, modifiers.shift);
+                cx.stop_propagation();
+                cx.notify();
+            }
             "backspace" => {
-                let mut query = self.active_search_query().to_string();
+                if modifiers.control || modifiers.platform || modifiers.alt || modifiers.function {
+                    return;
+                }
+                let mut query = self.top_search_query.clone();
                 query.pop();
-                self.set_search_query(query);
+                self.set_search_input(query);
                 cx.stop_propagation();
                 cx.notify();
             }
@@ -324,10 +365,13 @@ impl TempoApp {
                 let Some(key_char) = event.keystroke.key_char.as_ref() else {
                     return;
                 };
+                if modifiers.control || modifiers.platform || modifiers.alt || modifiers.function {
+                    return;
+                }
                 if key_char.chars().all(|ch| !ch.is_control()) {
-                    let mut query = self.active_search_query().to_string();
+                    let mut query = self.top_search_query.clone();
                     query.push_str(key_char);
-                    self.set_search_query(query);
+                    self.set_search_input(query);
                     cx.stop_propagation();
                     cx.notify();
                 }
@@ -355,6 +399,60 @@ impl TempoApp {
             track.year,
             track.codec,
             track.path.display()
+        )
+        .to_lowercase();
+
+        terms.iter().all(|term| searchable.contains(term))
+    }
+
+    pub(super) fn artist_indices_for_search_query(&self, query: &str) -> Vec<usize> {
+        let terms = Self::search_terms(query);
+        self.artists
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, artist)| {
+                Self::artist_matches_search_terms(artist, &terms).then_some(ix)
+            })
+            .collect()
+    }
+
+    pub(super) fn album_indices_for_search_query(&self, query: &str) -> Vec<usize> {
+        let terms = Self::search_terms(query);
+        self.albums
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, album)| Self::album_matches_search_terms(album, &terms).then_some(ix))
+            .collect()
+    }
+
+    pub(super) fn artist_matches_search_terms(artist: &Artist, terms: &[String]) -> bool {
+        if terms.is_empty() {
+            return true;
+        }
+
+        let searchable = format!(
+            "{} {} {} {}",
+            artist.name,
+            artist.bio.as_deref().unwrap_or_default(),
+            artist.album_count,
+            artist.track_count
+        )
+        .to_lowercase();
+
+        terms.iter().all(|term| searchable.contains(term))
+    }
+
+    pub(super) fn album_matches_search_terms(album: &Album, terms: &[String]) -> bool {
+        if terms.is_empty() {
+            return true;
+        }
+
+        let searchable = format!(
+            "{} {} {} {}",
+            album.title,
+            album.artist,
+            album.year.as_deref().unwrap_or_default(),
+            album.track_count
         )
         .to_lowercase();
 

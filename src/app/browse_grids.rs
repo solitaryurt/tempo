@@ -185,11 +185,22 @@ impl TempoApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let colors = *self.colors();
-        let subtitle = format!(
-            "{} artists  ·  {} local albums",
-            self.artists.len(),
-            self.albums.len()
-        );
+        let artist_indices = self.artist_indices_for_search_query(&self.top_search_query);
+        let is_searching = !self.top_search_query.trim().is_empty();
+        let subtitle = if is_searching {
+            format!(
+                "{} of {} artists  ·  {} local albums",
+                artist_indices.len(),
+                self.artists.len(),
+                self.albums.len()
+            )
+        } else {
+            format!(
+                "{} artists  ·  {} local albums",
+                self.artists.len(),
+                self.albums.len()
+            )
+        };
         let grid_columns = self.browse_grid_columns(window);
 
         div()
@@ -201,8 +212,8 @@ impl TempoApp {
             .flex_col()
             .child(self.render_browse_header("Artists", subtitle, self.artist_view_mode, cx))
             .child(match self.artist_view_mode {
-                BrowseViewMode::Grid => self.render_artist_grid(grid_columns, cx),
-                BrowseViewMode::Table => self.render_artist_table(cx),
+                BrowseViewMode::Grid => self.render_artist_grid(grid_columns, artist_indices, cx),
+                BrowseViewMode::Table => self.render_artist_table(artist_indices, cx),
             })
     }
 
@@ -212,11 +223,22 @@ impl TempoApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let colors = *self.colors();
-        let subtitle = format!(
-            "{} albums  ·  {} tracks",
-            self.albums.len(),
-            self.tracks.len()
-        );
+        let album_indices = self.album_indices_for_search_query(&self.top_search_query);
+        let is_searching = !self.top_search_query.trim().is_empty();
+        let subtitle = if is_searching {
+            format!(
+                "{} of {} albums  ·  {} tracks",
+                album_indices.len(),
+                self.albums.len(),
+                self.tracks.len()
+            )
+        } else {
+            format!(
+                "{} albums  ·  {} tracks",
+                self.albums.len(),
+                self.tracks.len()
+            )
+        };
         let grid_columns = self.browse_grid_columns(window);
 
         div()
@@ -228,31 +250,61 @@ impl TempoApp {
             .flex_col()
             .child(self.render_browse_header("Albums", subtitle, self.album_view_mode, cx))
             .child(match self.album_view_mode {
-                BrowseViewMode::Grid => self.render_album_grid(grid_columns, cx),
-                BrowseViewMode::Table => self.render_album_table(cx),
+                BrowseViewMode::Grid => self.render_album_grid(grid_columns, album_indices, cx),
+                BrowseViewMode::Table => self.render_album_table(album_indices, cx),
             })
     }
 
-    fn render_artist_grid(&self, columns: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_artist_grid(
+        &self,
+        columns: usize,
+        artist_indices: Vec<usize>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let is_searching = !self.top_search_query.trim().is_empty();
         self.render_browse_grid(
+            BrowseScrollbarTarget::ArtistsGrid,
             "artists-grid-scroll",
             "artist-grid-rows",
-            "No artists yet",
-            "Add a music folder and Tempo will group indexed tracks by artist.",
-            self.artists.len(),
+            if is_searching {
+                "No matching artists"
+            } else {
+                "No artists yet"
+            },
+            if is_searching {
+                "No artists match the current search."
+            } else {
+                "Add a music folder and Tempo will group indexed tracks by artist."
+            },
+            artist_indices,
             columns,
             Self::render_artist_grid_row,
             cx,
         )
     }
 
-    fn render_album_grid(&self, columns: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_album_grid(
+        &self,
+        columns: usize,
+        album_indices: Vec<usize>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let is_searching = !self.top_search_query.trim().is_empty();
         self.render_browse_grid(
+            BrowseScrollbarTarget::AlbumsGrid,
             "albums-grid-scroll",
             "album-grid-rows",
-            "No albums yet",
-            "Add a music folder and Tempo will group indexed tracks by album.",
-            self.albums.len(),
+            if is_searching {
+                "No matching albums"
+            } else {
+                "No albums yet"
+            },
+            if is_searching {
+                "No albums match the current search."
+            } else {
+                "Add a music folder and Tempo will group indexed tracks by album."
+            },
+            album_indices,
             columns,
             Self::render_album_grid_row,
             cx,
@@ -275,15 +327,17 @@ impl TempoApp {
     #[allow(clippy::too_many_arguments)]
     fn render_browse_grid(
         &self,
+        target: BrowseScrollbarTarget,
         id: &'static str,
         list_id: &'static str,
         empty_title: &'static str,
         empty_body: &'static str,
-        item_count: usize,
+        item_indices: Vec<usize>,
         columns: usize,
-        render_row: fn(&Self, usize, usize, &mut Context<Self>) -> AnyElement,
+        render_row: fn(&Self, usize, usize, &[usize], &mut Context<Self>) -> AnyElement,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let item_count = item_indices.len();
         if item_count == 0 {
             return div()
                 .id(id)
@@ -295,24 +349,63 @@ impl TempoApp {
                 .into_any_element();
         }
 
+        let item_indices = Arc::new(item_indices);
         let row_count = item_count.div_ceil(columns);
+        let scroll_handle = self.browse_scroll_handle(target);
         div()
             .id(id)
             .flex_1()
             .min_h_0()
+            .relative()
+            .overflow_hidden()
             .p_4()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseDownEvent, window, _cx| {
+                    window.focus(&this.focus_handle);
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                    if this.drag_browse_scrollbar(target, event) {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                    if this.finish_browse_scrollbar_drag() {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                    if this.finish_browse_scrollbar_drag() {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
             .child(
                 uniform_list(
                     list_id,
                     row_count,
                     cx.processor(move |this, range: Range<usize>, _window, cx| {
+                        let item_indices = item_indices.clone();
                         range
-                            .map(|row_ix| render_row(this, row_ix, columns, cx))
+                            .map(|row_ix| render_row(this, row_ix, columns, &item_indices, cx))
                             .collect()
                     }),
                 )
-                .size_full(),
+                .size_full()
+                .track_scroll(scroll_handle),
             )
+            .child(self.render_browse_scrollbar(target, row_count, cx))
             .into_any_element()
     }
 
@@ -320,10 +413,11 @@ impl TempoApp {
         &self,
         row_ix: usize,
         columns: usize,
+        artist_indices: &[usize],
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let start = row_ix * columns;
-        let end = (start + columns).min(self.artists.len());
+        let end = (start + columns).min(artist_indices.len());
 
         div()
             .id(SharedString::from(format!("artist-grid-row-{row_ix}")))
@@ -331,8 +425,9 @@ impl TempoApp {
             .gap_4()
             .pb_4()
             .children(
-                self.artists[start..end]
+                artist_indices[start..end]
                     .iter()
+                    .filter_map(|artist_ix| self.artists.get(*artist_ix))
                     .map(|artist| self.render_artist_card(artist, cx)),
             )
             .into_any_element()
@@ -342,10 +437,11 @@ impl TempoApp {
         &self,
         row_ix: usize,
         columns: usize,
+        album_indices: &[usize],
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let start = row_ix * columns;
-        let end = (start + columns).min(self.albums.len());
+        let end = (start + columns).min(album_indices.len());
 
         div()
             .id(SharedString::from(format!("album-grid-row-{row_ix}")))
@@ -353,20 +449,35 @@ impl TempoApp {
             .gap_4()
             .pb_4()
             .children(
-                self.albums[start..end]
+                album_indices[start..end]
                     .iter()
+                    .filter_map(|album_ix| self.albums.get(*album_ix))
                     .map(|album| self.render_album_card(album, cx)),
             )
             .into_any_element()
     }
 
-    fn render_artist_table(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_artist_table(
+        &self,
+        artist_indices: Vec<usize>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let is_searching = !self.top_search_query.trim().is_empty();
         self.render_browse_table(
+            BrowseScrollbarTarget::ArtistsTable,
             "artists-table",
             "artist-table-rows",
-            "No artists yet",
-            "Add a music folder and Tempo will group indexed tracks by artist.",
-            self.artists.len(),
+            if is_searching {
+                "No matching artists"
+            } else {
+                "No artists yet"
+            },
+            if is_searching {
+                "No artists match the current search."
+            } else {
+                "Add a music folder and Tempo will group indexed tracks by artist."
+            },
+            artist_indices,
             &[
                 BrowseTableColumn {
                     title: "",
@@ -390,13 +501,23 @@ impl TempoApp {
         )
     }
 
-    fn render_album_table(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_album_table(&self, album_indices: Vec<usize>, cx: &mut Context<Self>) -> AnyElement {
+        let is_searching = !self.top_search_query.trim().is_empty();
         self.render_browse_table(
+            BrowseScrollbarTarget::AlbumsTable,
             "albums-table",
             "album-table-rows",
-            "No albums yet",
-            "Add a music folder and Tempo will group indexed tracks by album.",
-            self.albums.len(),
+            if is_searching {
+                "No matching albums"
+            } else {
+                "No albums yet"
+            },
+            if is_searching {
+                "No albums match the current search."
+            } else {
+                "Add a music folder and Tempo will group indexed tracks by album."
+            },
+            album_indices,
             &[
                 BrowseTableColumn {
                     title: "",
@@ -427,16 +548,20 @@ impl TempoApp {
     #[allow(clippy::too_many_arguments)]
     fn render_browse_table(
         &self,
+        target: BrowseScrollbarTarget,
         id: &'static str,
         list_id: &'static str,
         empty_title: &'static str,
         empty_body: &'static str,
-        row_count: usize,
+        row_indices: Vec<usize>,
         columns: &'static [BrowseTableColumn],
-        render_row: fn(&Self, usize, &mut Context<Self>) -> Option<AnyElement>,
+        render_row: fn(&Self, usize, usize, &mut Context<Self>) -> Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
+        let row_count = row_indices.len();
+        let row_indices = Arc::new(row_indices);
+        let scroll_handle = self.browse_scroll_handle(target);
 
         div()
             .id(id)
@@ -456,20 +581,328 @@ impl TempoApp {
             })
             .when(row_count > 0, |this| {
                 this.child(
-                    uniform_list(
-                        list_id,
-                        row_count,
-                        cx.processor(move |this, range: Range<usize>, _window, cx| {
-                            range
-                                .filter_map(|row_ix| render_row(this, row_ix, cx))
-                                .collect()
-                        }),
-                    )
-                    .flex_1()
-                    .min_h_0(),
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .relative()
+                        .overflow_hidden()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event: &MouseDownEvent, window, _cx| {
+                                window.focus(&this.focus_handle);
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(
+                            move |this, event: &MouseMoveEvent, _window, cx| {
+                                if this.drag_browse_scrollbar(target, event) {
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                                if this.finish_browse_scrollbar_drag() {
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }
+                            }),
+                        )
+                        .on_mouse_up_out(
+                            MouseButton::Left,
+                            cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                                if this.finish_browse_scrollbar_drag() {
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }
+                            }),
+                        )
+                        .child(
+                            uniform_list(
+                                list_id,
+                                row_count,
+                                cx.processor(move |this, range: Range<usize>, _window, cx| {
+                                    let row_indices = row_indices.clone();
+                                    range
+                                        .filter_map(|row_ix| {
+                                            let item_ix = *row_indices.get(row_ix)?;
+                                            render_row(this, row_ix, item_ix, cx)
+                                        })
+                                        .collect()
+                                }),
+                            )
+                            .size_full()
+                            .track_scroll(scroll_handle),
+                        )
+                        .child(self.render_browse_scrollbar(target, row_count, cx)),
                 )
             })
             .into_any_element()
+    }
+
+    fn browse_scroll_handle(&self, target: BrowseScrollbarTarget) -> UniformListScrollHandle {
+        match target {
+            BrowseScrollbarTarget::ArtistsGrid => self.artist_grid_scroll_handle.clone(),
+            BrowseScrollbarTarget::ArtistsTable => self.artist_table_scroll_handle.clone(),
+            BrowseScrollbarTarget::AlbumsGrid => self.album_grid_scroll_handle.clone(),
+            BrowseScrollbarTarget::AlbumsTable => self.album_table_scroll_handle.clone(),
+        }
+    }
+
+    fn browse_scrollbar_base_handle(&self, target: BrowseScrollbarTarget) -> gpui::ScrollHandle {
+        self.browse_scroll_handle(target)
+            .0
+            .borrow()
+            .base_handle
+            .clone()
+    }
+
+    fn browse_scrollbar_metrics(
+        &self,
+        target: BrowseScrollbarTarget,
+    ) -> Option<TableScrollbarMetrics> {
+        let handle = self.browse_scroll_handle(target);
+        let (base_handle, measured) = {
+            let state = handle.0.borrow();
+            (state.base_handle.clone(), state.last_item_size.is_some())
+        };
+
+        if !measured {
+            return None;
+        }
+
+        let bounds = base_handle.bounds();
+        let viewport_height = f32::from(bounds.size.height);
+        if viewport_height <= 0.0 {
+            return None;
+        }
+
+        let max_scroll = f32::from(base_handle.max_offset().height).max(0.0);
+        let content_height = viewport_height + max_scroll;
+        let track_height = (viewport_height - TABLE_SCROLLBAR_MARGIN * 2.0).max(1.0);
+        let thumb_height = if content_height <= 0.0 {
+            track_height
+        } else {
+            ((viewport_height / content_height) * track_height)
+                .max(TABLE_SCROLLBAR_MIN_THUMB_H)
+                .min(track_height)
+        };
+        let thumb_travel = (track_height - thumb_height).max(0.0);
+        let scroll_top = (-f32::from(base_handle.offset().y)).clamp(0.0, max_scroll);
+        let thumb_top = if max_scroll > 0.0 && thumb_travel > 0.0 {
+            (scroll_top / max_scroll) * thumb_travel
+        } else {
+            0.0
+        };
+
+        Some(TableScrollbarMetrics {
+            track_top: f32::from(bounds.origin.y) + TABLE_SCROLLBAR_MARGIN,
+            track_height,
+            thumb_top,
+            thumb_height,
+            max_scroll,
+            scroll_top,
+        })
+    }
+
+    fn begin_browse_scrollbar_drag(
+        &mut self,
+        target: BrowseScrollbarTarget,
+        event: &MouseDownEvent,
+    ) -> bool {
+        let Some(metrics) = self.browse_scrollbar_metrics(target) else {
+            return false;
+        };
+
+        if metrics.max_scroll <= 0.0 {
+            return false;
+        }
+
+        let local_y = f32::from(event.position.y) - metrics.track_top;
+        let thumb_bottom = metrics.thumb_top + metrics.thumb_height;
+        let thumb_offset = if (metrics.thumb_top..=thumb_bottom).contains(&local_y) {
+            local_y - metrics.thumb_top
+        } else {
+            metrics.thumb_height / 2.0
+        };
+        let start_offset = self.browse_scrollbar_base_handle(target).offset();
+
+        self.browse_scrollbar_drag = Some(BrowseScrollbarDrag {
+            target,
+            thumb_offset,
+            start_offset,
+        });
+        self.scroll_browse_to_scrollbar_y(target, event.position.y, thumb_offset);
+        true
+    }
+
+    fn drag_browse_scrollbar(
+        &mut self,
+        target: BrowseScrollbarTarget,
+        event: &MouseMoveEvent,
+    ) -> bool {
+        let Some(drag) = self.browse_scrollbar_drag else {
+            return false;
+        };
+
+        if drag.target != target {
+            return false;
+        }
+
+        if !event.dragging() {
+            self.browse_scrollbar_drag = None;
+            return false;
+        }
+
+        self.scroll_browse_to_scrollbar_y(target, event.position.y, drag.thumb_offset)
+    }
+
+    pub(super) fn finish_browse_scrollbar_drag(&mut self) -> bool {
+        self.browse_scrollbar_drag.take().is_some()
+    }
+
+    pub(super) fn cancel_browse_scrollbar_drag(&mut self) -> bool {
+        let Some(drag) = self.browse_scrollbar_drag.take() else {
+            return false;
+        };
+
+        self.browse_scrollbar_base_handle(drag.target)
+            .set_offset(drag.start_offset);
+        true
+    }
+
+    fn scroll_browse_to_scrollbar_y(
+        &mut self,
+        target: BrowseScrollbarTarget,
+        mouse_y: Pixels,
+        thumb_offset: f32,
+    ) -> bool {
+        let Some(metrics) = self.browse_scrollbar_metrics(target) else {
+            return false;
+        };
+
+        if metrics.max_scroll <= 0.0 {
+            return false;
+        }
+
+        let thumb_travel = (metrics.track_height - metrics.thumb_height).max(1.0);
+        let thumb_top =
+            (f32::from(mouse_y) - metrics.track_top - thumb_offset).clamp(0.0, thumb_travel);
+        let ratio = thumb_top / thumb_travel;
+        self.scroll_browse_to_ratio(target, ratio)
+    }
+
+    fn scroll_browse_to_ratio(&mut self, target: BrowseScrollbarTarget, ratio: f32) -> bool {
+        let base_handle = self.browse_scrollbar_base_handle(target);
+        let max_scroll = f32::from(base_handle.max_offset().height).max(0.0);
+        if max_scroll <= 0.0 {
+            return false;
+        }
+
+        let target_y = px(-(ratio.clamp(0.0, 1.0) * max_scroll));
+        let current = base_handle.offset();
+        if (f32::from(current.y) - f32::from(target_y)).abs() < 0.5 {
+            return false;
+        }
+
+        base_handle.set_offset(point(current.x, target_y));
+        true
+    }
+
+    fn render_browse_scrollbar(
+        &self,
+        target: BrowseScrollbarTarget,
+        item_count: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if item_count == 0 {
+            return div().into_any_element();
+        }
+
+        let colors = *self.colors();
+        let metrics = self.browse_scrollbar_metrics(target);
+        let thumb_top = metrics.map_or(0.0, |metrics| metrics.thumb_top);
+        let thumb_height =
+            metrics.map_or(TABLE_SCROLLBAR_MIN_THUMB_H, |metrics| metrics.thumb_height);
+        let scrollable = metrics.is_some_and(|metrics| metrics.max_scroll > 0.0);
+        let is_dragging = self
+            .browse_scrollbar_drag
+            .is_some_and(|drag| drag.target == target);
+
+        div()
+            .id(SharedString::from(format!(
+                "browse-scrollbar-{}",
+                Self::browse_scrollbar_target_id(target)
+            )))
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .w(px(TABLE_SCROLLBAR_W))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus_handle);
+                    if this.begin_browse_scrollbar_drag(target, event) {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                    if this.drag_browse_scrollbar(target, event) {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                    if this.finish_browse_scrollbar_drag() {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(TABLE_SCROLLBAR_MARGIN))
+                    .right(px(4.0))
+                    .bottom(px(TABLE_SCROLLBAR_MARGIN))
+                    .w(px(TABLE_SCROLLBAR_TRACK_W))
+                    .rounded_full()
+                    .bg(rgb(colors.elevated))
+                    .opacity(if scrollable { 0.95 } else { 0.0 })
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(thumb_top))
+                            .left(px(1.0))
+                            .right(px(1.0))
+                            .h(px(thumb_height))
+                            .rounded_full()
+                            .bg(rgb(if is_dragging {
+                                colors.text
+                            } else {
+                                colors.text_faint
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn browse_scrollbar_target_id(target: BrowseScrollbarTarget) -> &'static str {
+        match target {
+            BrowseScrollbarTarget::ArtistsGrid => "artists-grid",
+            BrowseScrollbarTarget::ArtistsTable => "artists-table",
+            BrowseScrollbarTarget::AlbumsGrid => "albums-grid",
+            BrowseScrollbarTarget::AlbumsTable => "albums-table",
+        }
     }
 
     fn render_browse_header(
@@ -517,6 +950,7 @@ impl TempoApp {
                     .child(subtitle),
             )
             .child(div().flex_1())
+            .child(self.render_search_box("Search", cx))
             .child(
                 div()
                     .flex()
@@ -625,8 +1059,13 @@ impl TempoApp {
             .into_any_element()
     }
 
-    fn render_artist_row(&self, row_ix: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let artist = self.artists.get(row_ix)?;
+    fn render_artist_row(
+        &self,
+        row_ix: usize,
+        artist_ix: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let artist = self.artists.get(artist_ix)?;
         let colors = *self.colors();
         let bg = if row_ix.is_multiple_of(2) {
             colors.surface
@@ -700,8 +1139,13 @@ impl TempoApp {
             .into()
     }
 
-    fn render_album_row(&self, row_ix: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let album = self.albums.get(row_ix)?;
+    fn render_album_row(
+        &self,
+        row_ix: usize,
+        album_ix: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let album = self.albums.get(album_ix)?;
         let colors = *self.colors();
         let bg = if row_ix.is_multiple_of(2) {
             colors.surface

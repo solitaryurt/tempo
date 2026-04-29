@@ -9,7 +9,7 @@ use std::{
 use gpui::{
     AnyElement, ClickEvent, Context, CursorStyle, FocusHandle, Image, ImageFormat, IntoElement,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    ParentElement, PathPromptOptions, Pixels, Render, ScrollStrategy, ScrollWheelEvent,
+    ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollStrategy, ScrollWheelEvent,
     SharedString, Styled, UniformListScrollHandle, Window, div, img, point, prelude::*, px, rgb,
     uniform_list,
 };
@@ -89,6 +89,12 @@ enum PlaybackMode {
     Straight,
     Loop,
     Shuffle,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputMenuSource {
+    Player,
+    Settings,
 }
 
 #[derive(Clone, Copy)]
@@ -296,6 +302,22 @@ struct ScrollbarMarker {
 #[derive(Clone, Copy)]
 struct TableScrollbarDrag {
     thumb_offset: f32,
+    start_offset: Point<Pixels>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BrowseScrollbarTarget {
+    ArtistsGrid,
+    ArtistsTable,
+    AlbumsGrid,
+    AlbumsTable,
+}
+
+#[derive(Clone, Copy)]
+struct BrowseScrollbarDrag {
+    target: BrowseScrollbarTarget,
+    thumb_offset: f32,
+    start_offset: Point<Pixels>,
 }
 
 #[derive(Clone, Copy)]
@@ -370,6 +392,10 @@ struct AppState {
     playlists: Vec<Playlist>,
     #[serde(default = "default_theme_id")]
     theme_id: String,
+    #[serde(default)]
+    output_device: Option<String>,
+    #[serde(default = "default_volume")]
+    volume: f32,
 }
 
 impl Default for AppState {
@@ -378,8 +404,14 @@ impl Default for AppState {
             library_roots: Vec::new(),
             playlists: Vec::new(),
             theme_id: default_theme_id(),
+            output_device: None,
+            volume: default_volume(),
         }
     }
+}
+
+fn default_volume() -> f32 {
+    0.75
 }
 
 const INDEX_COL_W: f32 = 34.0;
@@ -394,6 +426,7 @@ const TABLE_ROW_H: f32 = 32.0;
 const LEFT_SIDEBAR_W: f32 = 220.0;
 const RIGHT_SIDEBAR_W: f32 = 300.0;
 const WAVEFORM_SEGMENTS: usize = 360;
+const WAVEFORM_CACHE_VERSION: u32 = 1;
 const PLAYER_BAR_PAD: f32 = 16.0;
 const PLAYER_ART_W: f32 = 54.0;
 const PLAYER_INFO_W: f32 = 220.0;
@@ -413,6 +446,7 @@ const BROWSE_GRID_PAD_X: f32 = 32.0;
 pub(crate) struct TempoApp {
     focus_handle: FocusHandle,
     search_focus_handle: FocusHandle,
+    top_search_query: String,
     page: Page,
     left_sidebar_collapsed: bool,
     right_sidebar_collapsed: bool,
@@ -440,10 +474,19 @@ pub(crate) struct TempoApp {
     library_root_label: String,
     library_status: String,
     playback_status: String,
+    output_device: Option<String>,
+    output_menu_source: Option<OutputMenuSource>,
+    volume: f32,
+    pre_mute_volume: f32,
     scan_progress: ScanProgress,
     scan_errors: Vec<IndexingError>,
     is_scanning: bool,
     table_scrollbar_drag: Option<TableScrollbarDrag>,
+    browse_scrollbar_drag: Option<BrowseScrollbarDrag>,
+    artist_grid_scroll_handle: UniformListScrollHandle,
+    artist_table_scroll_handle: UniformListScrollHandle,
+    album_grid_scroll_handle: UniformListScrollHandle,
+    album_table_scroll_handle: UniformListScrollHandle,
     table_is_scrolling: bool,
     table_scroll_generation: u64,
     catalog: Option<CatalogStore>,
@@ -476,10 +519,16 @@ impl TempoApp {
             library_status = catalog_status;
         }
         let playlists = state.playlists;
-        let (playback, playback_status) = match PlaybackController::new() {
-            Ok(playback) => (Some(playback), "Audio output ready".to_string()),
-            Err(error) => (None, format!("Playback unavailable: {error:#}")),
-        };
+        let volume = state.volume.clamp(0.0, 1.0);
+        let (playback, playback_status) =
+            match PlaybackController::new(state.output_device.as_deref(), volume) {
+                Ok(playback) => (Some(playback), "Audio output ready".to_string()),
+                Err(error) => (None, format!("Playback unavailable: {error:#}")),
+            };
+        let output_device = playback
+            .as_ref()
+            .map(|playback| playback.output_name().to_string())
+            .or(state.output_device);
 
         let initial_page = if roots.is_empty() {
             Page::Settings
@@ -490,6 +539,7 @@ impl TempoApp {
         let mut app = Self {
             focus_handle,
             search_focus_handle,
+            top_search_query: String::new(),
             page: initial_page,
             left_sidebar_collapsed: false,
             right_sidebar_collapsed: false,
@@ -517,10 +567,23 @@ impl TempoApp {
             library_root_label,
             library_status,
             playback_status,
+            output_device,
+            output_menu_source: None,
+            volume,
+            pre_mute_volume: if volume > 0.0 {
+                volume
+            } else {
+                default_volume()
+            },
             scan_progress: ScanProgress::default(),
             scan_errors: Vec::new(),
             is_scanning: false,
             table_scrollbar_drag: None,
+            browse_scrollbar_drag: None,
+            artist_grid_scroll_handle: UniformListScrollHandle::new(),
+            artist_table_scroll_handle: UniformListScrollHandle::new(),
+            album_grid_scroll_handle: UniformListScrollHandle::new(),
+            album_table_scroll_handle: UniformListScrollHandle::new(),
             table_is_scrolling: false,
             table_scroll_generation: 0,
             catalog,
@@ -584,6 +647,9 @@ impl TempoApp {
             }
             page => page,
         };
+        if self.page != Page::Library {
+            self.top_search_query.clear();
+        }
         self.context_menu_track = None;
     }
 
@@ -616,6 +682,10 @@ impl TempoApp {
 
     fn active_search_query(&self) -> &str {
         &self.active_tab().search_query
+    }
+
+    fn sync_search_input_to_active_tab(&mut self) {
+        self.top_search_query = self.active_search_query().to_string();
     }
 
     fn active_selected_track(&self) -> usize {
@@ -655,6 +725,18 @@ impl TempoApp {
         self.active_tab = self.tabs.len() - 1;
         self.rebuild_track_indices_for_tab(self.active_tab);
         self.page = Page::Library;
+        self.sync_search_input_to_active_tab();
+        self.context_menu_track = None;
+    }
+
+    fn new_search_tab(&mut self, query: String) {
+        let mut tab = BrowseTab::library();
+        tab.search_query = query.clone();
+        self.tabs.push(tab);
+        self.active_tab = self.tabs.len() - 1;
+        self.rebuild_track_indices_for_tab(self.active_tab);
+        self.page = Page::Library;
+        self.top_search_query = query;
         self.context_menu_track = None;
     }
 
@@ -672,6 +754,7 @@ impl TempoApp {
         }
 
         self.open_page(Page::Library);
+        self.sync_search_input_to_active_tab();
     }
 
     fn open_playlist_tab(&mut self, playlist_ix: usize) {
@@ -692,6 +775,7 @@ impl TempoApp {
         }
 
         self.open_page(Page::Library);
+        self.sync_search_input_to_active_tab();
     }
 
     fn open_artist_tab(&mut self, artist_id: i64) {
@@ -708,6 +792,7 @@ impl TempoApp {
         }
 
         self.open_page(Page::Library);
+        self.sync_search_input_to_active_tab();
     }
 
     fn open_album_tab(&mut self, album_id: i64) {
@@ -724,6 +809,7 @@ impl TempoApp {
         }
 
         self.open_page(Page::Library);
+        self.sync_search_input_to_active_tab();
     }
 
     fn artist_by_id(&self, artist_id: i64) -> Option<&Artist> {
@@ -824,6 +910,7 @@ impl TempoApp {
         } else if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len() - 1;
         }
+        self.sync_search_input_to_active_tab();
         self.context_menu_track = None;
     }
 }
@@ -1022,6 +1109,7 @@ impl TempoApp {
 
     fn focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
         self.open_page(Page::Library);
+        self.sync_search_input_to_active_tab();
         window.focus(&self.search_focus_handle);
         cx.notify();
     }

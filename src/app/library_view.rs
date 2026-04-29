@@ -176,8 +176,48 @@ impl TempoApp {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.active_tab = ix;
                 this.open_page(Page::Library);
+                this.sync_search_input_to_active_tab();
                 cx.notify();
             }))
+    }
+
+    pub(super) fn render_search_box(
+        &self,
+        placeholder: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+        let query = self.top_search_query.as_str();
+
+        div()
+            .id("library-search")
+            .w(px(180.0))
+            .h(px(26.0))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(colors.waveform_border))
+            .bg(rgb(colors.button))
+            .px_3()
+            .flex()
+            .items_center()
+            .text_xs()
+            .text_color(rgb(if query.is_empty() {
+                colors.text_faint
+            } else {
+                colors.text
+            }))
+            .track_focus(&self.search_focus_handle)
+            .on_click(cx.listener(|this, _, window, _cx| {
+                window.focus(&this.search_focus_handle);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                this.handle_search_key_down(event, cx);
+            }))
+            .child(if query.is_empty() {
+                format!("⌕  {placeholder}")
+            } else {
+                format!("⌕  {query}")
+            })
     }
 
     pub(super) fn render_library_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -214,37 +254,7 @@ impl TempoApp {
             )
             .child(self.render_scan_status(cx))
             .child(div().flex_1())
-            .child(
-                div()
-                    .id("library-search")
-                    .w(px(180.0))
-                    .h(px(26.0))
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(colors.waveform_border))
-                    .bg(rgb(colors.button))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .text_xs()
-                    .text_color(rgb(if self.active_search_query().is_empty() {
-                        colors.text_faint
-                    } else {
-                        colors.text
-                    }))
-                    .track_focus(&self.search_focus_handle)
-                    .on_click(cx.listener(|this, _, window, _cx| {
-                        window.focus(&this.search_focus_handle);
-                    }))
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                        this.handle_search_key_down(event, cx);
-                    }))
-                    .child(if self.active_search_query().is_empty() {
-                        "⌕  Search library".into()
-                    } else {
-                        format!("⌕  {}", self.active_search_query())
-                    }),
-            )
+            .child(self.render_search_box("Search library", cx))
             .child(
                 self.sidebar_button("⚙", "open-settings")
                     .on_click(cx.listener(|this, _, _, cx| {

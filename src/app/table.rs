@@ -66,12 +66,24 @@ impl TempoApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.page != Page::Library || !self.focus_handle.is_focused(window) {
+        if !self.focus_handle.is_focused(window) {
             return;
         }
 
         let modifiers = event.keystroke.modifiers;
         if modifiers.control || modifiers.platform || modifiers.alt || modifiers.function {
+            return;
+        }
+
+        if event.keystroke.key.as_str() == "escape" {
+            if self.cancel_table_scrollbar_drag() || self.cancel_browse_scrollbar_drag() {
+                cx.stop_propagation();
+                cx.notify();
+            }
+            return;
+        }
+
+        if self.page != Page::Library {
             return;
         }
 
@@ -252,7 +264,11 @@ impl TempoApp {
             metrics.thumb_height / 2.0
         };
 
-        self.table_scrollbar_drag = Some(TableScrollbarDrag { thumb_offset });
+        let start_offset = self.table_scrollbar_base_handle().offset();
+        self.table_scrollbar_drag = Some(TableScrollbarDrag {
+            thumb_offset,
+            start_offset,
+        });
         self.scroll_table_to_scrollbar_y(event.position.y, thumb_offset);
         true
     }
@@ -272,6 +288,16 @@ impl TempoApp {
 
     pub(super) fn finish_table_scrollbar_drag(&mut self) -> bool {
         self.table_scrollbar_drag.take().is_some()
+    }
+
+    pub(super) fn cancel_table_scrollbar_drag(&mut self) -> bool {
+        let Some(drag) = self.table_scrollbar_drag.take() else {
+            return false;
+        };
+
+        self.table_scrollbar_base_handle()
+            .set_offset(drag.start_offset);
+        true
     }
 
     pub(super) fn finish_table_drag_interactions(&mut self) -> bool {
@@ -341,8 +367,7 @@ impl TempoApp {
     }
 
     pub(super) fn scroll_table_to_ratio(&mut self, ratio: f32) -> bool {
-        let handle = self.active_tab().table_scroll_handle.clone();
-        let base_handle = handle.0.borrow().base_handle.clone();
+        let base_handle = self.table_scrollbar_base_handle();
         let max_scroll = f32::from(base_handle.max_offset().height).max(0.0);
         if max_scroll <= 0.0 {
             return false;
@@ -356,6 +381,15 @@ impl TempoApp {
 
         base_handle.set_offset(point(current.x, target_y));
         true
+    }
+
+    pub(super) fn table_scrollbar_base_handle(&self) -> gpui::ScrollHandle {
+        self.active_tab()
+            .table_scroll_handle
+            .0
+            .borrow()
+            .base_handle
+            .clone()
     }
 
     pub(super) fn current_scrollbar_label(&self, metrics: TableScrollbarMetrics) -> Option<String> {
@@ -738,7 +772,8 @@ impl TempoApp {
             .cursor_pointer()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus_handle);
                     if this.begin_table_scrollbar_drag(event) {
                         cx.stop_propagation();
                         cx.notify();
