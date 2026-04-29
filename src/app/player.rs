@@ -638,18 +638,7 @@ impl TempoApp {
                             .flex()
                             .items_center()
                             .gap_3()
-                            .child(
-                                self.seek_side_button(
-                                    self.playback_mode_icon(),
-                                    self.playback_mode != PlaybackMode::Straight,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.cycle_playback_mode();
-                                        cx.notify();
-                                    },
-                                )),
-                            )
+                            .child("☰")
                             .child("♩")
                             .child(
                                 div()
@@ -665,12 +654,6 @@ impl TempoApp {
                                             .bg(rgb(colors.text)),
                                     ),
                             )
-                            .child(self.seek_side_button("⤨", false).on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    this.play_random_track();
-                                    cx.notify();
-                                },
-                            ))),
                     ),
             )
             .into_any_element()
@@ -847,46 +830,66 @@ impl TempoApp {
             .bg(rgb(colors.app))
             .border_1()
             .border_color(rgb(colors.waveform_border))
-            .child(self.transport_button("⌘", false))
             .child(
-                self.transport_button("◀", false)
+                self.transport_button(
+                    self.playback_mode_icon(),
+                    false,
+                    self.playback_mode != PlaybackMode::Straight,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.cycle_playback_mode();
+                    cx.notify();
+                })),
+            )
+            .child(
+                self.transport_button("◀", false, false)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.play_adjacent_track(-1);
                         cx.notify();
                     })),
             )
             .child(
-                self.transport_button(if is_playing { "Ⅱ" } else { "▶" }, true)
+                self.transport_button(if is_playing { "Ⅱ" } else { "▶" }, true, false)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.toggle_playback();
                         cx.notify();
                     })),
             )
             .child(
-                self.transport_button("▶", false)
+                self.transport_button("▶", false, false)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.play_adjacent_track(1);
                         cx.notify();
                     })),
             )
-            .child(self.transport_button("↻", false))
+            .child(self.transport_button("↻", false, false).on_click(cx.listener(
+                |this, _, _, cx| {
+                    this.play_random_track();
+                    cx.notify();
+                },
+            )))
     }
 
     pub(super) fn transport_button(
         &self,
         label: &'static str,
         primary: bool,
+        active: bool,
     ) -> gpui::Stateful<gpui::Div> {
         let size = if primary { 28.0 } else { 22.0 };
         let hover_size = if primary { 32.0 } else { 26.0 };
         let colors = *self.colors();
         let bg = if primary {
             colors.transport_primary_bg
+        } else if active {
+            colors.text_strong
         } else {
             colors.player
         };
         let fg = if primary {
             colors.transport_primary_fg
+        } else if active {
+            colors.app
         } else {
             colors.text_muted
         };
@@ -910,37 +913,6 @@ impl TempoApp {
                     .bg(rgb(colors.text_strong))
                     .text_color(rgb(colors.app))
             })
-            .child(label)
-    }
-
-    pub(super) fn seek_side_button(
-        &self,
-        label: &'static str,
-        active: bool,
-    ) -> gpui::Stateful<gpui::Div> {
-        let colors = *self.colors();
-        div()
-            .id(SharedString::from(format!("seek-side-{label}")))
-            .w(px(20.0))
-            .h(px(20.0))
-            .rounded_full()
-            .cursor_pointer()
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_xs()
-            .font_weight(gpui::FontWeight::BOLD)
-            .bg(rgb(if active {
-                colors.text_strong
-            } else {
-                colors.player
-            }))
-            .text_color(rgb(if active {
-                colors.app
-            } else {
-                colors.text_muted
-            }))
-            .hover(move |this| this.bg(rgb(colors.text_strong)).text_color(rgb(colors.app)))
             .child(label)
     }
 }
