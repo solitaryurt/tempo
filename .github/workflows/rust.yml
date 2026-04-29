@@ -17,20 +17,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libasound2-dev \
-            libfontconfig1-dev \
-            libx11-dev \
-            libxcb1-dev \
-            libxcb-render0-dev \
-            libxcb-shape0-dev \
-            libxcb-xfixes0-dev \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
+      - name: Cache APT packages
+        uses: awalsh128/cache-apt-pkgs-action@v1.6.0
+        with:
+          packages: >-
+            libasound2-dev
+            libfontconfig1-dev
+            libx11-dev
+            libxcb1-dev
+            libxcb-render0-dev
+            libxcb-shape0-dev
+            libxcb-xfixes0-dev
+            libxkbcommon-dev
+            libxkbcommon-x11-dev
             pkg-config
+          version: 1.0
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -39,6 +40,11 @@ jobs:
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          # Stable shared key keeps cache hits across branches/PRs.
+          shared-key: rust-stable
+          # Save the cache even if clippy/tests fail so re-runs reuse deps.
+          cache-on-failure: "true"
 
       - name: Check formatting
         run: cargo fmt --all -- --check
