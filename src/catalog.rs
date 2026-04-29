@@ -1,12 +1,12 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use crate::library::{Artwork, Track};
 
@@ -55,6 +55,28 @@ pub struct CatalogAlbum {
     pub year: Option<String>,
     pub artwork_path: Option<PathBuf>,
     pub track_count: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct CatalogDiscographyItem {
+    pub item_id: i64,
+    pub artist_id: i64,
+    pub title: String,
+    pub year: Option<String>,
+    pub release_type: String,
+    pub musicbrainz_release_group_id: Option<String>,
+    pub cover_path: Option<PathBuf>,
+    pub local_album_id: Option<i64>,
+    pub is_local: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct CatalogMetadataJob {
+    pub job_id: i64,
+    pub entity_type: String,
+    pub entity_id: i64,
+    pub job_type: String,
+    pub attempts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -237,15 +259,34 @@ impl CatalogStore {
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 UNIQUE(entity_type, entity_id, job_type)
-             );
+              );
 
-             CREATE INDEX IF NOT EXISTS files_root_seen_idx ON files(root_id, last_seen_scan_id);
-             CREATE INDEX IF NOT EXISTS files_inode_idx ON files(device_id, inode);
-             CREATE INDEX IF NOT EXISTS files_status_idx ON files(status);
-             CREATE INDEX IF NOT EXISTS tracks_artist_idx ON tracks(artist_id);
-             CREATE INDEX IF NOT EXISTS tracks_album_idx ON tracks(album_id);
-             CREATE INDEX IF NOT EXISTS albums_artist_idx ON albums(artist_id);
-             CREATE INDEX IF NOT EXISTS artists_name_idx ON artists(normalized_name);",
+             CREATE TABLE IF NOT EXISTS discography_items (
+                id INTEGER PRIMARY KEY,
+                artist_id INTEGER NOT NULL REFERENCES artists(id),
+                title TEXT NOT NULL,
+                normalized_title TEXT NOT NULL,
+                year TEXT,
+                release_type TEXT NOT NULL,
+                musicbrainz_release_group_id TEXT UNIQUE,
+                cover_asset_id INTEGER REFERENCES assets(id),
+                local_album_id INTEGER REFERENCES albums(id),
+                is_local INTEGER NOT NULL DEFAULT 0,
+                sort_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(artist_id, normalized_title, release_type)
+              );
+
+              CREATE INDEX IF NOT EXISTS files_root_seen_idx ON files(root_id, last_seen_scan_id);
+              CREATE INDEX IF NOT EXISTS files_inode_idx ON files(device_id, inode);
+              CREATE INDEX IF NOT EXISTS files_status_idx ON files(status);
+              CREATE INDEX IF NOT EXISTS tracks_artist_idx ON tracks(artist_id);
+              CREATE INDEX IF NOT EXISTS tracks_album_idx ON tracks(album_id);
+              CREATE INDEX IF NOT EXISTS albums_artist_idx ON albums(artist_id);
+              CREATE INDEX IF NOT EXISTS artists_name_idx ON artists(normalized_name);
+              CREATE INDEX IF NOT EXISTS metadata_jobs_pending_idx ON metadata_jobs(status, next_attempt_at);
+              CREATE INDEX IF NOT EXISTS discography_artist_idx ON discography_items(artist_id, sort_key);",
         )?;
         Ok(())
     }
@@ -641,6 +682,172 @@ impl CatalogStore {
         Ok(())
     }
 
+    pub fn enqueue_metadata_job(
+        &self,
+        entity_type: &str,
+        entity_id: i64,
+        job_type: &str,
+    ) -> Result<()> {
+        let connection = self.connect()?;
+        enqueue_metadata_job(&connection, entity_type, entity_id, job_type, now_millis())
+    }
+
+    pub fn claim_next_metadata_job(
+        &self,
+        supported_job_types: &[&str],
+    ) -> Result<Option<CatalogMetadataJob>> {
+        if supported_job_types.is_empty() {
+            return Ok(None);
+        }
+
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction()?;
+        let now = now_millis();
+        let job = {
+            let mut statement = transaction.prepare(
+                "SELECT id, entity_type, entity_id, job_type, attempts
+                 FROM metadata_jobs
+                 WHERE status = 'pending' AND next_attempt_at <= ?1
+                 ORDER BY next_attempt_at, created_at
+                 LIMIT 50",
+            )?;
+            let rows = statement.query_map(params![now], |row| {
+                Ok(CatalogMetadataJob {
+                    job_id: row.get(0)?,
+                    entity_type: row.get(1)?,
+                    entity_id: row.get(2)?,
+                    job_type: row.get(3)?,
+                    attempts: row.get::<_, i64>(4)?.max(0) as u32,
+                })
+            })?;
+
+            rows.filter_map(|row| row.ok())
+                .find(|job| supported_job_types.contains(&job.job_type.as_str()))
+        };
+
+        if let Some(job) = &job {
+            transaction.execute(
+                "UPDATE metadata_jobs
+                 SET status = 'running', attempts = attempts + 1, updated_at = ?1
+                 WHERE id = ?2 AND status = 'pending'",
+                params![now, job.job_id],
+            )?;
+        }
+
+        transaction.commit()?;
+        Ok(job)
+    }
+
+    pub fn complete_metadata_job(&self, job_id: i64) -> Result<()> {
+        let connection = self.connect()?;
+        let now = now_millis();
+        connection.execute(
+            "UPDATE metadata_jobs
+             SET status = 'complete', last_error = NULL, updated_at = ?1
+             WHERE id = ?2",
+            params![now, job_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn fail_metadata_job(&self, job_id: i64, error: &str) -> Result<()> {
+        let connection = self.connect()?;
+        let now = now_millis();
+        connection.execute(
+            "UPDATE metadata_jobs
+             SET status = 'pending',
+                 next_attempt_at = ?1 + (60000 * (1 << MIN(attempts, 8))),
+                 last_error = ?2,
+                 updated_at = ?1
+             WHERE id = ?3",
+            params![now, error, job_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_discography_item(
+        &self,
+        artist_id: i64,
+        title: &str,
+        year: Option<&str>,
+        release_type: &str,
+        musicbrainz_release_group_id: Option<&str>,
+    ) -> Result<i64> {
+        let connection = self.connect()?;
+        let now = now_millis();
+        let normalized_title = normalize_key(title);
+        let sort_key = discography_sort_key(year, title);
+        connection.execute(
+            "INSERT INTO discography_items(
+                artist_id, title, normalized_title, year, release_type,
+                musicbrainz_release_group_id, sort_key, created_at, updated_at
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+             ON CONFLICT(artist_id, normalized_title, release_type) DO UPDATE SET
+                title = excluded.title,
+                year = COALESCE(excluded.year, discography_items.year),
+                musicbrainz_release_group_id = COALESCE(
+                    excluded.musicbrainz_release_group_id,
+                    discography_items.musicbrainz_release_group_id
+                ),
+                sort_key = excluded.sort_key,
+                updated_at = excluded.updated_at",
+            params![
+                artist_id,
+                title,
+                normalized_title,
+                year,
+                release_type,
+                musicbrainz_release_group_id,
+                sort_key,
+                now,
+            ],
+        )?;
+        connection
+            .query_row(
+                "SELECT id FROM discography_items
+                 WHERE artist_id = ?1 AND normalized_title = ?2 AND release_type = ?3",
+                params![artist_id, normalized_title, release_type],
+                |row| row.get(0),
+            )
+            .context("failed to select discography item id")
+    }
+
+    pub fn load_discography(&self, artist_id: i64) -> Result<Vec<CatalogDiscographyItem>> {
+        let connection = self.connect()?;
+        let mut statement = connection.prepare(
+            "SELECT
+                discography_items.id,
+                discography_items.artist_id,
+                discography_items.title,
+                discography_items.year,
+                discography_items.release_type,
+                discography_items.musicbrainz_release_group_id,
+                cover_assets.cache_path,
+                discography_items.local_album_id,
+                discography_items.is_local
+             FROM discography_items
+             LEFT JOIN assets AS cover_assets ON cover_assets.id = discography_items.cover_asset_id
+             WHERE discography_items.artist_id = ?1
+             ORDER BY discography_items.sort_key, discography_items.title",
+        )?;
+        let rows = statement.query_map(params![artist_id], |row| {
+            let cover_path: Option<String> = row.get(6)?;
+            Ok(CatalogDiscographyItem {
+                item_id: row.get(0)?,
+                artist_id: row.get(1)?,
+                title: row.get(2)?,
+                year: row.get(3)?,
+                release_type: row.get(4)?,
+                musicbrainz_release_group_id: row.get(5)?,
+                cover_path: cover_path.map(PathBuf::from),
+                local_album_id: row.get(7)?,
+                is_local: row.get::<_, i64>(8)? != 0,
+            })
+        })?;
+
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
     fn load_track_by_path(
         &self,
         connection: &Connection,
@@ -721,67 +928,38 @@ impl CatalogStore {
         }
 
         let connection = self.connect()?;
-        struct ArtistAggregate {
-            artist: CatalogArtist,
-            album_ids: HashSet<i64>,
-        }
-
-        let mut statement = connection.prepare(
+        let (root_filter, root_params) = root_path_filter(roots);
+        let mut statement = connection.prepare(&format!(
             "SELECT
                 artists.id,
                 artists.name,
                 artists.bio,
-                photo_assets.cache_path,
-                tracks.album_id,
-                files.path
+                COALESCE(photo_assets.cache_path, MAX(COALESCE(cover_assets.cache_path, tracks.artwork_path))),
+                COUNT(DISTINCT tracks.album_id),
+                COUNT(tracks.id)
              FROM artists
              JOIN tracks ON tracks.artist_id = artists.id
              JOIN files ON files.id = tracks.file_id
+             JOIN albums ON albums.id = tracks.album_id
              LEFT JOIN assets AS photo_assets ON photo_assets.id = artists.photo_asset_id
-             WHERE files.status = 'present'",
-        )?;
-        let rows = statement.query_map([], |row| {
+             LEFT JOIN assets AS cover_assets ON cover_assets.id = albums.cover_asset_id
+             WHERE files.status = 'present' AND ({root_filter})
+             GROUP BY artists.id
+             ORDER BY lower(artists.name)",
+        ))?;
+        let rows = statement.query_map(params_from_iter(root_params), |row| {
             let photo_path: Option<String> = row.get(3)?;
-            Ok((
-                CatalogArtist {
-                    artist_id: row.get(0)?,
-                    name: row.get(1)?,
-                    bio: row.get(2)?,
-                    photo_path: photo_path.map(PathBuf::from),
-                    album_count: 0,
-                    track_count: 0,
-                },
-                row.get::<_, i64>(4)?,
-                PathBuf::from(row.get::<_, String>(5)?),
-            ))
+            Ok(CatalogArtist {
+                artist_id: row.get(0)?,
+                name: row.get(1)?,
+                bio: row.get(2)?,
+                photo_path: photo_path.map(PathBuf::from),
+                album_count: row.get::<_, i64>(4)?.max(0) as usize,
+                track_count: row.get::<_, i64>(5)?.max(0) as usize,
+            })
         })?;
 
-        let mut artists = HashMap::<i64, ArtistAggregate>::new();
-        for row in rows.filter_map(|row| row.ok()) {
-            let (artist, album_id, path) = row;
-            if !path_in_roots(&path, roots) {
-                continue;
-            }
-
-            let entry = artists
-                .entry(artist.artist_id)
-                .or_insert_with(|| ArtistAggregate {
-                    artist,
-                    album_ids: HashSet::new(),
-                });
-            entry.artist.track_count += 1;
-            entry.album_ids.insert(album_id);
-        }
-
-        let mut artists = artists
-            .into_values()
-            .map(|mut aggregate| {
-                aggregate.artist.album_count = aggregate.album_ids.len();
-                aggregate.artist
-            })
-            .collect::<Vec<_>>();
-        artists.sort_by_key(|artist| artist.name.to_ascii_lowercase());
-        Ok(artists)
+        Ok(rows.filter_map(|row| row.ok()).collect())
     }
 
     pub fn load_albums(&self, roots: &[PathBuf]) -> Result<Vec<CatalogAlbum>> {
@@ -790,62 +968,38 @@ impl CatalogStore {
         }
 
         let connection = self.connect()?;
-        let mut statement = connection.prepare(
+        let (root_filter, root_params) = root_path_filter(roots);
+        let mut statement = connection.prepare(&format!(
             "SELECT
                 albums.id,
                 albums.artist_id,
                 albums.title,
                 albums.artist_name,
                 albums.year,
-                COALESCE(cover_assets.cache_path, tracks.artwork_path),
-                files.path
+                COALESCE(cover_assets.cache_path, MAX(tracks.artwork_path)),
+                COUNT(tracks.id)
              FROM albums
              JOIN tracks ON tracks.album_id = albums.id
              JOIN files ON files.id = tracks.file_id
              LEFT JOIN assets AS cover_assets ON cover_assets.id = albums.cover_asset_id
-             WHERE files.status = 'present'",
-        )?;
-        let rows = statement.query_map([], |row| {
+             WHERE files.status = 'present' AND ({root_filter})
+             GROUP BY albums.id
+             ORDER BY lower(albums.artist_name), albums.year, lower(albums.title)",
+        ))?;
+        let rows = statement.query_map(params_from_iter(root_params), |row| {
             let artwork_path: Option<String> = row.get(5)?;
-            Ok((
-                CatalogAlbum {
-                    album_id: row.get(0)?,
-                    artist_id: row.get(1)?,
-                    title: row.get(2)?,
-                    artist: row.get(3)?,
-                    year: row.get(4)?,
-                    artwork_path: artwork_path.map(PathBuf::from),
-                    track_count: 0,
-                },
-                PathBuf::from(row.get::<_, String>(6)?),
-            ))
+            Ok(CatalogAlbum {
+                album_id: row.get(0)?,
+                artist_id: row.get(1)?,
+                title: row.get(2)?,
+                artist: row.get(3)?,
+                year: row.get(4)?,
+                artwork_path: artwork_path.map(PathBuf::from),
+                track_count: row.get::<_, i64>(6)?.max(0) as usize,
+            })
         })?;
 
-        let mut albums = HashMap::<i64, CatalogAlbum>::new();
-        for row in rows.filter_map(|row| row.ok()) {
-            let (album, path) = row;
-            if !path_in_roots(&path, roots) {
-                continue;
-            }
-
-            let entry = albums
-                .entry(album.album_id)
-                .or_insert_with(|| album.clone());
-            if entry.artwork_path.is_none() {
-                entry.artwork_path = album.artwork_path;
-            }
-            entry.track_count += 1;
-        }
-
-        let mut albums = albums.into_values().collect::<Vec<_>>();
-        albums.sort_by_key(|album| {
-            (
-                album.artist.to_ascii_lowercase(),
-                album.year.clone().unwrap_or_default(),
-                album.title.to_ascii_lowercase(),
-            )
-        });
-        Ok(albums)
+        Ok(rows.filter_map(|row| row.ok()).collect())
     }
 
     fn persist_artwork(
@@ -932,6 +1086,45 @@ fn upsert_album(
         .context("failed to select album id")
 }
 
+fn enqueue_metadata_job(
+    connection: &Connection,
+    entity_type: &str,
+    entity_id: i64,
+    job_type: &str,
+    now: i64,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO metadata_jobs(
+            entity_type, entity_id, job_type, status, next_attempt_at, created_at, updated_at
+         ) VALUES(?1, ?2, ?3, 'pending', ?4, ?4, ?4)
+         ON CONFLICT(entity_type, entity_id, job_type) DO UPDATE SET
+            status = CASE
+                WHEN metadata_jobs.status IN ('complete', 'running') THEN metadata_jobs.status
+                ELSE 'pending'
+            END,
+            next_attempt_at = CASE
+                WHEN metadata_jobs.status IN ('complete', 'running') THEN metadata_jobs.next_attempt_at
+                ELSE MIN(metadata_jobs.next_attempt_at, excluded.next_attempt_at)
+            END,
+            updated_at = excluded.updated_at",
+        params![entity_type, entity_id, job_type, now],
+    )?;
+    Ok(())
+}
+
+fn discography_sort_key(year: Option<&str>, title: &str) -> String {
+    let year = year
+        .map(|year| {
+            year.chars()
+                .filter(|ch| ch.is_ascii_digit())
+                .take(4)
+                .collect::<String>()
+        })
+        .filter(|year: &String| year.len() == 4)
+        .unwrap_or_else(|| "9999".to_string());
+    format!("{}:{}", year, normalize_key(title))
+}
+
 fn select_id_by_text(
     connection: &Connection,
     table: &str,
@@ -984,6 +1177,35 @@ fn cache_home() -> PathBuf {
 
 fn path_in_roots(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path.starts_with(root))
+}
+
+fn root_path_filter(roots: &[PathBuf]) -> (String, Vec<String>) {
+    let mut clauses = Vec::with_capacity(roots.len());
+    let mut params = Vec::with_capacity(roots.len() * 2);
+
+    for root in roots {
+        let root = root.display().to_string();
+        let root = root.trim_end_matches('/');
+        let root = if root.is_empty() { "/" } else { root };
+        let prefix = if root == "/" {
+            "/".to_string()
+        } else {
+            format!("{}/", escape_like(root))
+        };
+
+        clauses.push("(files.path = ? OR files.path LIKE ? ESCAPE '\\')");
+        params.push(root.to_string());
+        params.push(format!("{prefix}%"));
+    }
+
+    (clauses.join(" OR "), params)
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 fn option_matches_if_present(left: Option<i64>, right: Option<i64>) -> bool {
@@ -1044,5 +1266,130 @@ mod tests {
     fn detects_artwork_extension_from_magic_bytes() {
         assert_eq!(artwork_extension(None, b"\x89PNG\r\n\x1a\nrest"), "png");
         assert_eq!(artwork_extension(Some("image/jpeg"), b""), "jpg");
+    }
+
+    #[test]
+    fn stores_discography_items_and_metadata_jobs() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = CatalogStore {
+            db_path: temp_dir.path().join("tempo.sqlite"),
+            cache_dir: temp_dir.path().join("cache"),
+        };
+        store.migrate().unwrap();
+
+        let connection = store.connect().unwrap();
+        let artist_id = upsert_artist(&connection, "Brian Eno", now_millis()).unwrap();
+
+        let item_id = store
+            .upsert_discography_item(
+                artist_id,
+                "Another Green World",
+                Some("1975"),
+                "album",
+                Some("release-group-mbid"),
+            )
+            .unwrap();
+        let discography = store.load_discography(artist_id).unwrap();
+        assert_eq!(discography.len(), 1);
+        assert_eq!(discography[0].item_id, item_id);
+        assert_eq!(discography[0].title, "Another Green World");
+
+        store
+            .enqueue_metadata_job("artist", artist_id, "resolve_artist_musicbrainz")
+            .unwrap();
+        let job = store
+            .claim_next_metadata_job(&["resolve_artist_musicbrainz"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.entity_type, "artist");
+        assert_eq!(job.entity_id, artist_id);
+        store.complete_metadata_job(job.job_id).unwrap();
+    }
+
+    #[test]
+    fn loads_browse_data_with_sql_aggregation_and_root_filtering() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = CatalogStore {
+            db_path: temp_dir.path().join("tempo.sqlite"),
+            cache_dir: temp_dir.path().join("cache"),
+        };
+        store.migrate().unwrap();
+
+        let root = temp_dir.path().join("library");
+        let other_root = temp_dir.path().join("other-library");
+        let cover_path = root.join("cover.jpg");
+        store
+            .upsert_track(
+                &Track {
+                    path: root.join("one.flac"),
+                    title: "One".to_string(),
+                    artist: "Alice".to_string(),
+                    album: "First".to_string(),
+                    year: Some("2024".to_string()),
+                    duration: Duration::from_secs(60),
+                    codec: "FLAC".to_string(),
+                    sample_rate: None,
+                    channels: None,
+                    bitrate: None,
+                    file_size: 10,
+                    modified: None,
+                    artwork: Some(Artwork::File(cover_path.clone())),
+                },
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_track(
+                &Track {
+                    path: root.join("two.flac"),
+                    title: "Two".to_string(),
+                    artist: "Alice".to_string(),
+                    album: "First".to_string(),
+                    year: Some("2024".to_string()),
+                    duration: Duration::from_secs(60),
+                    codec: "FLAC".to_string(),
+                    sample_rate: None,
+                    channels: None,
+                    bitrate: None,
+                    file_size: 10,
+                    modified: None,
+                    artwork: None,
+                },
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_track(
+                &Track {
+                    path: other_root.join("three.flac"),
+                    title: "Three".to_string(),
+                    artist: "Bob".to_string(),
+                    album: "Outside".to_string(),
+                    year: None,
+                    duration: Duration::from_secs(60),
+                    codec: "FLAC".to_string(),
+                    sample_rate: None,
+                    channels: None,
+                    bitrate: None,
+                    file_size: 10,
+                    modified: None,
+                    artwork: None,
+                },
+                None,
+            )
+            .unwrap();
+
+        let artists = store.load_artists(&[root.clone()]).unwrap();
+        assert_eq!(artists.len(), 1);
+        assert_eq!(artists[0].name, "Alice");
+        assert_eq!(artists[0].photo_path.as_ref(), Some(&cover_path));
+        assert_eq!(artists[0].album_count, 1);
+        assert_eq!(artists[0].track_count, 2);
+
+        let albums = store.load_albums(&[root]).unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].title, "First");
+        assert_eq!(albums[0].artwork_path.as_ref(), Some(&cover_path));
+        assert_eq!(albums[0].track_count, 2);
     }
 }

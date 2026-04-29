@@ -47,6 +47,12 @@ enum Page {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+enum BrowseViewMode {
+    Grid,
+    Table,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum SortColumn {
     Index,
     Title,
@@ -359,6 +365,9 @@ const TABLE_SCROLLBAR_MIN_THUMB_H: f32 = 32.0;
 const TABLE_SCROLLBAR_MAX_MARKERS: usize = 28;
 const TABLE_SCROLL_IDLE_DELAY: Duration = Duration::from_millis(120);
 const FAST_SCROLL_OVERSCAN_ROWS: usize = 4;
+const BROWSE_GRID_CARD_W: f32 = 154.0;
+const BROWSE_GRID_GAP: f32 = 16.0;
+const BROWSE_GRID_PAD_X: f32 = 32.0;
 
 pub(crate) struct TempoApp {
     focus_handle: FocusHandle,
@@ -377,6 +386,8 @@ pub(crate) struct TempoApp {
     tracks: Vec<Track>,
     artists: Vec<Artist>,
     albums: Vec<Album>,
+    artist_view_mode: BrowseViewMode,
+    album_view_mode: BrowseViewMode,
     queue: Vec<usize>,
     waveform_cache: Vec<Option<Vec<f32>>>,
     waveform_loading: Vec<bool>,
@@ -452,6 +463,8 @@ impl TempoApp {
             tracks: cached_tracks,
             artists: cached_artists,
             albums: cached_albums,
+            artist_view_mode: BrowseViewMode::Grid,
+            album_view_mode: BrowseViewMode::Grid,
             queue: Vec::new(),
             waveform_cache: Vec::new(),
             waveform_loading: Vec::new(),
@@ -787,7 +800,7 @@ impl Render for TempoApp {
                     .min_h_0()
                     .flex()
                     .child(self.render_left_sidebar(cx))
-                    .child(self.render_content(cx)),
+                    .child(self.render_content(window, cx)),
             )
             .child(self.render_player_bar(window, cx))
     }

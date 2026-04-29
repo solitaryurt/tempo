@@ -1,7 +1,11 @@
 use super::*;
 
 impl TempoApp {
-    pub(super) fn render_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_content(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         match self.page {
             Page::Library => div()
                 .flex_1()
@@ -10,8 +14,8 @@ impl TempoApp {
                 .child(self.render_library(cx))
                 .child(self.render_queue(cx))
                 .into_any_element(),
-            Page::Artists => self.render_artists_page(cx).into_any_element(),
-            Page::Albums => self.render_albums_page(cx).into_any_element(),
+            Page::Artists => self.render_artists_page(window, cx).into_any_element(),
+            Page::Albums => self.render_albums_page(window, cx).into_any_element(),
             Page::Settings => self.render_settings(cx).into_any_element(),
         }
     }
