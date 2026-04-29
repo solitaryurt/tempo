@@ -51,6 +51,7 @@ impl TempoApp {
             theme_id: self.theme_id.clone(),
             output_device: self.output_device.clone(),
             volume: self.volume,
+            visible_table_columns: self.visible_columns.clone(),
         };
 
         let Some(parent) = path.parent() else {
@@ -143,7 +144,7 @@ impl TempoApp {
         }
 
         if changed {
-            self.page = Page::Library;
+            self.open_page(Page::Library);
             self.save_app_state();
             self.restart_library_watcher(cx);
         }
@@ -153,7 +154,9 @@ impl TempoApp {
         if root_ix < self.library_roots.len() {
             self.library_roots.remove(root_ix);
             if self.library_roots.is_empty() {
-                self.page = Page::Settings;
+                self.set_page_without_history(Page::Settings);
+                self.back_history.clear();
+                self.forward_history.clear();
             }
             self.save_app_state();
             self.restart_library_watcher(cx);

@@ -141,7 +141,7 @@ impl TempoApp {
                         .child("search"),
                 )
             })
-            .when(self.tabs.len() > 1, |this| {
+            .when(self.can_close_tab(ix), |this| {
                 this.child(
                     div()
                         .id(SharedString::from(format!("close-tab-{ix}")))
@@ -178,9 +178,7 @@ impl TempoApp {
                 },
             )
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.active_tab = ix;
-                this.open_page(Page::Library);
-                this.sync_search_input_to_active_tab();
+                this.select_tab(ix);
                 cx.notify();
             }))
     }
@@ -192,17 +190,9 @@ impl TempoApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let colors = *self.colors();
-        let query = self.top_search_query.as_str();
+        let query = self.search_input.text();
         let is_focused = self.search_focus_handle.is_focused(window);
-        let label = if query.is_empty() {
-            if is_focused {
-                "⌕  ".to_string()
-            } else {
-                format!("⌕  {placeholder}")
-            }
-        } else {
-            format!("⌕  {query}")
-        };
+        let children = self.render_search_text_children(placeholder, is_focused);
 
         div()
             .id("library-search")
@@ -224,27 +214,118 @@ impl TempoApp {
                 colors.text
             }))
             .track_focus(&self.search_focus_handle)
-            .on_click(cx.listener(|this, _, window, _cx| {
+            .on_click(cx.listener(|this, _, window, cx| {
                 window.focus(&this.search_focus_handle);
+                this.search_input.move_to_end();
+                cx.notify();
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 this.handle_search_key_down(event, cx);
             }))
-            .child(label)
-            .when(is_focused, |this| {
-                this.child(
+            .children(children)
+    }
+
+    fn render_search_text_children(
+        &self,
+        placeholder: &'static str,
+        is_focused: bool,
+    ) -> Vec<AnyElement> {
+        let colors = *self.colors();
+        let query = self.search_input.text();
+        let mut children = vec![div().flex_none().child("⌕  ").into_any_element()];
+
+        if query.is_empty() {
+            if is_focused {
+                children.push(self.render_search_cursor().into_any_element());
+            } else {
+                children.push(
                     div()
-                        .ml(px(1.0))
-                        .w(px(1.0))
-                        .h(px(14.0))
-                        .bg(rgb(colors.text))
-                        .with_animation(
-                            "search-cursor",
-                            Animation::new(Duration::from_millis(1000)).repeat(),
-                            |this, delta| this.opacity(if delta < 0.5 { 1.0 } else { 0.0 }),
-                        ),
-                )
-            })
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(placeholder.to_string())
+                        .into_any_element(),
+                );
+            }
+            return children;
+        }
+
+        if !is_focused {
+            children.push(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(query.to_string())
+                    .into_any_element(),
+            );
+            return children;
+        }
+
+        if let Some(selection) = self.search_input.selection_range() {
+            if selection.start > 0 {
+                children.push(
+                    div()
+                        .flex_none()
+                        .child(query[..selection.start].to_string())
+                        .into_any_element(),
+                );
+            }
+            children.push(
+                div()
+                    .flex_none()
+                    .rounded_sm()
+                    .bg(rgb(colors.selected))
+                    .text_color(rgb(colors.text_strong))
+                    .child(query[selection.clone()].to_string())
+                    .into_any_element(),
+            );
+            if selection.end < query.len() {
+                children.push(
+                    div()
+                        .flex_none()
+                        .child(query[selection.end..].to_string())
+                        .into_any_element(),
+                );
+            }
+        } else {
+            let cursor = self.search_input.cursor().min(query.len());
+            if cursor > 0 {
+                children.push(
+                    div()
+                        .flex_none()
+                        .child(query[..cursor].to_string())
+                        .into_any_element(),
+                );
+            }
+            children.push(self.render_search_cursor().into_any_element());
+            if cursor < query.len() {
+                children.push(
+                    div()
+                        .flex_none()
+                        .child(query[cursor..].to_string())
+                        .into_any_element(),
+                );
+            }
+        }
+
+        children
+    }
+
+    fn render_search_cursor(&self) -> impl IntoElement {
+        let colors = *self.colors();
+
+        div()
+            .flex_none()
+            .ml(px(1.0))
+            .w(px(1.0))
+            .h(px(14.0))
+            .bg(rgb(colors.text))
+            .with_animation(
+                "search-cursor",
+                Animation::new(Duration::from_millis(1000)).repeat(),
+                |this, delta| this.opacity(if delta < 0.5 { 1.0 } else { 0.0 }),
+            )
     }
 
     pub(super) fn render_library_header(
@@ -287,11 +368,16 @@ impl TempoApp {
             .child(div().flex_1())
             .child(self.render_search_box(window, "Search library", cx))
             .child(
-                self.sidebar_button("⚙", "open-settings")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.open_page(Page::Settings);
-                        cx.notify();
-                    })),
+                self.with_tooltip(
+                    self.sidebar_button("⚙", "open-settings")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.open_page(Page::Settings);
+                            cx.notify();
+                        })),
+                    "open-settings-tooltip",
+                    "Settings",
+                    cx,
+                ),
             )
             .when(
                 self.right_sidebar_collapsed && !self.queue.is_empty(),
@@ -354,9 +440,10 @@ impl TempoApp {
 
     pub(super) fn render_scan_errors_page(
         &self,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let colors = *self.colors();
+        let item_count = self.scan_errors.len();
         let subtitle = if self.scan_errors.is_empty() {
             "No scan errors".to_string()
         } else {
@@ -384,8 +471,7 @@ impl TempoApp {
                     .id("scan-errors-scroll")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .child(self.render_scan_errors_table()),
+                    .child(self.render_scan_errors_table(item_count, cx)),
             )
     }
 
@@ -417,56 +503,18 @@ impl TempoApp {
             )
     }
 
-    fn render_scan_errors_table(&self) -> impl IntoElement {
+    fn render_scan_errors_table(
+        &self,
+        item_count: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let colors = *self.colors();
-        let rows = self
-            .scan_errors
-            .iter()
-            .rev()
-            .enumerate()
-            .map(|(ix, error)| {
-                div()
-                    .min_h(px(TABLE_ROW_H))
-                    .px_4()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(rgb(colors.row_border))
-                    .bg(rgb(if ix % 2 == 0 {
-                        colors.row
-                    } else {
-                        colors.surface
-                    }))
-                    .flex()
-                    .items_start()
-                    .gap_3()
-                    .child(
-                        div()
-                            .w(px(52.0))
-                            .flex_none()
-                            .text_color(rgb(colors.text_faint))
-                            .child((ix + 1).to_string()),
-                    )
-                    .child(
-                        div()
-                            .w(px(420.0))
-                            .flex_none()
-                            .text_color(rgb(colors.text_strong))
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(error.path.display().to_string()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_color(rgb(colors.text_muted))
-                            .child(error.message.clone()),
-                    )
-            });
+        let scroll_handle = self.scan_errors_scroll_handle.clone();
 
         div()
             .flex()
             .flex_col()
+            .size_full()
             .child(
                 div()
                     .h(px(27.0))
@@ -491,7 +539,73 @@ impl TempoApp {
                         .child("No scan errors for the current scan."),
                 )
             })
-            .when(!self.scan_errors.is_empty(), |this| this.children(rows))
+            .when(!self.scan_errors.is_empty(), |this| {
+                this.child(
+                    uniform_list(
+                        "scan-errors-rows",
+                        item_count,
+                        cx.processor(move |this, range: Range<usize>, _window, _cx| {
+                            let item_count = this.scan_errors.len();
+
+                            range
+                                .filter_map(|row_ix| {
+                                    let error_ix = item_count.checked_sub(row_ix + 1)?;
+                                    let error = this.scan_errors.get(error_ix)?;
+                                    Some(
+                                        this.render_scan_error_row(row_ix, error)
+                                            .into_any_element(),
+                                    )
+                                })
+                                .collect()
+                        }),
+                    )
+                    .flex_1()
+                    .min_h_0()
+                    .track_scroll(scroll_handle),
+                )
+            })
+    }
+
+    fn render_scan_error_row(&self, ix: usize, error: &IndexingError) -> impl IntoElement {
+        let colors = *self.colors();
+
+        div()
+            .min_h(px(TABLE_ROW_H))
+            .px_4()
+            .py_2()
+            .border_b_1()
+            .border_color(rgb(colors.row_border))
+            .bg(rgb(if ix % 2 == 0 {
+                colors.row
+            } else {
+                colors.surface
+            }))
+            .flex()
+            .items_start()
+            .gap_3()
+            .child(
+                div()
+                    .w(px(52.0))
+                    .flex_none()
+                    .text_color(rgb(colors.text_faint))
+                    .child((ix + 1).to_string()),
+            )
+            .child(
+                div()
+                    .w(px(420.0))
+                    .flex_none()
+                    .text_color(rgb(colors.text_strong))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(error.path.display().to_string()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_color(rgb(colors.text_muted))
+                    .child(error.message.clone()),
+            )
     }
 
     pub(super) fn format_library_size(tracks: &[Track]) -> String {

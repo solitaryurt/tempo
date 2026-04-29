@@ -7,11 +7,12 @@ use std::{
 };
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, ClickEvent, Context, CursorStyle, FocusHandle, Image,
-    ImageFormat, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, ParentElement, PathPromptOptions, Pixels, Point, Render,
-    ScrollStrategy, ScrollWheelEvent, SharedString, Styled, UniformListScrollHandle, Window, div,
-    img, point, prelude::*, px, rgb, uniform_list,
+    Animation, AnimationExt as _, AnyElement, ClickEvent, ClipboardItem, Context, Corner,
+    CursorStyle, FocusHandle, Image, ImageFormat, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, ObjectFit, ParentElement,
+    PathPromptOptions, Pixels, Point, Render, ScrollStrategy, ScrollWheelEvent, SharedString,
+    Styled, UniformListScrollHandle, Window, anchored, div, img, point, prelude::*, px, rgb,
+    uniform_list,
 };
 use rodio::{Decoder, Source as _};
 use serde::{Deserialize, Serialize};
@@ -31,14 +32,21 @@ mod artwork;
 mod browse_grids;
 mod library_state;
 mod library_view;
+mod menu;
 mod player;
 mod search;
 mod settings;
 mod sidebar;
 mod table;
+mod text_input;
 mod theme;
+mod tooltip;
 
-use crate::{FocusSearch, MoveSelectionDown, MoveSelectionUp, NewTab, PlaySelected, TogglePause};
+use crate::{
+    CloseTab, FocusSearch, MoveSelectionDown, MoveSelectionUp, NavigateBack, NavigateForward,
+    NewTab, OpenSettings, PlayRandomTrack, PlaySelected, TogglePause,
+};
+use text_input::TextInputState;
 use theme::{Theme, ThemeColors, bundled_themes, default_theme_id, resolve_theme_id};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -60,19 +68,31 @@ enum BrowseViewMode {
 enum SortColumn {
     Index,
     Title,
+    Artist,
     Album,
+    TrackNumber,
     Format,
+    Bitrate,
+    FileSize,
+    Year,
+    DateAdded,
     Plays,
     Duration,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum TableColumn {
     Index,
     Artwork,
     Title,
+    Artist,
     Album,
+    TrackNumber,
     Format,
+    Bitrate,
+    FileSize,
+    Year,
+    DateAdded,
     Plays,
     Duration,
     Loved,
@@ -102,8 +122,14 @@ struct ColumnWidths {
     index: f32,
     artwork: f32,
     title: f32,
+    artist: f32,
     album: f32,
+    track_number: f32,
     format: f32,
+    bitrate: f32,
+    file_size: f32,
+    year: f32,
+    date_added: f32,
     plays: f32,
     duration: f32,
     loved: f32,
@@ -115,8 +141,14 @@ impl Default for ColumnWidths {
             index: INDEX_COL_W,
             artwork: ART_COL_W,
             title: TITLE_COL_W,
+            artist: ARTIST_COL_W,
             album: ALBUM_COL_W,
+            track_number: TRACK_NO_COL_W,
             format: FMT_COL_W,
+            bitrate: BITRATE_COL_W,
+            file_size: FILE_SIZE_COL_W,
+            year: YEAR_COL_W,
+            date_added: DATE_ADDED_COL_W,
             plays: PLAYS_COL_W,
             duration: TIME_COL_W,
             loved: LOVE_COL_W,
@@ -139,13 +171,15 @@ struct Track {
     title: String,
     artist: String,
     album: String,
+    track_number: Option<u32>,
     year: String,
+    date_added: SystemTime,
     duration: String,
     duration_value: Duration,
     codec: String,
     bitrate: Option<u32>,
     file_size: u64,
-    plays: String,
+    plays: u32,
     loved: bool,
     artwork: Option<TrackArtwork>,
     album_initials: String,
@@ -212,6 +246,58 @@ struct TrackDrag {
     title: SharedString,
     artist: SharedString,
     position: gpui::Point<Pixels>,
+}
+
+#[derive(Clone)]
+struct ColumnDrag {
+    column: TableColumn,
+    label: SharedString,
+    position: Point<Pixels>,
+}
+
+#[derive(Clone)]
+struct Tooltip {
+    id: SharedString,
+    label: SharedString,
+    position: Point<Pixels>,
+}
+
+impl ColumnDrag {
+    fn new(column: TableColumn, label: &'static str) -> Self {
+        Self {
+            column,
+            label: label.into(),
+            position: Point::default(),
+        }
+    }
+
+    fn position(mut self, position: Point<Pixels>) -> Self {
+        self.position = position;
+        self
+    }
+}
+
+impl Render for ColumnDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .pl(self.position.x - px(14.0))
+            .pt(self.position.y - px(14.0))
+            .child(
+                div()
+                    .h(px(28.0))
+                    .px_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(0x4b4f5a))
+                    .bg(rgb(0x202229))
+                    .shadow_lg()
+                    .flex()
+                    .items_center()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgb(0xf0f0f4))
+                    .child(self.label.clone()),
+            )
+    }
 }
 
 impl TrackDrag {
@@ -282,7 +368,21 @@ enum TabSource {
     Album(i64),
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct NavigationEntry {
+    page: Page,
+    tab: Option<NavigationTab>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct NavigationTab {
+    tab_id: u64,
+    source: TabSource,
+    search_query: String,
+}
+
 struct BrowseTab {
+    id: u64,
     source: TabSource,
     search_query: String,
     sort_column: SortColumn,
@@ -331,8 +431,9 @@ struct TableScrollbarMetrics {
 }
 
 impl BrowseTab {
-    fn library() -> Self {
+    fn library(id: u64) -> Self {
         Self {
+            id,
             source: TabSource::Library,
             search_query: String::new(),
             sort_column: SortColumn::Index,
@@ -344,8 +445,9 @@ impl BrowseTab {
         }
     }
 
-    fn playlist(playlist_ix: usize) -> Self {
+    fn playlist(id: u64, playlist_ix: usize) -> Self {
         Self {
+            id,
             source: TabSource::Playlist(playlist_ix),
             search_query: String::new(),
             sort_column: SortColumn::Index,
@@ -357,8 +459,9 @@ impl BrowseTab {
         }
     }
 
-    fn artist(artist_id: i64) -> Self {
+    fn artist(id: u64, artist_id: i64) -> Self {
         Self {
+            id,
             source: TabSource::Artist(artist_id),
             search_query: String::new(),
             sort_column: SortColumn::Album,
@@ -370,8 +473,9 @@ impl BrowseTab {
         }
     }
 
-    fn album(album_id: i64) -> Self {
+    fn album(id: u64, album_id: i64) -> Self {
         Self {
+            id,
             source: TabSource::Album(album_id),
             search_query: String::new(),
             sort_column: SortColumn::Index,
@@ -396,6 +500,8 @@ struct AppState {
     output_device: Option<String>,
     #[serde(default = "default_volume")]
     volume: f32,
+    #[serde(default = "default_visible_table_columns")]
+    visible_table_columns: Vec<TableColumn>,
 }
 
 impl Default for AppState {
@@ -406,6 +512,7 @@ impl Default for AppState {
             theme_id: default_theme_id(),
             output_device: None,
             volume: default_volume(),
+            visible_table_columns: default_visible_table_columns(),
         }
     }
 }
@@ -414,11 +521,50 @@ fn default_volume() -> f32 {
     0.75
 }
 
+fn default_visible_table_columns() -> Vec<TableColumn> {
+    vec![
+        TableColumn::Index,
+        TableColumn::Artwork,
+        TableColumn::Title,
+        TableColumn::Artist,
+        TableColumn::Album,
+        TableColumn::TrackNumber,
+        TableColumn::Bitrate,
+        TableColumn::FileSize,
+        TableColumn::Year,
+        TableColumn::DateAdded,
+        TableColumn::Duration,
+    ]
+}
+
+const ALL_TABLE_COLUMNS: &[TableColumn] = &[
+    TableColumn::Index,
+    TableColumn::Artwork,
+    TableColumn::Title,
+    TableColumn::Artist,
+    TableColumn::Album,
+    TableColumn::TrackNumber,
+    TableColumn::Format,
+    TableColumn::Bitrate,
+    TableColumn::FileSize,
+    TableColumn::Year,
+    TableColumn::DateAdded,
+    TableColumn::Plays,
+    TableColumn::Duration,
+    TableColumn::Loved,
+];
+
 const INDEX_COL_W: f32 = 34.0;
 const ART_COL_W: f32 = 32.0;
 const TITLE_COL_W: f32 = 188.0;
+const ARTIST_COL_W: f32 = 160.0;
 const ALBUM_COL_W: f32 = 230.0;
+const TRACK_NO_COL_W: f32 = 58.0;
 const FMT_COL_W: f32 = 70.0;
+const BITRATE_COL_W: f32 = 86.0;
+const FILE_SIZE_COL_W: f32 = 86.0;
+const YEAR_COL_W: f32 = 72.0;
+const DATE_ADDED_COL_W: f32 = 96.0;
 const PLAYS_COL_W: f32 = 82.0;
 const TIME_COL_W: f32 = 64.0;
 const LOVE_COL_W: f32 = 24.0;
@@ -441,6 +587,7 @@ const TABLE_SCROLLBAR_MARGIN: f32 = 4.0;
 const TABLE_SCROLLBAR_MIN_THUMB_H: f32 = 32.0;
 const TABLE_SCROLLBAR_MAX_MARKERS: usize = 28;
 const TABLE_SCROLL_IDLE_DELAY: Duration = Duration::from_millis(120);
+const SEARCH_DEBOUNCE_DELAY: Duration = Duration::from_millis(90);
 const FAST_SCROLL_OVERSCAN_ROWS: usize = 4;
 const BROWSE_GRID_CARD_W: f32 = 154.0;
 const BROWSE_GRID_GAP: f32 = 16.0;
@@ -449,19 +596,31 @@ const BROWSE_GRID_PAD_X: f32 = 32.0;
 pub(crate) struct TempoApp {
     focus_handle: FocusHandle,
     search_focus_handle: FocusHandle,
-    top_search_query: String,
+    search_input: TextInputState,
+    browse_search_query: String,
+    search_debounce_generation: u64,
     page: Page,
     left_sidebar_collapsed: bool,
     right_sidebar_collapsed: bool,
     column_widths: ColumnWidths,
     column_resize: Option<ColumnResize>,
+    visible_columns: Vec<TableColumn>,
+    column_menu_open: bool,
+    column_menu_x: f32,
+    column_menu_y: f32,
     tabs: Vec<BrowseTab>,
     active_tab: usize,
+    next_tab_id: u64,
+    back_history: Vec<NavigationEntry>,
+    forward_history: Vec<NavigationEntry>,
+    hovered_tooltip_id: Option<SharedString>,
+    tooltip: Option<Tooltip>,
+    tooltip_generation: u64,
     playing_track: usize,
     is_playing: bool,
     playback_mode: PlaybackMode,
     context_menu_track: Option<usize>,
-    context_menu_row: usize,
+    context_menu_position: Point<Pixels>,
     tracks: Vec<Track>,
     artists: Vec<Artist>,
     albums: Vec<Album>,
@@ -479,6 +638,7 @@ pub(crate) struct TempoApp {
     playback_status: String,
     output_device: Option<String>,
     output_menu_source: Option<OutputMenuSource>,
+    output_menu_position: Point<Pixels>,
     volume: f32,
     pre_mute_volume: f32,
     scan_progress: ScanProgress,
@@ -490,6 +650,7 @@ pub(crate) struct TempoApp {
     artist_table_scroll_handle: UniformListScrollHandle,
     album_grid_scroll_handle: UniformListScrollHandle,
     album_table_scroll_handle: UniformListScrollHandle,
+    scan_errors_scroll_handle: UniformListScrollHandle,
     table_is_scrolling: bool,
     table_scroll_generation: u64,
     catalog: Option<CatalogStore>,
@@ -523,6 +684,7 @@ impl TempoApp {
         }
         let playlists = state.playlists;
         let volume = state.volume.clamp(0.0, 1.0);
+        let visible_columns = Self::sanitize_visible_columns(state.visible_table_columns);
         let (playback, playback_status) =
             match PlaybackController::new(state.output_device.as_deref(), volume) {
                 Ok(playback) => (Some(playback), "Audio output ready".to_string()),
@@ -542,19 +704,31 @@ impl TempoApp {
         let mut app = Self {
             focus_handle,
             search_focus_handle,
-            top_search_query: String::new(),
+            search_input: TextInputState::default(),
+            browse_search_query: String::new(),
+            search_debounce_generation: 0,
             page: initial_page,
             left_sidebar_collapsed: false,
             right_sidebar_collapsed: false,
             column_widths: ColumnWidths::default(),
             column_resize: None,
-            tabs: vec![BrowseTab::library()],
+            visible_columns,
+            column_menu_open: false,
+            column_menu_x: 0.0,
+            column_menu_y: 0.0,
+            tabs: vec![BrowseTab::library(1)],
             active_tab: 0,
+            next_tab_id: 2,
+            back_history: Vec::new(),
+            forward_history: Vec::new(),
+            hovered_tooltip_id: None,
+            tooltip: None,
+            tooltip_generation: 0,
             playing_track: 0,
             is_playing: false,
             playback_mode: PlaybackMode::Straight,
             context_menu_track: None,
-            context_menu_row: 0,
+            context_menu_position: Point::default(),
             tracks: cached_tracks,
             artists: cached_artists,
             albums: cached_albums,
@@ -572,6 +746,7 @@ impl TempoApp {
             playback_status,
             output_device,
             output_menu_source: None,
+            output_menu_position: Point::default(),
             volume,
             pre_mute_volume: if volume > 0.0 {
                 volume
@@ -587,6 +762,7 @@ impl TempoApp {
             artist_table_scroll_handle: UniformListScrollHandle::new(),
             album_grid_scroll_handle: UniformListScrollHandle::new(),
             album_table_scroll_handle: UniformListScrollHandle::new(),
+            scan_errors_scroll_handle: UniformListScrollHandle::new(),
             table_is_scrolling: false,
             table_scroll_generation: 0,
             catalog,
@@ -641,19 +817,132 @@ impl TempoApp {
         base.to_string()
     }
 
-    fn open_page(&mut self, page: Page) {
-        self.page = match page {
+    fn resolved_page(&self, page: Page) -> Page {
+        match page {
             Page::Library | Page::Artists | Page::Albums | Page::ScanErrors
                 if self.library_roots.is_empty() =>
             {
                 Page::Settings
             }
             page => page,
-        };
+        }
+    }
+
+    fn set_page_without_history(&mut self, page: Page) {
+        self.page = self.resolved_page(page);
         if self.page != Page::Library {
-            self.top_search_query.clear();
+            self.search_input.clear();
+            self.browse_search_query.clear();
+            self.search_debounce_generation = self.search_debounce_generation.wrapping_add(1);
         }
         self.context_menu_track = None;
+    }
+
+    fn current_navigation_entry(&self) -> NavigationEntry {
+        NavigationEntry {
+            page: self.page,
+            tab: (self.page == Page::Library).then(|| NavigationTab {
+                tab_id: self.active_tab().id,
+                source: self.active_tab().source,
+                search_query: self.active_search_query().to_string(),
+            }),
+        }
+    }
+
+    fn allocate_tab_id(&mut self) -> u64 {
+        let id = self.next_tab_id;
+        self.next_tab_id = self.next_tab_id.saturating_add(1);
+        id
+    }
+
+    fn reserve_tab_id(&mut self, id: u64) {
+        self.next_tab_id = self.next_tab_id.max(id.saturating_add(1));
+    }
+
+    fn record_navigation_from(&mut self, previous: NavigationEntry) {
+        if previous != self.current_navigation_entry() {
+            self.back_history.push(previous);
+            self.forward_history.clear();
+        }
+    }
+
+    fn open_page(&mut self, page: Page) {
+        let previous = self.current_navigation_entry();
+        self.set_page_without_history(page);
+        if self.page == Page::Library {
+            self.sync_search_input_to_active_tab();
+        }
+        self.record_navigation_from(previous);
+    }
+
+    fn ensure_navigation_tab(&mut self, nav_tab: &NavigationTab) -> usize {
+        if let Some(tab_ix) = self.tabs.iter().position(|tab| tab.id == nav_tab.tab_id) {
+            self.restore_navigation_tab_state(tab_ix, nav_tab);
+            return tab_ix;
+        }
+
+        if let Some(tab_ix) = self.tabs.iter().position(|tab| {
+            tab.source == nav_tab.source && tab.search_query == nav_tab.search_query
+        }) {
+            return tab_ix;
+        }
+
+        self.reserve_tab_id(nav_tab.tab_id);
+        let mut tab = match nav_tab.source {
+            TabSource::Library => BrowseTab::library(nav_tab.tab_id),
+            TabSource::Playlist(playlist_ix) => BrowseTab::playlist(nav_tab.tab_id, playlist_ix),
+            TabSource::Artist(artist_id) => BrowseTab::artist(nav_tab.tab_id, artist_id),
+            TabSource::Album(album_id) => BrowseTab::album(nav_tab.tab_id, album_id),
+        };
+        tab.search_query = nav_tab.search_query.clone();
+        self.tabs.push(tab);
+        let tab_ix = self.tabs.len() - 1;
+        self.rebuild_track_indices_for_tab(tab_ix);
+        tab_ix
+    }
+
+    fn restore_navigation_tab_state(&mut self, tab_ix: usize, nav_tab: &NavigationTab) {
+        let Some(tab) = self.tabs.get_mut(tab_ix) else {
+            return;
+        };
+        if tab.source == nav_tab.source && tab.search_query != nav_tab.search_query {
+            tab.search_query = nav_tab.search_query.clone();
+            self.rebuild_track_indices_for_tab(tab_ix);
+        }
+    }
+
+    fn restore_navigation_entry(&mut self, entry: NavigationEntry) {
+        if entry.page == Page::Library {
+            if let Some(tab) = entry.tab {
+                self.active_tab = self.ensure_navigation_tab(&tab);
+            }
+            self.set_page_without_history(Page::Library);
+            if self.page == Page::Library {
+                self.sync_search_input_to_active_tab();
+            }
+        } else {
+            self.set_page_without_history(entry.page);
+        }
+    }
+
+    fn navigate_back(&mut self) {
+        let Some(entry) = self.back_history.pop() else {
+            return;
+        };
+
+        let current = self.current_navigation_entry();
+        self.forward_history.push(current);
+        self.restore_navigation_entry(entry);
+    }
+
+    fn navigate_forward(&mut self) {
+        let Some(entry) = self.forward_history.pop() else {
+            return;
+        };
+
+        let current = self.current_navigation_entry();
+        self.back_history.push(current);
+        self.restore_navigation_entry(entry);
     }
 
     fn theme(&self) -> &Theme {
@@ -688,7 +977,9 @@ impl TempoApp {
     }
 
     fn sync_search_input_to_active_tab(&mut self) {
-        self.top_search_query = self.active_search_query().to_string();
+        self.search_input
+            .set_text(self.active_search_query().to_string());
+        self.search_debounce_generation = self.search_debounce_generation.wrapping_add(1);
     }
 
     fn active_selected_track(&self) -> usize {
@@ -724,26 +1015,33 @@ impl TempoApp {
     }
 
     fn new_library_tab(&mut self) {
-        self.tabs.push(BrowseTab::library());
+        let previous = self.current_navigation_entry();
+        let tab_id = self.allocate_tab_id();
+        self.tabs.push(BrowseTab::library(tab_id));
         self.active_tab = self.tabs.len() - 1;
         self.rebuild_track_indices_for_tab(self.active_tab);
-        self.page = Page::Library;
+        self.set_page_without_history(Page::Library);
         self.sync_search_input_to_active_tab();
         self.context_menu_track = None;
+        self.record_navigation_from(previous);
     }
 
     fn new_search_tab(&mut self, query: String) {
-        let mut tab = BrowseTab::library();
+        let previous = self.current_navigation_entry();
+        let tab_id = self.allocate_tab_id();
+        let mut tab = BrowseTab::library(tab_id);
         tab.search_query = query.clone();
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
         self.rebuild_track_indices_for_tab(self.active_tab);
-        self.page = Page::Library;
-        self.top_search_query = query;
+        self.set_page_without_history(Page::Library);
+        self.search_input.set_text(query);
         self.context_menu_track = None;
+        self.record_navigation_from(previous);
     }
 
     fn open_all_music_tab(&mut self) {
+        let previous = self.current_navigation_entry();
         if let Some(tab_ix) = self
             .tabs
             .iter()
@@ -751,13 +1049,15 @@ impl TempoApp {
         {
             self.active_tab = tab_ix;
         } else {
-            self.tabs.push(BrowseTab::library());
+            let tab_id = self.allocate_tab_id();
+            self.tabs.push(BrowseTab::library(tab_id));
             self.active_tab = self.tabs.len() - 1;
             self.rebuild_track_indices_for_tab(self.active_tab);
         }
 
-        self.open_page(Page::Library);
+        self.set_page_without_history(Page::Library);
         self.sync_search_input_to_active_tab();
+        self.record_navigation_from(previous);
     }
 
     fn open_playlist_tab(&mut self, playlist_ix: usize) {
@@ -765,6 +1065,7 @@ impl TempoApp {
             return;
         }
 
+        let previous = self.current_navigation_entry();
         if let Some(tab_ix) = self
             .tabs
             .iter()
@@ -772,16 +1073,19 @@ impl TempoApp {
         {
             self.active_tab = tab_ix;
         } else {
-            self.tabs.push(BrowseTab::playlist(playlist_ix));
+            let tab_id = self.allocate_tab_id();
+            self.tabs.push(BrowseTab::playlist(tab_id, playlist_ix));
             self.active_tab = self.tabs.len() - 1;
             self.rebuild_track_indices_for_tab(self.active_tab);
         }
 
-        self.open_page(Page::Library);
+        self.set_page_without_history(Page::Library);
         self.sync_search_input_to_active_tab();
+        self.record_navigation_from(previous);
     }
 
     fn open_artist_tab(&mut self, artist_id: i64) {
+        let previous = self.current_navigation_entry();
         if let Some(tab_ix) = self
             .tabs
             .iter()
@@ -789,16 +1093,19 @@ impl TempoApp {
         {
             self.active_tab = tab_ix;
         } else {
-            self.tabs.push(BrowseTab::artist(artist_id));
+            let tab_id = self.allocate_tab_id();
+            self.tabs.push(BrowseTab::artist(tab_id, artist_id));
             self.active_tab = self.tabs.len() - 1;
             self.rebuild_track_indices_for_tab(self.active_tab);
         }
 
-        self.open_page(Page::Library);
+        self.set_page_without_history(Page::Library);
         self.sync_search_input_to_active_tab();
+        self.record_navigation_from(previous);
     }
 
     fn open_album_tab(&mut self, album_id: i64) {
+        let previous = self.current_navigation_entry();
         if let Some(tab_ix) = self
             .tabs
             .iter()
@@ -806,13 +1113,27 @@ impl TempoApp {
         {
             self.active_tab = tab_ix;
         } else {
-            self.tabs.push(BrowseTab::album(album_id));
+            let tab_id = self.allocate_tab_id();
+            self.tabs.push(BrowseTab::album(tab_id, album_id));
             self.active_tab = self.tabs.len() - 1;
             self.rebuild_track_indices_for_tab(self.active_tab);
         }
 
-        self.open_page(Page::Library);
+        self.set_page_without_history(Page::Library);
         self.sync_search_input_to_active_tab();
+        self.record_navigation_from(previous);
+    }
+
+    fn select_tab(&mut self, tab_ix: usize) {
+        if tab_ix >= self.tabs.len() {
+            return;
+        }
+
+        let previous = self.current_navigation_entry();
+        self.active_tab = tab_ix;
+        self.set_page_without_history(Page::Library);
+        self.sync_search_input_to_active_tab();
+        self.record_navigation_from(previous);
     }
 
     fn artist_by_id(&self, artist_id: i64) -> Option<&Artist> {
@@ -903,7 +1224,7 @@ impl TempoApp {
     }
 
     fn close_tab(&mut self, tab_ix: usize) {
-        if self.tabs.len() <= 1 || tab_ix >= self.tabs.len() {
+        if !self.can_close_tab(tab_ix) {
             return;
         }
 
@@ -915,6 +1236,15 @@ impl TempoApp {
         }
         self.sync_search_input_to_active_tab();
         self.context_menu_track = None;
+    }
+
+    fn can_close_tab(&self, tab_ix: usize) -> bool {
+        let Some(tab) = self.tabs.get(tab_ix) else {
+            return false;
+        };
+
+        self.tabs.len() > 1
+            && !(tab.source == TabSource::Library && tab.search_query.trim().is_empty())
     }
 }
 
@@ -930,13 +1260,15 @@ impl From<tempo::library::Track> for Track {
             title: track.title,
             artist: track.artist,
             album: track.album,
+            track_number: track.track_number,
             year: track.year.unwrap_or_else(|| "Unknown year".to_string()),
+            date_added: track.date_added,
             duration: format_duration(track.duration),
             duration_value: track.duration,
             codec: track.codec,
             bitrate: track.bitrate,
             file_size: track.file_size,
-            plays: "0".to_string(),
+            plays: 0,
             loved: false,
             artwork: track.artwork.and_then(TrackArtwork::from_library),
             album_initials,
@@ -957,13 +1289,15 @@ impl From<CatalogTrack> for Track {
             title: track.title,
             artist: track.artist,
             album: track.album,
+            track_number: track.track_number,
             year: track.year.unwrap_or_else(|| "Unknown year".to_string()),
+            date_added: track.date_added,
             duration: format_duration(track.duration),
             duration_value: track.duration,
             codec: track.codec,
             bitrate: track.bitrate,
             file_size: track.file_size,
-            plays: "0".to_string(),
+            plays: track.play_count,
             loved: false,
             artwork: track.artwork_path.map(TrackArtwork::File),
             album_initials,
@@ -1049,7 +1383,20 @@ impl Render for TempoApp {
             .on_action(cx.listener(Self::move_selection_up))
             .on_action(cx.listener(Self::move_selection_down))
             .on_action(cx.listener(Self::new_tab))
+            .on_action(cx.listener(Self::close_active_tab))
             .on_action(cx.listener(Self::focus_search))
+            .on_action(cx.listener(Self::open_settings_action))
+            .on_action(cx.listener(Self::play_random_track_action))
+            .on_action(cx.listener(Self::navigate_back_action))
+            .on_action(cx.listener(Self::navigate_forward_action))
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(Self::navigate_back_mouse),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(Self::navigate_forward_mouse),
+            )
             .on_key_down(cx.listener(Self::handle_table_key_down))
             .size_full()
             .bg(rgb(colors.app))
@@ -1067,11 +1414,30 @@ impl Render for TempoApp {
                     .child(self.render_content(window, cx)),
             )
             .child(self.render_player_bar(window, cx))
+            .when_some(
+                self.context_menu_track
+                    .filter(|track_ix| *track_ix < self.tracks.len()),
+                |this, track_ix| this.child(self.render_context_menu(track_ix, cx)),
+            )
+            .when(self.column_menu_open, |this| {
+                this.child(self.render_column_menu(cx))
+            })
+            .when(
+                self.output_menu_source == Some(OutputMenuSource::Settings),
+                |this| this.child(self.settings_output_device_menu(cx)),
+            )
+            .when_some(self.tooltip.clone(), |this, tooltip| {
+                this.child(self.render_tooltip(&tooltip))
+            })
     }
 }
 
 impl TempoApp {
-    fn play_selected(&mut self, _: &PlaySelected, _: &mut Window, cx: &mut Context<Self>) {
+    fn play_selected(&mut self, _: &PlaySelected, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_focus_handle.is_focused(window) {
+            return;
+        }
+
         if self.tracks.is_empty() {
             return;
         }
@@ -1080,7 +1446,11 @@ impl TempoApp {
         cx.notify();
     }
 
-    fn toggle_pause(&mut self, _: &TogglePause, _: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_pause(&mut self, _: &TogglePause, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_focus_handle.is_focused(window) {
+            return;
+        }
+
         if self.tracks.is_empty() {
             return;
         }
@@ -1089,7 +1459,18 @@ impl TempoApp {
         cx.notify();
     }
 
-    fn move_selection_up(&mut self, _: &MoveSelectionUp, _: &mut Window, cx: &mut Context<Self>) {
+    fn move_selection_up(
+        &mut self,
+        _: &MoveSelectionUp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.search_focus_handle.is_focused(window) {
+            self.search_input.move_left(false, false);
+            cx.notify();
+            return;
+        }
+
         self.move_selection(-1);
         cx.notify();
     }
@@ -1097,9 +1478,15 @@ impl TempoApp {
     fn move_selection_down(
         &mut self,
         _: &MoveSelectionDown,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.search_focus_handle.is_focused(window) {
+            self.search_input.move_right(false, false);
+            cx.notify();
+            return;
+        }
+
         self.move_selection(1);
         cx.notify();
     }
@@ -1110,12 +1497,64 @@ impl TempoApp {
         cx.notify();
     }
 
+    fn close_active_tab(&mut self, _: &CloseTab, _: &mut Window, cx: &mut Context<Self>) {
+        self.close_tab(self.active_tab);
+        cx.notify();
+    }
+
     fn focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.page, Page::Library | Page::Artists | Page::Albums) {
             self.open_page(Page::Library);
             self.sync_search_input_to_active_tab();
         }
         window.focus(&self.search_focus_handle);
+        cx.notify();
+    }
+
+    fn open_settings_action(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_page(Page::Settings);
+        cx.notify();
+    }
+
+    fn play_random_track_action(
+        &mut self,
+        _: &PlayRandomTrack,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.play_random_track();
+        cx.notify();
+    }
+
+    fn navigate_back_action(&mut self, _: &NavigateBack, _: &mut Window, cx: &mut Context<Self>) {
+        self.navigate_back();
+        cx.notify();
+    }
+
+    fn navigate_forward_action(
+        &mut self,
+        _: &NavigateForward,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_forward();
+        cx.notify();
+    }
+
+    fn navigate_back_mouse(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.navigate_back();
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn navigate_forward_mouse(
+        &mut self,
+        _: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_forward();
+        cx.stop_propagation();
         cx.notify();
     }
 }

@@ -57,6 +57,30 @@ impl TempoApp {
             .border_color(rgb(colors.border_subtle))
             .gap_2()
             .child(
+                self.sidebar_button("←", "navigate-back")
+                    .opacity(if self.back_history.is_empty() {
+                        0.4
+                    } else {
+                        1.0
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.navigate_back();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                self.sidebar_button("→", "navigate-forward")
+                    .opacity(if self.forward_history.is_empty() {
+                        0.4
+                    } else {
+                        1.0
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.navigate_forward();
+                        cx.notify();
+                    })),
+            )
+            .child(
                 div()
                     .flex_1()
                     .font_weight(gpui::FontWeight::BOLD)
@@ -138,13 +162,6 @@ impl TempoApp {
                     cx,
                 ))
             })
-            .child(self.render_nav_item(
-                "Settings",
-                "",
-                self.page == Page::Settings,
-                Page::Settings,
-                cx,
-            ))
     }
 
     pub(super) fn render_playlists_nav(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {

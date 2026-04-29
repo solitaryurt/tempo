@@ -155,6 +155,14 @@ impl TempoApp {
 
         match playback.play_path(&track_path) {
             Ok(()) => {
+                let plays = self
+                    .catalog
+                    .as_ref()
+                    .and_then(|catalog| catalog.increment_play_count(&track_path).ok())
+                    .unwrap_or_else(|| self.tracks[track_ix].plays.saturating_add(1));
+                if let Some(track) = self.tracks.get_mut(track_ix) {
+                    track.plays = plays;
+                }
                 self.is_playing = true;
                 self.playback_status = "Playing".to_string();
             }
@@ -927,7 +935,6 @@ impl TempoApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let colors = *self.colors();
-        let menu_open = self.output_menu_source == Some(source);
         let button_label = match source {
             OutputMenuSource::Player => format!("{} ▾", self.playback_status_label()),
             OutputMenuSource::Settings => format!("{} ▾", self.current_output_label()),
@@ -950,7 +957,8 @@ impl TempoApp {
                     .px_1()
                     .text_color(rgb(colors.text_muted))
                     .hover(move |this| this.text_color(rgb(colors.accent)).bg(rgb(colors.hover)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                        this.output_menu_position = event.position();
                         this.output_menu_source = if this.output_menu_source == Some(source) {
                             None
                         } else {
@@ -960,72 +968,43 @@ impl TempoApp {
                     }))
                     .child(button_label),
             )
-            .when(menu_open && source == OutputMenuSource::Settings, |this| {
-                this.child(self.output_device_menu(source, cx))
-            })
     }
 
     pub(super) fn player_output_device_menu(
         &self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        div()
-            .absolute()
-            .left(px(90.0))
-            .bottom(px(34.0))
-            .child(self.output_device_menu(OutputMenuSource::Player, cx))
+        self.menu_at(
+            self.output_menu_position,
+            Corner::BottomLeft,
+            point(px(0.0), px(-8.0)),
+            self.output_device_menu(OutputMenuSource::Player, cx),
+        )
+    }
+
+    pub(super) fn settings_output_device_menu(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        self.menu_at(
+            self.output_menu_position,
+            Corner::TopRight,
+            point(px(24.0), px(18.0)),
+            self.output_device_menu(OutputMenuSource::Settings, cx),
+        )
     }
 
     pub(super) fn output_device_menu(
         &self,
-        source: OutputMenuSource,
+        _source: OutputMenuSource,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let colors = *self.colors();
         let current_output = self.current_output_label();
         let devices = PlaybackController::output_devices();
-        let top = match source {
-            OutputMenuSource::Player => -142.0,
-            OutputMenuSource::Settings => 30.0,
-        };
-        let align_right = source == OutputMenuSource::Settings;
 
-        div()
-            .absolute()
-            .top(px(top))
-            .when(align_right, |this| this.right_0())
-            .when(!align_right, |this| this.left_0())
-            .w(px(260.0))
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(colors.border_strong))
-            .bg(rgb(colors.elevated))
-            .shadow_lg()
-            .overflow_hidden()
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(rgb(colors.border))
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(colors.text_strong))
-                            .child("Audio Output"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(colors.text_muted))
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(current_output.clone()),
-                    ),
-            )
+        self.menu_panel(260.0)
+            .child(self.menu_header_with_subtitle("Audio Output", current_output.clone()))
             .when(devices.is_empty(), |this| {
                 this.child(
                     div()
@@ -1044,14 +1023,9 @@ impl TempoApp {
                 };
                 let output_name = device.name;
 
-                div()
-                    .id(SharedString::from(format!("output-device-{output_name}")))
+                self.menu_item_base(SharedString::from(format!("output-device-{output_name}")))
                     .h(px(30.0))
-                    .px_3()
-                    .flex()
-                    .items_center()
                     .justify_between()
-                    .cursor_pointer()
                     .text_color(rgb(if selected {
                         colors.accent_soft
                     } else {

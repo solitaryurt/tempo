@@ -6,8 +6,14 @@ impl TempoApp {
             TableColumn::Index => self.column_widths.index,
             TableColumn::Artwork => self.column_widths.artwork,
             TableColumn::Title => self.column_widths.title,
+            TableColumn::Artist => self.column_widths.artist,
             TableColumn::Album => self.column_widths.album,
+            TableColumn::TrackNumber => self.column_widths.track_number,
             TableColumn::Format => self.column_widths.format,
+            TableColumn::Bitrate => self.column_widths.bitrate,
+            TableColumn::FileSize => self.column_widths.file_size,
+            TableColumn::Year => self.column_widths.year,
+            TableColumn::DateAdded => self.column_widths.date_added,
             TableColumn::Plays => self.column_widths.plays,
             TableColumn::Duration => self.column_widths.duration,
             TableColumn::Loved => self.column_widths.loved,
@@ -20,8 +26,14 @@ impl TempoApp {
             TableColumn::Index => self.column_widths.index = width,
             TableColumn::Artwork => self.column_widths.artwork = width,
             TableColumn::Title => self.column_widths.title = width,
+            TableColumn::Artist => self.column_widths.artist = width,
             TableColumn::Album => self.column_widths.album = width,
+            TableColumn::TrackNumber => self.column_widths.track_number = width,
             TableColumn::Format => self.column_widths.format = width,
+            TableColumn::Bitrate => self.column_widths.bitrate = width,
+            TableColumn::FileSize => self.column_widths.file_size = width,
+            TableColumn::Year => self.column_widths.year = width,
+            TableColumn::DateAdded => self.column_widths.date_added = width,
             TableColumn::Plays => self.column_widths.plays = width,
             TableColumn::Duration => self.column_widths.duration = width,
             TableColumn::Loved => self.column_widths.loved = width,
@@ -32,8 +44,10 @@ impl TempoApp {
         match column {
             TableColumn::Index | TableColumn::Artwork | TableColumn::Loved => 24.0,
             TableColumn::Format => 44.0,
-            TableColumn::Plays | TableColumn::Duration => 52.0,
-            TableColumn::Title | TableColumn::Album => 96.0,
+            TableColumn::TrackNumber | TableColumn::Plays | TableColumn::Duration => 52.0,
+            TableColumn::Bitrate | TableColumn::FileSize | TableColumn::Year => 60.0,
+            TableColumn::Title | TableColumn::Artist | TableColumn::Album => 96.0,
+            TableColumn::DateAdded => 82.0,
         }
     }
 
@@ -58,6 +72,85 @@ impl TempoApp {
 
     pub(super) fn finish_column_resize(&mut self) -> bool {
         self.column_resize.take().is_some()
+    }
+
+    pub(super) fn sanitize_visible_columns(columns: Vec<TableColumn>) -> Vec<TableColumn> {
+        let mut sanitized = Vec::new();
+        for column in columns {
+            if ALL_TABLE_COLUMNS.contains(&column) && !sanitized.contains(&column) {
+                sanitized.push(column);
+            }
+        }
+
+        if !sanitized.contains(&TableColumn::Title) {
+            sanitized.insert(0, TableColumn::Title);
+        }
+        if sanitized.is_empty() {
+            default_visible_table_columns()
+        } else {
+            sanitized
+        }
+    }
+
+    pub(super) fn show_column_menu(&mut self, event: &MouseDownEvent) {
+        self.column_menu_open = true;
+        self.column_menu_x = f32::from(event.position.x);
+        self.column_menu_y = f32::from(event.position.y);
+        self.context_menu_track = None;
+    }
+
+    pub(super) fn toggle_table_column(&mut self, column: TableColumn) {
+        if column == TableColumn::Title {
+            return;
+        }
+
+        if let Some(ix) = self
+            .visible_columns
+            .iter()
+            .position(|visible| *visible == column)
+        {
+            self.visible_columns.remove(ix);
+        } else if let Some(ix) = ALL_TABLE_COLUMNS
+            .iter()
+            .position(|available| *available == column)
+        {
+            let insert_ix = ALL_TABLE_COLUMNS[..ix]
+                .iter()
+                .filter(|available| self.visible_columns.contains(available))
+                .count();
+            self.visible_columns.insert(insert_ix, column);
+        }
+
+        self.visible_columns = Self::sanitize_visible_columns(self.visible_columns.clone());
+        self.save_app_state();
+    }
+
+    pub(super) fn move_table_column_before(&mut self, moving: TableColumn, target: TableColumn) {
+        if moving == target {
+            return;
+        }
+
+        let Some(from_ix) = self
+            .visible_columns
+            .iter()
+            .position(|column| *column == moving)
+        else {
+            return;
+        };
+        let Some(mut to_ix) = self
+            .visible_columns
+            .iter()
+            .position(|column| *column == target)
+        else {
+            return;
+        };
+
+        let column = self.visible_columns.remove(from_ix);
+        if from_ix < to_ix {
+            to_ix = to_ix.saturating_sub(1);
+        }
+        self.visible_columns.insert(to_ix, column);
+        self.save_app_state();
     }
 
     pub(super) fn handle_table_key_down(
@@ -437,8 +530,12 @@ impl TempoApp {
             .overflow_hidden()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _event: &MouseDownEvent, window, _cx| {
+                cx.listener(|this, _event: &MouseDownEvent, window, cx| {
                     window.focus(&this.focus_handle);
+                    if this.column_menu_open {
+                        this.column_menu_open = false;
+                        cx.notify();
+                    }
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
@@ -572,11 +669,6 @@ impl TempoApp {
                         ),
                 )
             })
-            .when_some(
-                self.context_menu_track
-                    .filter(|track_ix| *track_ix < self.tracks.len()),
-                |this, track_ix| this.child(self.render_context_menu(track_ix, cx)),
-            )
     }
 
     pub(super) fn render_fast_scroll_rows(&self) -> AnyElement {
@@ -632,12 +724,6 @@ impl TempoApp {
         } else {
             colors.row
         };
-        let title_color = if active {
-            colors.accent
-        } else {
-            colors.text_strong
-        };
-
         div()
             .absolute()
             .top(px(top))
@@ -650,46 +736,11 @@ impl TempoApp {
             .border_b_1()
             .border_color(rgb(colors.row_border))
             .bg(rgb(bg))
-            .child(
-                div()
-                    .w(px(self.column_width(TableColumn::Index)))
-                    .text_xs()
-                    .text_color(rgb(colors.text_faint))
-                    .child(if active {
-                        if self.is_playing { "Ⅱ" } else { "▶" }.into()
-                    } else {
-                        format!("{:02}", track_ix + 1)
-                    }),
-            )
-            .child(
-                div()
-                    .w(px(self.column_width(TableColumn::Artwork)))
-                    .flex()
-                    .items_center()
-                    .child(self.album_tile_placeholder(track, 22.0)),
-            )
-            .child(
-                div()
-                    .w(px(self.column_width(TableColumn::Title)))
-                    .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rgb(title_color))
-                    .child(track.title.clone()),
-            )
-            .child(self.cell(track.album.clone(), self.column_width(TableColumn::Album)))
-            .child(self.cell(track.codec.clone(), self.column_width(TableColumn::Format)))
-            .child(self.cell(track.plays.clone(), self.column_width(TableColumn::Plays)))
-            .child(self.cell(
-                track.duration.clone(),
-                self.column_width(TableColumn::Duration),
-            ))
-            .child(
-                div()
-                    .w(px(self.column_width(TableColumn::Loved)))
-                    .text_color(rgb(colors.love))
-                    .child(if track.loved { "♥" } else { "" }),
+            .children(
+                self.visible_columns
+                    .iter()
+                    .copied()
+                    .map(|column| self.track_cell(column, track_ix, track, active, true)),
             )
             .into_any_element()
     }
@@ -862,6 +913,7 @@ impl TempoApp {
         let colors = *self.colors();
 
         div()
+            .id("table-header")
             .h(px(27.0))
             .px_4()
             .flex()
@@ -871,28 +923,29 @@ impl TempoApp {
             .text_xs()
             .font_weight(gpui::FontWeight::BOLD)
             .text_color(rgb(colors.text_faint))
-            .child(self.header_cell("#", TableColumn::Index, Some(SortColumn::Index), cx))
-            .child(self.header_cell("", TableColumn::Artwork, None, cx))
-            .child(self.header_cell("TITLE", TableColumn::Title, Some(SortColumn::Title), cx))
-            .child(self.header_cell("ALBUM", TableColumn::Album, Some(SortColumn::Album), cx))
-            .child(self.header_cell("FMT", TableColumn::Format, Some(SortColumn::Format), cx))
-            .child(self.header_cell("PLAYS", TableColumn::Plays, Some(SortColumn::Plays), cx))
-            .child(self.header_cell(
-                "TIME",
-                TableColumn::Duration,
-                Some(SortColumn::Duration),
-                cx,
-            ))
-            .child(self.header_cell("", TableColumn::Loved, None, cx))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                    this.show_column_menu(event);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .children(
+                self.visible_columns
+                    .iter()
+                    .copied()
+                    .map(|column| self.header_cell(column, cx)),
+            )
     }
 
     pub(super) fn header_cell(
         &self,
-        label: &'static str,
         column: TableColumn,
-        sort_column: Option<SortColumn>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        let label = Self::column_label(column);
+        let sort_column = Self::sort_column_for(column);
         let width = self.column_width(column);
         let tab = self.active_tab();
         let active = sort_column.is_some_and(|column| tab.sort_column == column);
@@ -901,16 +954,7 @@ impl TempoApp {
             SortDirection::Ascending => "▲",
             SortDirection::Descending => "▼",
         };
-        let id = match column {
-            TableColumn::Index => "column-index",
-            TableColumn::Artwork => "column-artwork",
-            TableColumn::Title => "column-title",
-            TableColumn::Album => "column-album",
-            TableColumn::Format => "column-format",
-            TableColumn::Plays => "column-plays",
-            TableColumn::Duration => "column-duration",
-            TableColumn::Loved => "column-loved",
-        };
+        let id = SharedString::from(format!("column-{}", Self::column_key(column)));
 
         div()
             .id(id)
@@ -948,6 +992,17 @@ impl TempoApp {
                     cx.notify();
                 }))
             })
+            .on_drag(
+                ColumnDrag::new(column, label),
+                |drag: &ColumnDrag, position, _, cx| {
+                    let preview = drag.clone().position(position);
+                    cx.new(|_| preview)
+                },
+            )
+            .on_drop(cx.listener(move |this, drag: &ColumnDrag, _window, cx| {
+                this.move_table_column_before(drag.column, column);
+                cx.notify();
+            }))
             .child(
                 div()
                     .absolute()
@@ -970,7 +1025,7 @@ impl TempoApp {
 
     pub(super) fn render_track_row(
         &self,
-        row_ix: usize,
+        _row_ix: usize,
         track_ix: usize,
         track: &Track,
         lightweight: bool,
@@ -986,12 +1041,6 @@ impl TempoApp {
         } else {
             colors.row
         };
-        let title_color = if active {
-            colors.accent
-        } else {
-            colors.text_strong
-        };
-
         div()
             .id(SharedString::from(format!("track-row-{track_ix}")))
             .h(px(TABLE_ROW_H))
@@ -1008,6 +1057,7 @@ impl TempoApp {
                         window.focus(&this.focus_handle);
                         this.set_active_selected_track(track_ix);
                         this.context_menu_track = None;
+                        this.column_menu_open = false;
 
                         if event.standard_click() && event.modifiers().control {
                             this.queue_track(track_ix);
@@ -1023,11 +1073,12 @@ impl TempoApp {
                     }))
                     .on_mouse_down(
                         MouseButton::Right,
-                        cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                             window.focus(&this.focus_handle);
                             this.set_active_selected_track(track_ix);
                             this.context_menu_track = Some(track_ix);
-                            this.context_menu_row = row_ix;
+                            this.column_menu_open = false;
+                            this.context_menu_position = event.position;
                             cx.notify();
                         }),
                     )
@@ -1039,50 +1090,11 @@ impl TempoApp {
                         },
                     )
             })
-            .child(
-                div()
-                    .w(px(self.column_width(TableColumn::Index)))
-                    .text_xs()
-                    .text_color(rgb(colors.text_faint))
-                    .child(if active {
-                        if self.is_playing { "Ⅱ" } else { "▶" }.into()
-                    } else {
-                        format!("{:02}", track_ix + 1)
-                    }),
-            )
-            .child(
-                div()
-                    .w(px(self.column_width(TableColumn::Artwork)))
-                    .flex()
-                    .items_center()
-                    .child(if lightweight {
-                        self.album_tile_placeholder(track, 22.0)
-                    } else {
-                        self.album_tile(track, 22.0)
-                    }),
-            )
-            .child(
-                div()
-                    .w(px(self.column_width(TableColumn::Title)))
-                    .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rgb(title_color))
-                    .child(track.title.clone()),
-            )
-            .child(self.cell(track.album.clone(), self.column_width(TableColumn::Album)))
-            .child(self.cell(track.codec.clone(), self.column_width(TableColumn::Format)))
-            .child(self.cell(track.plays.clone(), self.column_width(TableColumn::Plays)))
-            .child(self.cell(
-                track.duration.clone(),
-                self.column_width(TableColumn::Duration),
-            ))
-            .child(
-                div()
-                    .w(px(self.column_width(TableColumn::Loved)))
-                    .text_color(rgb(colors.love))
-                    .child(if track.loved { "♥" } else { "" }),
+            .children(
+                self.visible_columns
+                    .iter()
+                    .copied()
+                    .map(|column| self.track_cell(column, track_ix, track, active, lightweight)),
             )
     }
 
@@ -1095,131 +1107,307 @@ impl TempoApp {
             .child(content.into())
     }
 
+    pub(super) fn track_cell(
+        &self,
+        column: TableColumn,
+        track_ix: usize,
+        track: &Track,
+        active: bool,
+        lightweight: bool,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let width = self.column_width(column);
+        match column {
+            TableColumn::Index => div()
+                .w(px(width))
+                .text_xs()
+                .text_color(rgb(colors.text_faint))
+                .child(if active {
+                    if self.is_playing { "Ⅱ" } else { "▶" }.into()
+                } else {
+                    format!("{:02}", track_ix + 1)
+                })
+                .into_any_element(),
+            TableColumn::Artwork => div()
+                .w(px(width))
+                .flex()
+                .items_center()
+                .child(if lightweight {
+                    self.album_tile_placeholder(track, 22.0)
+                } else {
+                    self.album_tile(track, 22.0)
+                })
+                .into_any_element(),
+            TableColumn::Title => div()
+                .w(px(width))
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(rgb(if active {
+                    colors.accent
+                } else {
+                    colors.text_strong
+                }))
+                .child(track.title.clone())
+                .into_any_element(),
+            TableColumn::Artist => self.cell(track.artist.clone(), width).into_any_element(),
+            TableColumn::Album => self.cell(track.album.clone(), width).into_any_element(),
+            TableColumn::TrackNumber => self
+                .cell(
+                    track
+                        .track_number
+                        .map(|track_number| track_number.to_string())
+                        .unwrap_or_default(),
+                    width,
+                )
+                .into_any_element(),
+            TableColumn::Format => self.cell(track.codec.clone(), width).into_any_element(),
+            TableColumn::Bitrate => self
+                .cell(Self::bitrate_cell_label(track), width)
+                .into_any_element(),
+            TableColumn::FileSize => self
+                .cell(Self::file_size_label(track.file_size), width)
+                .into_any_element(),
+            TableColumn::Year => self.cell(track.year.clone(), width).into_any_element(),
+            TableColumn::DateAdded => self
+                .cell(Self::date_label(track.date_added), width)
+                .into_any_element(),
+            TableColumn::Plays => self.cell(track.plays.to_string(), width).into_any_element(),
+            TableColumn::Duration => self.cell(track.duration.clone(), width).into_any_element(),
+            TableColumn::Loved => div()
+                .w(px(width))
+                .text_color(rgb(colors.love))
+                .child(if track.loved { "♥" } else { "" })
+                .into_any_element(),
+        }
+    }
+
+    pub(super) fn render_column_menu(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        self.menu_at(
+            point(px(self.column_menu_x), px(self.column_menu_y)),
+            Corner::TopLeft,
+            point(px(2.0), px(2.0)),
+            self.menu_panel(220.0)
+                .child(self.menu_header("Columns"))
+                .children(
+                    ALL_TABLE_COLUMNS
+                        .iter()
+                        .copied()
+                        .map(|column| self.column_menu_item(column, cx)),
+                ),
+        )
+    }
+
+    pub(super) fn column_menu_item(
+        &self,
+        column: TableColumn,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+        let checked = self.visible_columns.contains(&column);
+        let locked = column == TableColumn::Title;
+        self.menu_item_base(SharedString::from(format!(
+            "column-menu-{}",
+            Self::column_key(column)
+        )))
+        .gap_2()
+        .cursor(if locked {
+            CursorStyle::Arrow
+        } else {
+            CursorStyle::PointingHand
+        })
+        .text_color(rgb(if locked {
+            colors.text_faint
+        } else {
+            colors.text
+        }))
+        .child(
+            div()
+                .w(px(16.0))
+                .text_color(rgb(colors.accent))
+                .child(if checked { "✓" } else { "" }),
+        )
+        .child(div().flex_1().child(Self::column_menu_label(column)))
+        .when(locked, |this| this.child(div().text_xs().child("required")))
+        .when(!locked, |this| {
+            this.on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                this.toggle_table_column(column);
+                cx.stop_propagation();
+                cx.notify();
+            }))
+        })
+    }
+
+    pub(super) fn column_label(column: TableColumn) -> &'static str {
+        match column {
+            TableColumn::Index => "#",
+            TableColumn::Artwork => "",
+            TableColumn::Title => "TITLE",
+            TableColumn::Artist => "ARTIST",
+            TableColumn::Album => "ALBUM",
+            TableColumn::TrackNumber => "TRK",
+            TableColumn::Format => "FMT",
+            TableColumn::Bitrate => "BITRATE",
+            TableColumn::FileSize => "SIZE",
+            TableColumn::Year => "YEAR",
+            TableColumn::DateAdded => "ADDED",
+            TableColumn::Plays => "PLAYS",
+            TableColumn::Duration => "TIME",
+            TableColumn::Loved => "",
+        }
+    }
+
+    pub(super) fn column_menu_label(column: TableColumn) -> &'static str {
+        match column {
+            TableColumn::Artwork => "Artwork",
+            TableColumn::Loved => "Loved",
+            _ => Self::column_label(column),
+        }
+    }
+
+    pub(super) fn column_key(column: TableColumn) -> &'static str {
+        match column {
+            TableColumn::Index => "index",
+            TableColumn::Artwork => "artwork",
+            TableColumn::Title => "title",
+            TableColumn::Artist => "artist",
+            TableColumn::Album => "album",
+            TableColumn::TrackNumber => "track-number",
+            TableColumn::Format => "format",
+            TableColumn::Bitrate => "bitrate",
+            TableColumn::FileSize => "file-size",
+            TableColumn::Year => "year",
+            TableColumn::DateAdded => "date-added",
+            TableColumn::Plays => "plays",
+            TableColumn::Duration => "duration",
+            TableColumn::Loved => "loved",
+        }
+    }
+
+    pub(super) fn sort_column_for(column: TableColumn) -> Option<SortColumn> {
+        match column {
+            TableColumn::Index => Some(SortColumn::Index),
+            TableColumn::Title => Some(SortColumn::Title),
+            TableColumn::Artist => Some(SortColumn::Artist),
+            TableColumn::Album => Some(SortColumn::Album),
+            TableColumn::TrackNumber => Some(SortColumn::TrackNumber),
+            TableColumn::Format => Some(SortColumn::Format),
+            TableColumn::Bitrate => Some(SortColumn::Bitrate),
+            TableColumn::FileSize => Some(SortColumn::FileSize),
+            TableColumn::Year => Some(SortColumn::Year),
+            TableColumn::DateAdded => Some(SortColumn::DateAdded),
+            TableColumn::Plays => Some(SortColumn::Plays),
+            TableColumn::Duration => Some(SortColumn::Duration),
+            TableColumn::Artwork | TableColumn::Loved => None,
+        }
+    }
+
+    pub(super) fn bitrate_cell_label(track: &Track) -> String {
+        track
+            .bitrate
+            .map(|bitrate| format!("{bitrate} kbps"))
+            .unwrap_or_default()
+    }
+
+    pub(super) fn file_size_label(bytes: u64) -> String {
+        if bytes >= 1_000_000_000 {
+            format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
+        } else if bytes >= 1_000_000 {
+            format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+        } else {
+            format!("{} KB", bytes / 1_000)
+        }
+    }
+
+    pub(super) fn date_label(time: SystemTime) -> String {
+        let Ok(duration) = time.duration_since(UNIX_EPOCH) else {
+            return String::new();
+        };
+        let days = (duration.as_secs() / 86_400) as i64;
+        let (year, month, day) = Self::civil_date_from_days(days);
+        format!("{year:04}-{month:02}-{day:02}")
+    }
+
+    pub(super) fn civil_date_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
+        let z = days_since_epoch + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let mut year = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = mp + if mp < 10 { 3 } else { -9 };
+        if month <= 2 {
+            year += 1;
+        }
+        (year, month, day)
+    }
+
     pub(super) fn render_context_menu(
         &self,
         track_ix: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let track = &self.tracks[track_ix];
-        let top = 27.0 + ((self.context_menu_row as f32 + 1.0) * TABLE_ROW_H).min(560.0);
-        let colors = *self.colors();
-
-        div()
-            .absolute()
-            .top(px(top))
-            .left(px(76.0))
-            .w(px(190.0))
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(colors.border_strong))
-            .bg(rgb(colors.elevated))
-            .shadow_lg()
-            .overflow_hidden()
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(rgb(colors.border))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rgb(colors.text_strong))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .child(track.title.clone()),
-            )
-            .child(
-                self.context_menu_item("Play from start")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if track_ix < this.tracks.len() {
-                            this.play_track(track_ix);
-                            cx.notify();
-                        }
-                    })),
-            )
-            .child(self.context_menu_item("Add to queue").on_click(cx.listener(
-                move |this, _, _, cx| {
-                    this.queue_track(track_ix);
-                    cx.notify();
-                },
-            )))
-            .child(self.context_menu_item("Queue Album").on_click(cx.listener(
-                move |this, _, _, cx| {
-                    this.queue_album_from_track(track_ix, false);
-                    cx.notify();
-                },
-            )))
-            .child(
-                self.context_menu_item("Queue Album Shuffled")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.queue_album_from_track(track_ix, true);
+        self.menu_at(
+            self.context_menu_position,
+            Corner::TopLeft,
+            point(px(2.0), px(2.0)),
+            self.menu_panel(190.0)
+                .child(self.menu_header(track.title.clone()))
+                .child(
+                    self.context_menu_item("Play from start")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if track_ix < this.tracks.len() {
+                                this.play_track(track_ix);
+                                cx.notify();
+                            }
+                        })),
+                )
+                .child(self.context_menu_item("Add to queue").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.queue_track(track_ix);
                         cx.notify();
-                    })),
-            )
-            .when(!self.playlists.is_empty(), |this| {
-                this.child(
-                    div()
-                        .mt_1()
-                        .px_3()
-                        .pt_2()
-                        .pb_1()
-                        .border_t_1()
-                        .border_color(rgb(colors.border))
-                        .text_xs()
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(rgb(colors.text_faint))
-                        .child("ADD TO PLAYLIST"),
+                    },
+                )))
+                .child(self.context_menu_item("Queue Album").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.queue_album_from_track(track_ix, false);
+                        cx.notify();
+                    },
+                )))
+                .child(
+                    self.context_menu_item("Queue Album Shuffled")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.queue_album_from_track(track_ix, true);
+                            cx.notify();
+                        })),
                 )
-                .children(
-                    self.playlists
-                        .iter()
-                        .enumerate()
-                        .map(|(playlist_ix, playlist)| {
-                            self.context_menu_item_dynamic(format!("Add to {}", playlist.name))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.add_track_to_playlist(track_ix, playlist_ix);
-                                    cx.notify();
-                                }))
-                        }),
-                )
-            })
-            .child(self.context_menu_item("Go to album"))
-            .child(self.context_menu_item("Show file"))
+                .when(!self.playlists.is_empty(), |this| {
+                    this.child(self.menu_section_label("ADD TO PLAYLIST"))
+                        .children(self.playlists.iter().enumerate().map(
+                            |(playlist_ix, playlist)| {
+                                self.context_menu_item_dynamic(format!("Add to {}", playlist.name))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.add_track_to_playlist(track_ix, playlist_ix);
+                                        cx.notify();
+                                    }))
+                            },
+                        ))
+                })
+                .child(self.context_menu_item("Go to album"))
+                .child(self.context_menu_item("Show file")),
+        )
     }
 
     pub(super) fn context_menu_item(&self, label: &'static str) -> gpui::Stateful<gpui::Div> {
-        let colors = *self.colors();
-
-        div()
-            .id(SharedString::from(format!("context-menu-{label}")))
-            .h(px(28.0))
-            .px_3()
-            .flex()
-            .items_center()
-            .cursor_pointer()
-            .text_color(rgb(colors.text))
-            .hover(move |this| {
-                this.bg(rgb(colors.button_hover))
-                    .text_color(rgb(colors.text_strong))
-            })
-            .child(label)
+        self.menu_item(SharedString::from(format!("context-menu-{label}")), label)
     }
 
     pub(super) fn context_menu_item_dynamic(&self, label: String) -> gpui::Stateful<gpui::Div> {
         let id = SharedString::from(format!("context-menu-{label}"));
-        let colors = *self.colors();
-
-        div()
-            .id(id)
-            .h(px(28.0))
-            .px_3()
-            .flex()
-            .items_center()
-            .cursor_pointer()
-            .text_color(rgb(colors.text))
-            .hover(move |this| {
-                this.bg(rgb(colors.button_hover))
-                    .text_color(rgb(colors.text_strong))
-            })
-            .child(label)
+        self.menu_item(id, label)
     }
 }

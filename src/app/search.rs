@@ -76,19 +76,30 @@ impl TempoApp {
             let ordering = match sort_column {
                 SortColumn::Index => a.cmp(b),
                 SortColumn::Title => left.title.cmp(&right.title),
+                SortColumn::Artist => left
+                    .artist
+                    .cmp(&right.artist)
+                    .then(left.title.cmp(&right.title)),
                 SortColumn::Album => left
                     .album
                     .cmp(&right.album)
+                    .then(left.title.cmp(&right.title)),
+                SortColumn::TrackNumber => left
+                    .track_number
+                    .cmp(&right.track_number)
                     .then(left.title.cmp(&right.title)),
                 SortColumn::Format => left
                     .codec
                     .cmp(&right.codec)
                     .then(left.title.cmp(&right.title)),
-                SortColumn::Plays => left
-                    .plays
-                    .parse::<u32>()
-                    .unwrap_or_default()
-                    .cmp(&right.plays.parse::<u32>().unwrap_or_default()),
+                SortColumn::Bitrate => left.bitrate.cmp(&right.bitrate),
+                SortColumn::FileSize => left.file_size.cmp(&right.file_size),
+                SortColumn::Year => left
+                    .year
+                    .cmp(&right.year)
+                    .then(left.title.cmp(&right.title)),
+                SortColumn::DateAdded => left.date_added.cmp(&right.date_added),
+                SortColumn::Plays => left.plays.cmp(&right.plays),
                 SortColumn::Duration => left.duration_value.cmp(&right.duration_value),
             };
 
@@ -111,12 +122,18 @@ impl TempoApp {
         }
 
         match sort_column {
-            SortColumn::Title | SortColumn::Album | SortColumn::Format => {
-                self.compute_grouped_scrollbar_markers(indices, sort_column)
-            }
-            SortColumn::Index | SortColumn::Plays | SortColumn::Duration => {
-                self.compute_sampled_scrollbar_markers(indices, sort_column)
-            }
+            SortColumn::Title
+            | SortColumn::Artist
+            | SortColumn::Album
+            | SortColumn::Format
+            | SortColumn::Year => self.compute_grouped_scrollbar_markers(indices, sort_column),
+            SortColumn::Index
+            | SortColumn::TrackNumber
+            | SortColumn::Bitrate
+            | SortColumn::FileSize
+            | SortColumn::DateAdded
+            | SortColumn::Plays
+            | SortColumn::Duration => self.compute_sampled_scrollbar_markers(indices, sort_column),
         }
     }
 
@@ -135,9 +152,17 @@ impl TempoApp {
             };
             let label = match sort_column {
                 SortColumn::Title => Self::marker_initial(&track.title),
+                SortColumn::Artist => Self::marker_initial(&track.artist),
                 SortColumn::Album => Self::marker_initial(&track.album),
                 SortColumn::Format => track.codec.to_ascii_uppercase(),
-                SortColumn::Index | SortColumn::Plays | SortColumn::Duration => unreachable!(),
+                SortColumn::Year => Self::marker_initial(&track.year),
+                SortColumn::Index
+                | SortColumn::TrackNumber
+                | SortColumn::Bitrate
+                | SortColumn::FileSize
+                | SortColumn::DateAdded
+                | SortColumn::Plays
+                | SortColumn::Duration => unreachable!(),
             };
 
             if label == previous_label {
@@ -208,9 +233,18 @@ impl TempoApp {
         match sort_column {
             SortColumn::Index => format!("{}", track_ix + 1),
             SortColumn::Title => Self::marker_initial(&track.title),
+            SortColumn::Artist => Self::marker_initial(&track.artist),
             SortColumn::Album => Self::marker_initial(&track.album),
+            SortColumn::TrackNumber => track
+                .track_number
+                .map(|track_number| track_number.to_string())
+                .unwrap_or_else(|| "-".to_string()),
             SortColumn::Format => track.codec.to_ascii_uppercase(),
-            SortColumn::Plays => track.plays.clone(),
+            SortColumn::Bitrate => TempoApp::bitrate_cell_label(track),
+            SortColumn::FileSize => TempoApp::file_size_label(track.file_size),
+            SortColumn::Year => Self::marker_initial(&track.year),
+            SortColumn::DateAdded => TempoApp::date_label(track.date_added),
+            SortColumn::Plays => track.plays.to_string(),
             SortColumn::Duration => track.duration.clone(),
         }
     }
@@ -275,8 +309,9 @@ impl TempoApp {
     }
 
     pub(super) fn set_search_query(&mut self, query: String) {
+        self.search_debounce_generation = self.search_debounce_generation.wrapping_add(1);
         self.active_tab_mut().search_query = query.clone();
-        self.top_search_query = query;
+        self.search_input.set_text(query);
         self.context_menu_track = None;
         self.invalidate_track_indices();
         let selected_track = self.active_selected_track();
@@ -297,11 +332,17 @@ impl TempoApp {
     }
 
     pub(super) fn clear_search_query(&mut self) {
-        if !self.active_search_query().is_empty() {
-            self.set_search_query(String::new());
-        } else if !self.top_search_query.is_empty() {
-            self.top_search_query.clear();
+        self.search_debounce_generation = self.search_debounce_generation.wrapping_add(1);
+        if self.page == Page::Library {
+            if !self.active_search_query().is_empty() {
+                self.set_search_query(String::new());
+            } else if !self.search_input.text().is_empty() {
+                self.search_input.clear();
+            }
+        } else {
+            self.search_input.clear();
         }
+        self.browse_search_query.clear();
     }
 
     fn should_live_filter_active_tab(&self) -> bool {
@@ -310,18 +351,57 @@ impl TempoApp {
                 || !self.active_search_query().trim().is_empty())
     }
 
-    fn set_search_input(&mut self, query: String) {
-        self.top_search_query = query.clone();
-        if self.should_live_filter_active_tab() {
-            self.set_search_query(query);
+    fn schedule_current_search_input(&mut self, cx: &mut Context<Self>) {
+        let query = self.search_input.text().to_string();
+        if self.should_live_filter_active_tab() || matches!(self.page, Page::Artists | Page::Albums)
+        {
+            self.schedule_search_apply(query, cx);
         }
     }
 
+    fn schedule_search_apply(&mut self, query: String, cx: &mut Context<Self>) {
+        self.search_debounce_generation = self.search_debounce_generation.wrapping_add(1);
+        let generation = self.search_debounce_generation;
+        let target_page = self.page;
+        let target_tab = self.active_tab;
+
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SEARCH_DEBOUNCE_DELAY).await;
+
+            let Ok(()) = this.update(cx, |app, cx| {
+                if app.search_debounce_generation != generation || app.page != target_page {
+                    return;
+                }
+
+                match target_page {
+                    Page::Library => {
+                        if app.active_tab == target_tab && app.should_live_filter_active_tab() {
+                            app.set_search_query(query);
+                            cx.notify();
+                        }
+                    }
+                    Page::Artists | Page::Albums => {
+                        if app.browse_search_query != query {
+                            app.browse_search_query = query;
+                            cx.notify();
+                        }
+                    }
+                    Page::ScanErrors | Page::Settings => {}
+                }
+            }) else {
+                return;
+            };
+        })
+        .detach();
+    }
+
     fn submit_search(&mut self, new_tab: bool, force_current_tab: bool) {
-        let query = self.top_search_query.trim().to_string();
+        let query = self.search_input.text().trim().to_string();
         if query.is_empty() {
             return;
         }
+
+        self.search_debounce_generation = self.search_debounce_generation.wrapping_add(1);
 
         if new_tab {
             let previous_tab = self.active_tab;
@@ -347,6 +427,7 @@ impl TempoApp {
 
     pub(super) fn handle_search_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let modifiers = event.keystroke.modifiers;
+        let command = modifiers.control || modifiers.platform;
 
         match event.keystroke.key.as_str() {
             "enter" => {
@@ -358,40 +439,119 @@ impl TempoApp {
                 cx.notify();
             }
             "backspace" => {
-                if modifiers.control || modifiers.platform || modifiers.alt || modifiers.function {
+                if modifiers.alt || modifiers.function {
                     return;
                 }
-                let mut query = self.top_search_query.clone();
-                query.pop();
-                self.set_search_input(query);
+                self.search_input.backspace(command);
+                self.schedule_current_search_input(cx);
                 cx.stop_propagation();
                 cx.notify();
             }
             "delete" => {
-                if !modifiers.control
-                    && !modifiers.platform
-                    && !modifiers.alt
-                    && !modifiers.function
-                {
-                    cx.stop_propagation();
+                if modifiers.alt || modifiers.function {
+                    return;
                 }
+                self.search_input.delete(command);
+                self.schedule_current_search_input(cx);
+                cx.stop_propagation();
+                cx.notify();
             }
             "escape" => {
                 self.clear_search_query();
                 cx.stop_propagation();
                 cx.notify();
             }
+            "left" => {
+                if modifiers.alt || modifiers.function {
+                    return;
+                }
+                self.search_input.move_left(command, modifiers.shift);
+                cx.stop_propagation();
+                cx.notify();
+            }
+            "right" => {
+                if modifiers.alt || modifiers.function {
+                    return;
+                }
+                self.search_input.move_right(command, modifiers.shift);
+                cx.stop_propagation();
+                cx.notify();
+            }
+            "home" => {
+                if modifiers.alt || modifiers.function {
+                    return;
+                }
+                self.search_input.move_home(modifiers.shift);
+                cx.stop_propagation();
+                cx.notify();
+            }
+            "end" => {
+                if modifiers.alt || modifiers.function {
+                    return;
+                }
+                self.search_input.move_end(modifiers.shift);
+                cx.stop_propagation();
+                cx.notify();
+            }
+            "space" => {
+                if command || modifiers.alt || modifiers.function {
+                    return;
+                }
+                self.search_input.insert(" ");
+                self.schedule_current_search_input(cx);
+                cx.stop_propagation();
+                cx.notify();
+            }
             _ => {
+                if command && !modifiers.alt && !modifiers.function {
+                    match event.keystroke.key.as_str() {
+                        "a" => {
+                            self.search_input.select_all();
+                            cx.stop_propagation();
+                            cx.notify();
+                            return;
+                        }
+                        "c" => {
+                            if let Some(text) = self.search_input.selected_text() {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            }
+                            cx.stop_propagation();
+                            return;
+                        }
+                        "x" => {
+                            if let Some(text) = self.search_input.selected_text() {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                self.search_input.insert("");
+                                self.schedule_current_search_input(cx);
+                                cx.notify();
+                            }
+                            cx.stop_propagation();
+                            return;
+                        }
+                        "v" => {
+                            if let Some(text) =
+                                cx.read_from_clipboard().and_then(|item| item.text())
+                            {
+                                self.search_input.insert(&text.replace('\n', " "));
+                                self.schedule_current_search_input(cx);
+                                cx.notify();
+                            }
+                            cx.stop_propagation();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
                 let Some(key_char) = event.keystroke.key_char.as_ref() else {
                     return;
                 };
-                if modifiers.control || modifiers.platform || modifiers.alt || modifiers.function {
+                if command || modifiers.alt || modifiers.function {
                     return;
                 }
                 if key_char.chars().all(|ch| !ch.is_control()) {
-                    let mut query = self.top_search_query.clone();
-                    query.push_str(key_char);
-                    self.set_search_input(query);
+                    self.search_input.insert(key_char);
+                    self.schedule_current_search_input(cx);
                     cx.stop_propagation();
                     cx.notify();
                 }

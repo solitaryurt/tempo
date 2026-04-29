@@ -185,8 +185,8 @@ impl TempoApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let colors = *self.colors();
-        let artist_indices = self.artist_indices_for_search_query(&self.top_search_query);
-        let is_searching = !self.top_search_query.trim().is_empty();
+        let artist_indices = self.artist_indices_for_search_query(&self.browse_search_query);
+        let is_searching = !self.browse_search_query.trim().is_empty();
         let subtitle = if is_searching {
             format!(
                 "{} of {} artists  ·  {} local albums",
@@ -229,8 +229,8 @@ impl TempoApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let colors = *self.colors();
-        let album_indices = self.album_indices_for_search_query(&self.top_search_query);
-        let is_searching = !self.top_search_query.trim().is_empty();
+        let album_indices = self.album_indices_for_search_query(&self.browse_search_query);
+        let is_searching = !self.browse_search_query.trim().is_empty();
         let subtitle = if is_searching {
             format!(
                 "{} of {} albums  ·  {} tracks",
@@ -267,7 +267,7 @@ impl TempoApp {
         artist_indices: Vec<usize>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let is_searching = !self.top_search_query.trim().is_empty();
+        let is_searching = !self.browse_search_query.trim().is_empty();
         self.render_browse_grid(
             BrowseScrollbarTarget::ArtistsGrid,
             "artists-grid-scroll",
@@ -295,7 +295,7 @@ impl TempoApp {
         album_indices: Vec<usize>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let is_searching = !self.top_search_query.trim().is_empty();
+        let is_searching = !self.browse_search_query.trim().is_empty();
         self.render_browse_grid(
             BrowseScrollbarTarget::AlbumsGrid,
             "albums-grid-scroll",
@@ -468,7 +468,7 @@ impl TempoApp {
         artist_indices: Vec<usize>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let is_searching = !self.top_search_query.trim().is_empty();
+        let is_searching = !self.browse_search_query.trim().is_empty();
         self.render_browse_table(
             BrowseScrollbarTarget::ArtistsTable,
             "artists-table",
@@ -508,7 +508,7 @@ impl TempoApp {
     }
 
     fn render_album_table(&self, album_indices: Vec<usize>, cx: &mut Context<Self>) -> AnyElement {
-        let is_searching = !self.top_search_query.trim().is_empty();
+        let is_searching = !self.browse_search_query.trim().is_empty();
         self.render_browse_table(
             BrowseScrollbarTarget::AlbumsTable,
             "albums-table",
@@ -979,11 +979,16 @@ impl TempoApp {
                     ),
             )
             .child(
-                self.sidebar_button("⚙", "open-settings")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.open_page(Page::Settings);
-                        cx.notify();
-                    })),
+                self.with_tooltip(
+                    self.sidebar_button("⚙", "open-settings")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.open_page(Page::Settings);
+                            cx.notify();
+                        })),
+                    "browse-open-settings-tooltip",
+                    "Settings",
+                    cx,
+                ),
             )
     }
 
