@@ -49,6 +49,8 @@ impl TempoApp {
             library_roots: self.library_roots.clone(),
             playlists: self.playlists.clone(),
             theme_id: self.theme_id.clone(),
+            output_device: self.output_device.clone(),
+            volume: self.volume,
         };
 
         let Some(parent) = path.parent() else {

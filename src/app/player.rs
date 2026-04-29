@@ -10,15 +10,20 @@ impl TempoApp {
 
                 if this
                     .update(cx, |app, cx| {
-                        if app.is_playing
-                            && app
-                                .playback
-                                .as_ref()
-                                .is_some_and(|playback| playback.is_empty())
-                        {
-                            app.play_finished_track();
-                            cx.notify();
+                        if !app.is_playing {
+                            return;
                         }
+
+                        let playback_finished = app
+                            .playback
+                            .as_ref()
+                            .is_some_and(|playback| playback.is_empty());
+
+                        if playback_finished {
+                            app.play_finished_track();
+                        }
+
+                        cx.notify();
                     })
                     .is_err()
                 {
@@ -151,7 +156,7 @@ impl TempoApp {
         match playback.play_path(&track_path) {
             Ok(()) => {
                 self.is_playing = true;
-                self.playback_status = "Playing through default output".to_string();
+                self.playback_status = "Playing".to_string();
             }
             Err(error) => {
                 self.is_playing = false;
@@ -187,7 +192,7 @@ impl TempoApp {
         if let Some(playback) = &self.playback {
             playback.resume();
             self.is_playing = true;
-            self.playback_status = "Playing through default output".to_string();
+            self.playback_status = "Playing".to_string();
         }
 
         self.context_menu_track = None;
@@ -198,6 +203,73 @@ impl TempoApp {
             playback.stop();
         }
         self.is_playing = false;
+    }
+
+    pub(super) fn select_output_device(&mut self, output_name: String) {
+        self.output_menu_source = None;
+        let was_playing = self.is_playing;
+
+        let result = if let Some(playback) = &mut self.playback {
+            playback.set_output(&output_name, self.volume)
+        } else {
+            match PlaybackController::new(Some(&output_name), self.volume) {
+                Ok(playback) => {
+                    self.playback = Some(playback);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        };
+
+        match result {
+            Ok(()) => {
+                self.output_device = self
+                    .playback
+                    .as_ref()
+                    .map(|playback| playback.output_name().to_string());
+                self.playback_status = if was_playing {
+                    "Playing".to_string()
+                } else {
+                    "Playback paused".to_string()
+                };
+                self.save_app_state();
+
+                if was_playing {
+                    self.play_track(self.playing_track);
+                }
+            }
+            Err(error) => {
+                self.is_playing = false;
+                self.playback_status = format!("Playback unavailable: {error:#}");
+            }
+        }
+    }
+
+    pub(super) fn set_playback_volume(&mut self, volume: f32) {
+        self.volume = volume.clamp(0.0, 1.0);
+
+        if self.volume > 0.0 {
+            self.pre_mute_volume = self.volume;
+        }
+
+        if let Some(playback) = &self.playback {
+            playback.set_volume(self.volume);
+        }
+
+        self.save_app_state();
+    }
+
+    pub(super) fn toggle_mute(&mut self) {
+        if self.volume > 0.0 {
+            self.pre_mute_volume = self.volume;
+            self.set_playback_volume(0.0);
+        } else {
+            self.set_playback_volume(self.pre_mute_volume.max(0.1));
+        }
+    }
+
+    pub(super) fn set_max_volume(&mut self) {
+        self.set_playback_volume(1.0);
     }
 
     pub(super) fn play_adjacent_track(&mut self, delta: isize) {
@@ -335,10 +407,11 @@ impl TempoApp {
         if !self.waveform_loading[track_ix] {
             self.waveform_loading[track_ix] = true;
             let expected_path = source.path.clone();
+            let catalog = self.catalog.clone();
             cx.spawn(async move |this, cx| {
                 let waveform = cx
                     .background_executor()
-                    .spawn(async move { TempoApp::generate_audio_waveform(&source) })
+                    .spawn(async move { TempoApp::load_or_generate_waveform(&source, catalog) })
                     .await;
 
                 let _ = this.update(cx, |app, cx| {
@@ -364,8 +437,31 @@ impl TempoApp {
         )
     }
 
-    pub(super) fn generate_audio_waveform(track: &WaveformSource) -> Vec<f32> {
-        Self::decode_waveform(track).unwrap_or_else(|| Self::generate_fallback_waveform(track))
+    pub(super) fn load_or_generate_waveform(
+        track: &WaveformSource,
+        catalog: Option<CatalogStore>,
+    ) -> Vec<f32> {
+        if let Some(catalog) = catalog.as_ref()
+            && let Ok(Some(waveform)) =
+                catalog.load_waveform(&track.path, WAVEFORM_SEGMENTS, WAVEFORM_CACHE_VERSION)
+        {
+            return waveform;
+        }
+
+        let Some(waveform) = Self::decode_waveform(track) else {
+            return Self::generate_fallback_waveform(track);
+        };
+
+        if let Some(catalog) = catalog.as_ref() {
+            let _ = catalog.save_waveform(
+                &track.path,
+                WAVEFORM_SEGMENTS,
+                WAVEFORM_CACHE_VERSION,
+                &waveform,
+            );
+        }
+
+        waveform
     }
 
     pub(super) fn decode_waveform(track: &WaveformSource) -> Option<Vec<f32>> {
@@ -529,9 +625,11 @@ impl TempoApp {
         } else {
             (playback_position.as_secs_f32() / track.duration_value.as_secs_f32()).clamp(0.0, 1.0)
         };
-        let now_playing_active_color = colors.accent_soft;
+        let now_playing_active_color = colors.accent;
+        let volume_fill = 104.0 * self.volume;
 
         div()
+            .relative()
             .h(px(86.0))
             .flex_none()
             .flex()
@@ -609,13 +707,16 @@ impl TempoApp {
                         div()
                             .text_xs()
                             .text_color(rgb(colors.text_faint))
-                            .child(format!(
-                                "{}  ·  {}  ·  {}  ·  {}",
-                                track.codec,
-                                Self::bitrate_label(track),
-                                track.year,
-                                self.playback_status.clone()
-                            )),
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(track.codec.clone())
+                            .child("·")
+                            .child(Self::bitrate_label(track))
+                            .child("·")
+                            .child(track.year.clone())
+                            .child("·")
+                            .child(self.playback_status_dropdown(OutputMenuSource::Player, cx)),
                     ),
             )
             .child(
@@ -645,8 +746,17 @@ impl TempoApp {
                             .flex()
                             .items_center()
                             .gap_3()
-                            .child("☰")
-                            .child("♩")
+                            .child(
+                                div()
+                                    .id("volume-mute")
+                                    .cursor_pointer()
+                                    .active(|this| this.opacity(0.75))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_mute();
+                                        cx.notify();
+                                    }))
+                                    .child(Self::volume_speaker_icon(1, colors)),
+                            )
                             .child(
                                 div()
                                     .flex_1()
@@ -655,13 +765,28 @@ impl TempoApp {
                                     .bg(rgb(colors.text_faint))
                                     .child(
                                         div()
-                                            .w(px(104.0))
+                                            .w(px(volume_fill))
                                             .h(px(3.0))
                                             .rounded_full()
                                             .bg(rgb(colors.text)),
                                     ),
+                            )
+                            .child(
+                                div()
+                                    .id("volume-max")
+                                    .cursor_pointer()
+                                    .active(|this| this.opacity(0.75))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_max_volume();
+                                        cx.notify();
+                                    }))
+                                    .child(Self::volume_speaker_icon(3, colors)),
                             ),
                     ),
+            )
+            .when(
+                self.output_menu_source == Some(OutputMenuSource::Player),
+                |this| this.child(self.player_output_device_menu(cx)),
             )
             .into_any_element()
     }
@@ -672,6 +797,214 @@ impl TempoApp {
             PlaybackMode::Loop => "↻",
             PlaybackMode::Shuffle => "⤨",
         }
+    }
+
+    pub(super) fn volume_speaker_icon(waves: usize, colors: ThemeColors) -> AnyElement {
+        let color = format!("#{:06x}", colors.text_muted);
+        let mut wave_paths = String::new();
+
+        if waves >= 1 {
+            wave_paths.push_str(&format!(
+                r#"<path d="M14.5 9.4C15.2 10.1 15.6 11 15.6 12C15.6 13 15.2 13.9 14.5 14.6" fill="none" stroke="{color}" stroke-width="1.8" stroke-linecap="round"/>"#
+            ));
+        }
+
+        if waves >= 2 {
+            wave_paths.push_str(&format!(
+                r#"<path d="M17 7.2C18.2 8.5 18.9 10.2 18.9 12C18.9 13.8 18.2 15.5 17 16.8" fill="none" stroke="{color}" stroke-width="1.8" stroke-linecap="round"/>"#
+            ));
+        }
+
+        if waves >= 3 {
+            wave_paths.push_str(&format!(
+                r#"<path d="M19.4 5C21 7 22 9.4 22 12C22 14.6 21 17 19.4 19" fill="none" stroke="{color}" stroke-width="1.8" stroke-linecap="round"/>"#
+            ));
+        }
+
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path d="M3 9V15H7L12 19V5L7 9H3Z" fill="{color}"/>{wave_paths}</svg>"#
+        );
+
+        img(Arc::new(Image::from_bytes(
+            ImageFormat::Svg,
+            svg.into_bytes(),
+        )))
+        .w(px(18.0))
+        .h(px(18.0))
+        .into_any_element()
+    }
+
+    pub(super) fn playback_status_label(&self) -> &'static str {
+        if self.playback.is_none() {
+            "Unavailable"
+        } else if self.is_playing {
+            "Playing"
+        } else {
+            "Paused"
+        }
+    }
+
+    pub(super) fn current_output_label(&self) -> String {
+        self.playback
+            .as_ref()
+            .map(|playback| playback.output_name().to_string())
+            .or_else(|| self.output_device.clone())
+            .unwrap_or_else(|| "No output device".to_string())
+    }
+
+    pub(super) fn playback_status_dropdown(
+        &self,
+        source: OutputMenuSource,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+        let menu_open = self.output_menu_source == Some(source);
+        let button_label = match source {
+            OutputMenuSource::Player => format!("{} ▾", self.playback_status_label()),
+            OutputMenuSource::Settings => format!("{} ▾", self.current_output_label()),
+        };
+
+        div()
+            .id(SharedString::from(match source {
+                OutputMenuSource::Player => "player-output-dropdown",
+                OutputMenuSource::Settings => "settings-output-dropdown",
+            }))
+            .relative()
+            .child(
+                div()
+                    .id(SharedString::from(match source {
+                        OutputMenuSource::Player => "player-output-dropdown-button",
+                        OutputMenuSource::Settings => "settings-output-dropdown-button",
+                    }))
+                    .cursor_pointer()
+                    .rounded_sm()
+                    .px_1()
+                    .text_color(rgb(colors.text_muted))
+                    .hover(move |this| this.text_color(rgb(colors.accent)).bg(rgb(colors.hover)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.output_menu_source = if this.output_menu_source == Some(source) {
+                            None
+                        } else {
+                            Some(source)
+                        };
+                        cx.notify();
+                    }))
+                    .child(button_label),
+            )
+            .when(menu_open && source == OutputMenuSource::Settings, |this| {
+                this.child(self.output_device_menu(source, cx))
+            })
+    }
+
+    pub(super) fn player_output_device_menu(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        div()
+            .absolute()
+            .left(px(90.0))
+            .bottom(px(34.0))
+            .child(self.output_device_menu(OutputMenuSource::Player, cx))
+    }
+
+    pub(super) fn output_device_menu(
+        &self,
+        source: OutputMenuSource,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+        let current_output = self.current_output_label();
+        let devices = PlaybackController::output_devices();
+        let top = match source {
+            OutputMenuSource::Player => -142.0,
+            OutputMenuSource::Settings => 30.0,
+        };
+        let align_right = source == OutputMenuSource::Settings;
+
+        div()
+            .absolute()
+            .top(px(top))
+            .when(align_right, |this| this.right_0())
+            .when(!align_right, |this| this.left_0())
+            .w(px(260.0))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(colors.border_strong))
+            .bg(rgb(colors.elevated))
+            .shadow_lg()
+            .overflow_hidden()
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(colors.border))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(colors.text_strong))
+                            .child("Audio Output"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(colors.text_muted))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(current_output.clone()),
+                    ),
+            )
+            .when(devices.is_empty(), |this| {
+                this.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_color(rgb(colors.text_muted))
+                        .child("No output devices found"),
+                )
+            })
+            .children(devices.into_iter().map(move |device| {
+                let selected = device.name == current_output;
+                let label = if device.is_default {
+                    format!("{} (default)", device.name)
+                } else {
+                    device.name.clone()
+                };
+                let output_name = device.name;
+
+                div()
+                    .id(SharedString::from(format!("output-device-{output_name}")))
+                    .h(px(30.0))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .cursor_pointer()
+                    .text_color(rgb(if selected {
+                        colors.accent_soft
+                    } else {
+                        colors.text
+                    }))
+                    .hover(move |this| {
+                        this.bg(rgb(colors.button_hover))
+                            .text_color(rgb(colors.text_strong))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_output_device(output_name.clone());
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(label),
+                    )
+                    .child(if selected { "✓" } else { "" })
+            }))
     }
 
     pub(super) fn bitrate_label(track: &Track) -> String {

@@ -75,6 +75,7 @@ impl TempoApp {
                         this.child(self.render_onboarding_card())
                     })
                     .child(self.render_theme_settings(cx))
+                    .child(self.render_output_settings(cx))
                     .child(self.render_library_settings(cx))
                     .child(self.render_playlist_settings(cx)),
             )
@@ -244,6 +245,73 @@ impl TempoApp {
                 this.set_theme(&theme_id);
                 cx.notify();
             }))
+    }
+
+    pub(super) fn render_output_settings(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+
+        div()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.surface))
+            .overflow_hidden()
+            .child(
+                div()
+                    .px_4()
+                    .py_2()
+                    .bg(rgb(colors.elevated))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("Audio Output"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(colors.text_muted))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(self.current_output_label()),
+                    ),
+            )
+            .child(
+                div()
+                    .px_4()
+                    .py_3()
+                    .border_t_1()
+                    .border_color(rgb(colors.border))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_color(rgb(colors.text_strong))
+                                    .child("Playback device"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(colors.text_muted))
+                                    .child("Choose where Tempo sends audio."),
+                            ),
+                    )
+                    .child(self.playback_status_dropdown(OutputMenuSource::Settings, cx)),
+            )
     }
 
     pub(super) fn render_library_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
