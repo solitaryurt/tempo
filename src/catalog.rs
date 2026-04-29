@@ -15,6 +15,11 @@ use crate::{
 };
 
 const APP_DIR: &str = "tempo";
+/// Bump this whenever the SQL schema or any migration step in `migrate()`
+/// changes. Startup short-circuits when the SQLite `user_version` already
+/// matches, so this is the only knob that controls whether DDL re-runs on
+/// app launch.
+const SCHEMA_VERSION: i64 = 1;
 
 #[derive(Clone, Debug)]
 pub struct CatalogStore {
@@ -134,6 +139,10 @@ impl CatalogStore {
         &self.db_path
     }
 
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+
     fn connect(&self) -> Result<Connection> {
         let _span = perf::slow_span(
             "catalog.connect",
@@ -142,11 +151,22 @@ impl CatalogStore {
         );
         let connection = Connection::open(&self.db_path)
             .with_context(|| format!("failed to open {}", self.db_path.display()))?;
+        // PRAGMA tuning rationale:
+        //   journal_mode=WAL: required for concurrent readers + writer.
+        //   synchronous=NORMAL: WAL-safe, faster than FULL.
+        //   foreign_keys=ON: enforce schema integrity.
+        //   busy_timeout: avoid SQLITE_BUSY under contention.
+        //   temp_store=MEMORY: keep temp tables/indexes in RAM.
+        //   cache_size=-32768: ~32 MiB page cache (negative = KiB).
+        //   mmap_size=268435456: 256 MiB memory-mapped reads (faster cold reads).
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
-             PRAGMA busy_timeout = 5000;",
+             PRAGMA busy_timeout = 5000;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA cache_size = -32768;
+             PRAGMA mmap_size = 268435456;",
         )?;
         Ok(connection)
     }
@@ -154,6 +174,21 @@ impl CatalogStore {
     fn migrate(&self) -> Result<()> {
         let _span = perf::span("catalog.migrate_inner", "");
         let connection = self.connect()?;
+        // Fast path: each migration bump increments SCHEMA_VERSION; if the
+        // database already advertises that version, skip all DDL/ALTERs.
+        // Even on no-op runs the `CREATE TABLE IF NOT EXISTS` + multiple
+        // `ALTER TABLE` calls cost ~7 ms because SQLite still parses every
+        // statement.
+        let stored_version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0);
+        if stored_version >= SCHEMA_VERSION {
+            perf::event(
+                "catalog.migrate.skip",
+                format!("user_version={stored_version}"),
+            );
+            return Ok(());
+        }
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS library_roots (
                 id INTEGER PRIMARY KEY,
@@ -337,6 +372,11 @@ impl CatalogStore {
             "UPDATE tracks SET date_added = created_at WHERE date_added IS NULL",
             [],
         )?;
+        connection.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+        perf::event(
+            "catalog.migrate.applied",
+            format!("user_version={SCHEMA_VERSION}"),
+        );
         Ok(())
     }
 
@@ -757,7 +797,8 @@ impl CatalogStore {
         }
 
         let connection = self.connect()?;
-        let mut statement = connection.prepare(
+        let (root_filter, root_params) = root_path_filter(roots);
+        let mut statement = connection.prepare(&format!(
             "SELECT
                 tracks.id, files.id, tracks.artist_id, tracks.album_id, files.path, tracks.title,
                 tracks.artist_name, tracks.album_name, tracks.track_number, tracks.year,
@@ -765,10 +806,10 @@ impl CatalogStore {
                 tracks.file_size, tracks.play_count, tracks.artwork_path
              FROM tracks
              JOIN files ON files.id = tracks.file_id
-             WHERE files.status = 'present'
+             WHERE files.status = 'present' AND ({root_filter})
              ORDER BY files.path",
-        )?;
-        let rows = statement.query_map([], |row| {
+        ))?;
+        let rows = statement.query_map(params_from_iter(root_params), |row| {
             let path: String = row.get(4)?;
             let track_number: Option<i64> = row.get(8)?;
             let date_added_ms: i64 = row.get(10)?;
@@ -798,10 +839,7 @@ impl CatalogStore {
             })
         })?;
 
-        let tracks: Vec<CatalogTrack> = rows
-            .filter_map(|row| row.ok())
-            .filter(|track| path_in_roots(&track.path, roots))
-            .collect();
+        let tracks: Vec<CatalogTrack> = rows.filter_map(|row| row.ok()).collect();
         perf::event(
             "catalog.load_tracks.count",
             format!("tracks={}", tracks.len()),
@@ -822,7 +860,8 @@ impl CatalogStore {
         }
 
         let connection = self.connect()?;
-        let mut statement = connection.prepare(
+        let (root_filter, root_params) = root_path_filter(roots);
+        let mut statement = connection.prepare(&format!(
             "SELECT
                 tracks.id, files.id, tracks.artist_id, tracks.album_id, files.path, tracks.title,
                 tracks.artist_name, tracks.album_name, tracks.track_number, tracks.year,
@@ -831,9 +870,9 @@ impl CatalogStore {
                 files.size_bytes, files.modified_at, files.device_id, files.inode
              FROM tracks
              JOIN files ON files.id = tracks.file_id
-             WHERE files.status = 'present'",
-        )?;
-        let rows = statement.query_map([], |row| {
+             WHERE files.status = 'present' AND ({root_filter})",
+        ))?;
+        let rows = statement.query_map(params_from_iter(root_params), |row| {
             let path: String = row.get(4)?;
             let track_number: Option<i64> = row.get(8)?;
             let date_added_ms: i64 = row.get(10)?;
@@ -876,9 +915,7 @@ impl CatalogStore {
         let mut tracks = HashMap::new();
         for row in rows.filter_map(|row| row.ok()) {
             let (path, fingerprint, track) = row;
-            if path_in_roots(&path, roots) {
-                tracks.insert(path, (fingerprint, track));
-            }
+            tracks.insert(path, (fingerprint, track));
         }
         perf::event(
             "catalog.load_track_fingerprints.count",
@@ -1691,10 +1728,6 @@ fn cache_home() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .unwrap_or_else(|| PathBuf::from("."))
-}
-
-fn path_in_roots(path: &Path, roots: &[PathBuf]) -> bool {
-    roots.iter().any(|root| path.starts_with(root))
 }
 
 fn waveform_to_blob(peaks: &[f32]) -> Vec<u8> {

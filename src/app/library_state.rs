@@ -352,6 +352,164 @@ impl TempoApp {
             .collect())
     }
 
+    /// Load tracks/artists/albums for startup. Tries the binary snapshot
+    /// first (single sequential read, ~tens of ms for 8k tracks); falls back
+    /// to running the three SQLite catalog queries in parallel.
+    pub(super) fn load_browse_caches_for_startup(
+        catalog: Option<&CatalogStore>,
+        roots: &[PathBuf],
+    ) -> (Vec<Track>, Vec<Artist>, Vec<Album>) {
+        let _span = perf::span(
+            "startup.load_browse_caches",
+            format!("roots={}", roots.len()),
+        );
+
+        if let Some(catalog) = catalog
+            && let Some(snapshot) = perf::time(
+                "startup.snapshot_load",
+                format!("roots={}", roots.len()),
+                || tempo::snapshot::load(catalog.cache_dir(), roots),
+            )
+        {
+            perf::event(
+                "startup.snapshot.hit",
+                format!(
+                    "tracks={} artists={} albums={}",
+                    snapshot.tracks.len(),
+                    snapshot.artists.len(),
+                    snapshot.albums.len()
+                ),
+            );
+            let tracks = perf::time(
+                "startup.snapshot_to_tracks",
+                format!("count={}", snapshot.tracks.len()),
+                || snapshot.tracks.into_iter().map(Track::from).collect(),
+            );
+            let artists = perf::time(
+                "startup.snapshot_to_artists",
+                format!("count={}", snapshot.artists.len()),
+                || snapshot.artists.into_iter().map(Artist::from).collect(),
+            );
+            let albums = perf::time(
+                "startup.snapshot_to_albums",
+                format!("count={}", snapshot.albums.len()),
+                || snapshot.albums.into_iter().map(Album::from).collect(),
+            );
+            return (tracks, artists, albums);
+        }
+
+        perf::event("startup.snapshot.miss", "");
+
+        // Fallback path: run the three SQLite loads in parallel. Each
+        // `load_*` opens its own short-lived `Connection`, so they do not
+        // contend on a shared transaction; with WAL + mmap, three readers
+        // overlap nicely on disk + CPU.
+        let Some(catalog) = catalog else {
+            return (Vec::new(), Vec::new(), Vec::new());
+        };
+
+        let parallel_span = perf::span("startup.cached_parallel", format!("roots={}", roots.len()));
+        std::thread::scope(|scope| {
+            let tracks_handle = {
+                let catalog = catalog.clone();
+                let roots = roots.to_vec();
+                scope.spawn(move || {
+                    perf::time(
+                        "startup.cached_tracks",
+                        format!("roots={}", roots.len()),
+                        || Self::load_cached_tracks(Some(&catalog), &roots).unwrap_or_default(),
+                    )
+                })
+            };
+            let artists_handle = {
+                let catalog = catalog.clone();
+                let roots = roots.to_vec();
+                scope.spawn(move || {
+                    perf::time(
+                        "startup.cached_artists",
+                        format!("roots={}", roots.len()),
+                        || Self::load_cached_artists(Some(&catalog), &roots).unwrap_or_default(),
+                    )
+                })
+            };
+            let albums_handle = {
+                let catalog = catalog.clone();
+                let roots = roots.to_vec();
+                scope.spawn(move || {
+                    perf::time(
+                        "startup.cached_albums",
+                        format!("roots={}", roots.len()),
+                        || Self::load_cached_albums(Some(&catalog), &roots).unwrap_or_default(),
+                    )
+                })
+            };
+
+            let tracks = tracks_handle.join().unwrap_or_default();
+            let artists = artists_handle.join().unwrap_or_default();
+            let albums = albums_handle.join().unwrap_or_default();
+            drop(parallel_span);
+            (tracks, artists, albums)
+        })
+    }
+
+    /// Rewrite the on-disk binary snapshot from SQLite on a background
+    /// thread. We re-query the catalog (rather than reusing the in-memory
+    /// browse vectors) so the snapshot stays bound to the canonical
+    /// `Catalog*` shape, and so we don't have to keep a parallel copy alive
+    /// in the UI struct. The work is fire-and-forget; failures are logged
+    /// via the `perf` channel and the next startup just falls back to
+    /// SQLite again.
+    pub(super) fn spawn_snapshot_rebuild(&self, reason: &'static str) {
+        let Some(catalog) = self.catalog.clone() else {
+            return;
+        };
+        let roots = self.library_roots.clone();
+        std::thread::Builder::new()
+            .name("tempo-snapshot".into())
+            .spawn(move || {
+                let _span = perf::span("snapshot.rebuild", format!("reason={reason}"));
+                let tracks = match catalog.load_tracks(&roots) {
+                    Ok(tracks) => tracks,
+                    Err(error) => {
+                        perf::event(
+                            "snapshot.rebuild.error",
+                            format!("stage=tracks error={error:#}"),
+                        );
+                        return;
+                    }
+                };
+                let artists = match catalog.load_artists(&roots) {
+                    Ok(artists) => artists,
+                    Err(error) => {
+                        perf::event(
+                            "snapshot.rebuild.error",
+                            format!("stage=artists error={error:#}"),
+                        );
+                        return;
+                    }
+                };
+                let albums = match catalog.load_albums(&roots) {
+                    Ok(albums) => albums,
+                    Err(error) => {
+                        perf::event(
+                            "snapshot.rebuild.error",
+                            format!("stage=albums error={error:#}"),
+                        );
+                        return;
+                    }
+                };
+                if let Err(error) =
+                    tempo::snapshot::save(catalog.cache_dir(), &roots, &tracks, &artists, &albums)
+                {
+                    perf::event(
+                        "snapshot.rebuild.error",
+                        format!("stage=save error={error:#}"),
+                    );
+                }
+            })
+            .ok();
+    }
+
     pub(super) fn reload_catalog_browse_data(&mut self) {
         let _span = perf::span("library.reload_catalog_browse_data", "");
         if let Ok(artists) = Self::load_cached_artists(self.catalog.as_ref(), &self.library_roots) {
@@ -475,7 +633,8 @@ impl TempoApp {
             }
             LibraryEvent::ScanFinished => {
                 let finish_start = Instant::now();
-                if self.scan_changed_tracks
+                let changed = self.scan_changed_tracks;
+                if changed
                     && self.catalog.is_some()
                     && let Ok(tracks) =
                         Self::load_cached_tracks(self.catalog.as_ref(), &self.library_roots)
@@ -485,7 +644,7 @@ impl TempoApp {
                     self.waveform_loading.clear();
                     self.invalidate_track_indices();
                 }
-                if self.scan_changed_tracks {
+                if changed {
                     self.reload_catalog_browse_data();
                 }
                 self.clamp_track_indices();
@@ -496,13 +655,16 @@ impl TempoApp {
                     finish_start.elapsed(),
                     format!(
                         "changed={} tracks={} artists={} albums={} errors={}",
-                        self.scan_changed_tracks,
+                        changed,
                         self.tracks.len(),
                         self.artists.len(),
                         self.albums.len(),
                         self.scan_progress.errors
                     ),
                 );
+                if changed {
+                    self.spawn_snapshot_rebuild("scan_finished");
+                }
             }
         }
     }

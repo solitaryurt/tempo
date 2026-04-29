@@ -901,28 +901,15 @@ impl TempoApp {
             Ok(catalog) => (Some(catalog), None),
             Err(error) => (None, Some(format!("Catalog cache unavailable: {error:#}"))),
         };
-        let cached_tracks = perf::time(
-            "startup.cached_tracks",
-            format!("roots={}", roots.len()),
-            || Self::load_cached_tracks(catalog.as_ref(), &roots).unwrap_or_default(),
-        );
+        let (cached_tracks, cached_artists, cached_albums) =
+            Self::load_browse_caches_for_startup(catalog.as_ref(), &roots);
         perf::event(
             "startup.cached_tracks.count",
             format!("tracks={}", cached_tracks.len()),
         );
-        let cached_artists = perf::time(
-            "startup.cached_artists",
-            format!("roots={}", roots.len()),
-            || Self::load_cached_artists(catalog.as_ref(), &roots).unwrap_or_default(),
-        );
         perf::event(
             "startup.cached_artists.count",
             format!("artists={}", cached_artists.len()),
-        );
-        let cached_albums = perf::time(
-            "startup.cached_albums",
-            format!("roots={}", roots.len()),
-            || Self::load_cached_albums(catalog.as_ref(), &roots).unwrap_or_default(),
         );
         perf::event(
             "startup.cached_albums.count",
@@ -940,17 +927,13 @@ impl TempoApp {
         let playlists = state.playlists;
         let volume = state.volume.clamp(0.0, 1.0);
         let visible_columns = Self::sanitize_visible_columns(state.visible_table_columns);
-        let (playback, playback_status) =
-            match perf::time_result("startup.playback_init", "", || {
-                PlaybackController::new(state.output_device.as_deref(), volume)
-            }) {
-                Ok(playback) => (Some(playback), "Audio output ready".to_string()),
-                Err(error) => (None, format!("Playback unavailable: {error:#}")),
-            };
-        let output_device = playback
-            .as_ref()
-            .map(|playback| playback.output_name().to_string())
-            .or(state.output_device);
+        // Playback init is deferred to a background task so it does not block
+        // the first frame; until it completes, `playback` is `None` (UI already
+        // tolerates this) and clicks that need playback fall through silently
+        // for the brief moment before init completes.
+        let playback: Option<PlaybackController> = None;
+        let playback_status = "Initializing audio output...".to_string();
+        let output_device = state.output_device.clone();
 
         let initial_page = if roots.is_empty() {
             Page::Settings
@@ -1100,6 +1083,21 @@ impl TempoApp {
         perf::time("startup.start_playback_tick", "", || {
             app.start_playback_tick(cx)
         });
+        perf::time("startup.start_deferred_playback_init", "", || {
+            app.start_deferred_playback_init(cx)
+        });
+        // If the snapshot didn't exist or was stale, build it now in the
+        // background so the next launch hits the fast path.
+        if !tempo::snapshot::snapshot_path(
+            app.catalog
+                .as_ref()
+                .map(|catalog| catalog.cache_dir())
+                .unwrap_or(std::path::Path::new("")),
+        )
+        .exists()
+        {
+            app.spawn_snapshot_rebuild("initial_build");
+        }
         app
     }
 

@@ -46,6 +46,42 @@ impl TempoApp {
             .into_any_element()
     }
 
+    /// Initialize playback off the main startup path. Output device
+    /// enumeration on cpal can take 25–50 ms, and rodio has to acquire the
+    /// stream lock; doing it eagerly delays the first frame for no UI
+    /// benefit (no track is playing yet). On systems without an audio
+    /// device, the failure surfaces in the status bar a moment later
+    /// instead of blocking the window.
+    pub(super) fn start_deferred_playback_init(&self, cx: &mut Context<Self>) {
+        let preferred_output = self.output_device.clone();
+        let volume = self.volume;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    perf::time_result("startup.playback_init_deferred", "", || {
+                        PlaybackController::new(preferred_output.as_deref(), volume)
+                    })
+                })
+                .await;
+
+            let _ = this.update(cx, |app, cx| match result {
+                Ok(playback) => {
+                    let device_label = playback.output_name().to_string();
+                    app.playback = Some(playback);
+                    app.output_device = Some(device_label);
+                    app.playback_status = "Audio output ready".to_string();
+                    cx.notify();
+                }
+                Err(error) => {
+                    app.playback_status = format!("Playback unavailable: {error:#}");
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn start_playback_tick(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
