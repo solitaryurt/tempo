@@ -230,6 +230,56 @@ pub(crate) struct PlayerEntity {
     /// hovers over the same track repeatedly during a slow disk.
     pub(super) waveform_loading: HashSet<PathBuf>,
 
+    // === Waveform morph animation ===
+    //
+    // When the active waveform buffer changes (loading shimmer →
+    // real peaks, real peaks A → real peaks B on track skip, etc.),
+    // we animate each column's height from its previous value to
+    // its new target over `WAVEFORM_MORPH_DURATION`. Without this,
+    // the bars snap instantaneously, which is jarring — especially
+    // on song change, where the seekbar visibly "pops" to a new
+    // shape mid-frame.
+    //
+    // The morph is driven entirely from the render path: we compare
+    // the buffer returned by `cached_waveform` to
+    // `waveform_displayed_buffer` from the previous render, and on
+    // mismatch, snapshot the previous heights as `waveform_morph_from`
+    // and stamp `waveform_morph_started`. Render then lerps from
+    // `morph_from` toward the new buffer, easing out, until
+    // `morph_started.elapsed() >= WAVEFORM_MORPH_DURATION` at which
+    // point it clears the morph state.
+    //
+    // Why store the *full-resolution* (360-bar) source even though
+    // the seekbar paints at variable widths: width-aware
+    // downsampling depends on the painted size and is recomputed
+    // each frame, so the morph has to interpolate the source
+    // buffers, not the post-downsample heights. (If we lerped
+    // post-downsample buffers, a window resize mid-morph would
+    // produce different bar counts on consecutive frames and the
+    // lerp would be undefined.)
+    /// Source buffer the seekbar last consumed from `cached_waveform`.
+    /// Compared (via `Arc::ptr_eq`) against the buffer returned this
+    /// frame: a mismatch means the active waveform changed and the
+    /// morph should restart toward the new target. The loading-
+    /// shimmer generator returns a fresh `Arc` every call, which
+    /// is exactly what we want — ptr_eq stays false so the morph
+    /// retargets each shimmer frame in tiny increments (visually
+    /// just the existing shimmer; the morph is short relative to
+    /// the shimmer's amplitude so it doesn't fight it).
+    pub(super) waveform_displayed_source: Option<Arc<[f32]>>,
+    /// Per-bar heights actually *painted* on the previous frame
+    /// (after lerp). When the source changes mid-morph, these are
+    /// snapshotted into `waveform_morph_from` so the new morph
+    /// starts from the user's current visual state — not from the
+    /// previous *target*, which would cause a visible snap.
+    pub(super) waveform_displayed_heights: Option<Arc<[f32]>>,
+    /// Heights at the start of the current morph (per-bar, length
+    /// = `WAVEFORM_SEGMENTS`). `None` when no morph is active.
+    pub(super) waveform_morph_from: Option<Arc<[f32]>>,
+    /// When the current morph started; combined with
+    /// `WAVEFORM_MORPH_DURATION` to compute progress each frame.
+    pub(super) waveform_morph_started: Option<Instant>,
+
     // === Catalog (for waveform cache I/O and play-count increments) ===
     /// Cloned from `TempoApp` at construction. `CatalogStore` is
     /// `Arc`-backed (per Phase 1.1) so cloning is a refcount bump;
@@ -367,6 +417,10 @@ impl PlayerEntity {
             alt_pressed: false,
             waveform_cache: HashMap::new(),
             waveform_loading: HashSet::new(),
+            waveform_displayed_source: None,
+            waveform_displayed_heights: None,
+            waveform_morph_from: None,
+            waveform_morph_started: None,
             catalog,
             playing_track: None,
             theme_colors,
@@ -520,6 +574,10 @@ impl PlayerEntity {
         self.playing_track_path = None;
         self.waveform_cache.clear();
         self.waveform_loading.clear();
+        self.waveform_displayed_source = None;
+        self.waveform_displayed_heights = None;
+        self.waveform_morph_from = None;
+        self.waveform_morph_started = None;
         if was_playing {
             cx.emit(PlayerEvent::IsPlayingChanged(false));
         }
@@ -1165,6 +1223,138 @@ impl PlayerEntity {
     pub(crate) fn clear_waveform_cache(&mut self) {
         self.waveform_cache.clear();
         self.waveform_loading.clear();
+        // Cancel any in-flight morph; the new track will start its
+        // own morph from the loading shimmer once render runs again.
+        self.waveform_displayed_source = None;
+        self.waveform_displayed_heights = None;
+        self.waveform_morph_from = None;
+        self.waveform_morph_started = None;
+    }
+
+    /// Resolve the heights to *paint* this frame, given the source
+    /// buffer the cache returned. Drives the morph state machine:
+    ///
+    /// - If `source` is the same `Arc` as last frame and no morph
+    ///   is in progress, return `source` directly (zero-copy).
+    /// - If `source` differs from the last-painted source (track
+    ///   changed, or the loading shimmer's per-frame `Arc` changed,
+    ///   or the cache filled in real peaks), snapshot the heights
+    ///   we last *painted* (so the user sees a smooth continuation
+    ///   of their current visual state) and start a new morph
+    ///   toward the new source.
+    /// - While a morph is in progress, lerp from `morph_from` to
+    ///   `source` per-bar with an ease-out curve. Once the morph
+    ///   duration elapses, clear the morph state and return
+    ///   `source` directly.
+    ///
+    /// Returns the heights to paint, plus a flag indicating whether
+    /// a morph is still active (caller should keep `with_animation`
+    /// wrapping the bars row to drive repaints until the morph
+    /// finishes).
+    ///
+    /// # Buffer-length contract
+    ///
+    /// `source` and any stored morph state always have length
+    /// `WAVEFORM_SEGMENTS`; the lerp assumes parity. Width-aware
+    /// downsampling happens *after* the morph (in render), so the
+    /// returned slice is always 360 floats.
+    pub(super) fn resolve_waveform_heights(
+        &mut self,
+        source: Arc<[f32]>,
+        loading: bool,
+    ) -> (Arc<[f32]>, bool) {
+        // While loading, the shimmer is *itself* the animation —
+        // every frame `cached_waveform` returns a fresh `Arc` with
+        // updated heights from the wall-clock phase. Trying to morph
+        // between consecutive shimmer frames would freeze the bars
+        // (we'd always be lerping `t≈0` back toward the previous
+        // frame's heights). Just paint the shimmer source directly,
+        // and remember it so the *exit* from loading (real peaks
+        // arriving) triggers a morph from the user's most recent
+        // shimmer state, not from blank.
+        if loading {
+            self.waveform_morph_from = None;
+            self.waveform_morph_started = None;
+            self.waveform_displayed_source = Some(Arc::clone(&source));
+            self.waveform_displayed_heights = Some(Arc::clone(&source));
+            return (source, false);
+        }
+
+        let source_changed = self
+            .waveform_displayed_source
+            .as_ref()
+            .is_none_or(|prev| !Arc::ptr_eq(prev, &source));
+
+        if source_changed {
+            // The "from" is the heights we *painted last frame* —
+            // not the previous source. If a morph was already in
+            // progress, that's the lerp midpoint; if not, it's the
+            // previous source itself. Either way, the user's eye
+            // sees one continuous curve.
+            //
+            // First-paint case (`displayed_heights == None`): no
+            // visual continuity to preserve, so skip the morph and
+            // jump straight to the new source. Otherwise the very
+            // first frame after app launch would morph from
+            // height-zero to the target, which reads as a one-time
+            // grow-in animation that doesn't match the user's
+            // mental model ("the seekbar just appeared, with these
+            // heights").
+            if let Some(prev_heights) = self.waveform_displayed_heights.clone() {
+                self.waveform_morph_from = Some(prev_heights);
+                self.waveform_morph_started = Some(Instant::now());
+            } else {
+                self.waveform_morph_from = None;
+                self.waveform_morph_started = None;
+            }
+            self.waveform_displayed_source = Some(Arc::clone(&source));
+        }
+
+        let morph_done = match (self.waveform_morph_started, &self.waveform_morph_from) {
+            (Some(started), Some(_)) => started.elapsed() >= WAVEFORM_MORPH_DURATION,
+            _ => true,
+        };
+
+        if morph_done {
+            self.waveform_morph_from = None;
+            self.waveform_morph_started = None;
+            self.waveform_displayed_heights = Some(Arc::clone(&source));
+            return (source, false);
+        }
+
+        // Active morph: lerp per-bar with cubic ease-out so the
+        // motion accelerates fast and settles gently. `t` is in
+        // `[0, 1)`; cubic ease-out is `1 - (1 - t)^3`.
+        let from = self
+            .waveform_morph_from
+            .as_ref()
+            .expect("morph_from set when morph_started is set");
+        let started = self
+            .waveform_morph_started
+            .expect("morph_started set when morph_from is set");
+        let raw_t = started.elapsed().as_secs_f32() / WAVEFORM_MORPH_DURATION.as_secs_f32();
+        let t = raw_t.clamp(0.0, 1.0);
+        let eased = 1.0 - (1.0 - t).powi(3);
+
+        // Length mismatch is unexpected (both are
+        // `WAVEFORM_SEGMENTS`-sized) but defend against it: if
+        // `from` is shorter, just paint the target (no lerp) for
+        // the trailing bars.
+        let n = source.len();
+        let from_len = from.len();
+        let lerped: Arc<[f32]> = (0..n)
+            .map(|ix| {
+                if ix < from_len {
+                    from[ix] + (source[ix] - from[ix]) * eased
+                } else {
+                    source[ix]
+                }
+            })
+            .collect::<Vec<f32>>()
+            .into();
+
+        self.waveform_displayed_heights = Some(Arc::clone(&lerped));
+        (lerped, true)
     }
 }
 
@@ -1372,19 +1562,45 @@ fn generate_fallback_waveform(track: &WaveformSource) -> Vec<f32> {
 }
 
 pub(super) fn generate_loading_waveform(phase: f32) -> Vec<f32> {
+    // `phase` is expected to be a small, bounded radian value
+    // (see `waveform_loading_phase`). The two sinusoids combine
+    // into a travelling wave so the *whole* seekbar visibly moves;
+    // earlier versions kept the per-bar position scaled small
+    // enough that aliasing in `sin()` (when `phase` was the raw
+    // unbounded wall-clock millis / 90) collapsed everything past
+    // the first column into incoherent noise. Coherence here
+    // matters because the user reads the shimmer as "loading,
+    // working" — frozen bars read as "stuck".
     (0..WAVEFORM_SEGMENTS)
         .map(|ix| {
-            let position = ix as f32 / 12.0;
+            // 2.5 full wavelengths across the seekbar, sweeping
+            // left → right at one cycle per `phase += 2π`.
+            let position = ix as f32 / WAVEFORM_SEGMENTS as f32 * std::f32::consts::TAU * 2.5;
             let sweep = ((position - phase).sin() + 1.0) * 0.5;
-            let ripple = ((position * 0.35 + phase * 0.6).sin() + 1.0) * 0.5;
+            // Faster, finer ripple riding on top so individual
+            // bars wiggle even when they're near the trough of
+            // the main sweep.
+            let ripple = ((position * 1.7 + phase * 1.6).sin() + 1.0) * 0.5;
             (10.0 + (sweep * 0.7 + ripple * 0.3) * 42.0).round()
         })
         .collect()
 }
 
 pub(super) fn waveform_loading_phase() -> f32 {
-    SystemTime::now()
+    // One full sweep every ~1.2s. The modulo keeps the phase
+    // bounded in `[0, 2π)` regardless of how long the process
+    // has been running — without it, `now_millis as f32 / 200.0`
+    // grows to ~1e10 and wrecks `sin()` precision (every bar past
+    // the first ends up snapping to a near-constant value because
+    // floats can't represent the fractional radians distinct from
+    // the integer-multiple-of-π part). Bounding the phase here
+    // means `generate_loading_waveform` always sees a small,
+    // well-conditioned angle.
+    let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as f32 / 90.0)
-        .unwrap_or_default()
+        .map(|duration| duration.as_millis() as f64)
+        .unwrap_or_default();
+    let cycle_ms = 1200.0_f64;
+    let normalized = (millis % cycle_ms) / cycle_ms;
+    (normalized as f32) * std::f32::consts::TAU
 }

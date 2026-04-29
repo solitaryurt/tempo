@@ -910,6 +910,10 @@ const WAVEFORM_CACHE_VERSION: u32 = 1;
 const WAVEFORM_SAMPLED_MIN_DURATION: Duration = Duration::from_secs(30);
 const WAVEFORM_MIN_SAMPLE_FRAMES: usize = 256;
 const WAVEFORM_MAX_SAMPLE_FRAMES: usize = 2048;
+/// How long the per-column morph animation runs when the active
+/// waveform changes (loading shimmer → loaded peaks, or song A →
+/// song B). 400ms ease-out reads as snappy without dragging.
+const WAVEFORM_MORPH_DURATION: Duration = Duration::from_millis(400);
 const PLAYER_VOLUME_BAR_W: f32 = 104.0;
 const TABLE_SCROLLBAR_W: f32 = 54.0;
 const TABLE_SCROLLBAR_TRACK_W: f32 = 6.0;

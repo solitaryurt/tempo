@@ -49,7 +49,15 @@ impl Render for PlayerEntity {
         };
 
         let path = snapshot.path.clone();
-        let (waveform, waveform_loading) = self.cached_waveform_for_path(&path, cx);
+        let (waveform_source, waveform_loading) = self.cached_waveform_for_path(&path, cx);
+        // Drive the per-column morph: when the cache hands us a
+        // different `Arc` than last frame (track changed, shimmer
+        // → real peaks, etc.), this lerps from the heights we
+        // *painted* last frame toward the new source over
+        // `WAVEFORM_MORPH_DURATION`. While `morph_active` is true,
+        // the bars row needs `with_animation` to keep repainting.
+        let (waveform, morph_active) =
+            self.resolve_waveform_heights(waveform_source, waveform_loading);
         let playback_position = self.playback_position().min(snapshot.duration_value);
         let is_playing = self.is_playing;
         let now_playing_info_hovered = self.now_playing_info_hovered;
@@ -342,6 +350,7 @@ impl Render for PlayerEntity {
                 playback_progress,
                 waveform,
                 waveform_loading,
+                morph_active,
                 colors,
                 self.waveform_seekbar_scroll_handle.clone(),
                 cx,
@@ -598,6 +607,7 @@ fn waveform_seekbar(
     progress: f32,
     waveform: Arc<[f32]>,
     loading: bool,
+    morph_active: bool,
     colors: ThemeColors,
     waveform_handle: gpui::ScrollHandle,
     cx: &mut Context<PlayerEntity>,
@@ -650,30 +660,39 @@ fn waveform_seekbar(
                 }),
         );
 
-    // When loading, wrap the bar row in `with_animation` so the
-    // shimmer phase advances *without* the player having to call
-    // `window.request_animation_frame()`. The animation auto-stops
-    // when `loading` flips false on the next render.
+    // Wrap the bars row in `with_animation` whenever something is
+    // moving — either the loading shimmer (heights regenerated each
+    // frame from a wall-clock phase inside `cached_waveform`) or
+    // the per-column morph (heights lerped each frame inside
+    // `resolve_waveform_heights`). The animation's only job is to
+    // force a fresh paint at the window's refresh rate; the actual
+    // visual change is computed in the entity, not in this closure.
     //
     // Phase 3 #17: this replaces the lone direct
     // `request_animation_frame` call in the codebase. Future
     // animation needs in this entity should follow the same
     // `with_animation` idiom.
+    //
+    // The animation IDs are distinct so that switching between
+    // "loading" and "morphing" mid-animation doesn't reset the
+    // wall-clock used by the shimmer. The looped 1500ms / 400ms
+    // periods are arbitrary — the closure is a no-op so the period
+    // only affects how often the animation system re-evaluates
+    // (and therefore repaints).
     let bars_row: AnyElement = if loading {
         bars_row
             .with_animation(
                 "waveform-loading-shimmer",
                 Animation::new(Duration::from_millis(1500)).repeat(),
-                |this, _delta| {
-                    // The shimmer's visible component is the per-bar
-                    // height/color, which is recomputed inside
-                    // `cached_waveform`'s synthetic generator using
-                    // the wall-clock phase. The animation here just
-                    // ensures we get a fresh paint pass at the
-                    // window's refresh rate; no inline transform is
-                    // needed.
-                    this
-                },
+                |this, _delta| this,
+            )
+            .into_any_element()
+    } else if morph_active {
+        bars_row
+            .with_animation(
+                "waveform-morph",
+                Animation::new(WAVEFORM_MORPH_DURATION),
+                |this, _delta| this,
             )
             .into_any_element()
     } else {
