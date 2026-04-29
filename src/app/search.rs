@@ -80,9 +80,16 @@ impl TempoApp {
                     .artist
                     .cmp(&right.artist)
                     .then(left.title.cmp(&right.title)),
+                SortColumn::AlbumByArtist => left
+                    .artist
+                    .cmp(&right.artist)
+                    .then(left.album.cmp(&right.album))
+                    .then(left.track_number.cmp(&right.track_number))
+                    .then(left.title.cmp(&right.title)),
                 SortColumn::Album => left
                     .album
                     .cmp(&right.album)
+                    .then(left.track_number.cmp(&right.track_number))
                     .then(left.title.cmp(&right.title)),
                 SortColumn::TrackNumber => left
                     .track_number
@@ -124,6 +131,7 @@ impl TempoApp {
         match sort_column {
             SortColumn::Title
             | SortColumn::Artist
+            | SortColumn::AlbumByArtist
             | SortColumn::Album
             | SortColumn::Format
             | SortColumn::Year => self.compute_grouped_scrollbar_markers(indices, sort_column),
@@ -153,6 +161,7 @@ impl TempoApp {
             let label = match sort_column {
                 SortColumn::Title => Self::marker_initial(&track.title),
                 SortColumn::Artist => Self::marker_initial(&track.artist),
+                SortColumn::AlbumByArtist => Self::marker_initial(&track.artist),
                 SortColumn::Album => Self::marker_initial(&track.album),
                 SortColumn::Format => track.codec.to_ascii_uppercase(),
                 SortColumn::Year => Self::marker_initial(&track.year),
@@ -234,6 +243,7 @@ impl TempoApp {
             SortColumn::Index => format!("{}", track_ix + 1),
             SortColumn::Title => Self::marker_initial(&track.title),
             SortColumn::Artist => Self::marker_initial(&track.artist),
+            SortColumn::AlbumByArtist => Self::marker_initial(&track.artist),
             SortColumn::Album => Self::marker_initial(&track.album),
             SortColumn::TrackNumber => track
                 .track_number
@@ -386,7 +396,7 @@ impl TempoApp {
                             cx.notify();
                         }
                     }
-                    Page::ScanErrors | Page::Settings => {}
+                    Page::PlaybackHistory | Page::ScanErrors | Page::Settings => {}
                 }
             }) else {
                 return;

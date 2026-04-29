@@ -52,6 +52,18 @@ impl TempoApp {
             output_device: self.output_device.clone(),
             volume: self.volume,
             visible_table_columns: self.visible_columns.clone(),
+            page: self.page,
+            tabs: self.saved_tabs(),
+            active_tab_id: self.tabs.get(self.active_tab).map(|tab| tab.id),
+            artist_view_mode: self.artist_view_mode,
+            album_view_mode: self.album_view_mode,
+            artist_grid_scroll_top: Self::uniform_list_scroll_top(&self.artist_grid_scroll_handle),
+            artist_table_scroll_top: Self::uniform_list_scroll_top(
+                &self.artist_table_scroll_handle,
+            ),
+            album_grid_scroll_top: Self::uniform_list_scroll_top(&self.album_grid_scroll_handle),
+            album_table_scroll_top: Self::uniform_list_scroll_top(&self.album_table_scroll_handle),
+            playback_history: self.playback_history.clone(),
         };
 
         let Some(parent) = path.parent() else {
@@ -63,6 +75,35 @@ impl TempoApp {
         {
             let _ = fs::write(path, contents);
         }
+    }
+
+    pub(super) fn saved_tabs(&self) -> Vec<SavedBrowseTab> {
+        self.tabs
+            .iter()
+            .map(|tab| {
+                let base_handle = tab.table_scroll_handle.0.borrow().base_handle.clone();
+                let has_rendered = f32::from(base_handle.bounds().size.height) > 0.0;
+                let scroll_top = if has_rendered {
+                    (-f32::from(base_handle.offset().y)).max(0.0)
+                } else {
+                    tab.table_scroll_top.max(0.0)
+                };
+                SavedBrowseTab {
+                    id: tab.id,
+                    source: tab.source,
+                    search_query: tab.search_query.clone(),
+                    sort_column: tab.sort_column,
+                    sort_direction: tab.sort_direction,
+                    selected_track: tab.selected_track,
+                    table_scroll_top: scroll_top,
+                    table_horizontal_scroll: tab.table_horizontal_scroll,
+                }
+            })
+            .collect()
+    }
+
+    pub(super) fn uniform_list_scroll_top(handle: &UniformListScrollHandle) -> f32 {
+        (-f32::from(handle.0.borrow().base_handle.offset().y)).max(0.0)
     }
 
     pub(super) fn library_root_label(roots: &[PathBuf]) -> String {

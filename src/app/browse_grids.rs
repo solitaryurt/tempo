@@ -1,11 +1,5 @@
 use super::*;
 
-#[derive(Clone, Copy)]
-struct BrowseTableColumn {
-    title: &'static str,
-    width: Option<f32>,
-}
-
 impl TempoApp {
     pub(super) fn render_detail_hero(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         match self.active_tab().source {
@@ -94,7 +88,7 @@ impl TempoApp {
                                     .text_color(rgb(colors.text_faint))
                                     .child("ALBUMS"),
                             )
-                            .child(self.render_artist_album_grid(&albums, cx)),
+                            .child(self.render_artist_album_strip(&albums, cx)),
                     )
                 })
                 .into_any_element(),
@@ -485,22 +479,10 @@ impl TempoApp {
             },
             artist_indices,
             &[
-                BrowseTableColumn {
-                    title: "",
-                    width: Some(42.0),
-                },
-                BrowseTableColumn {
-                    title: "Artist",
-                    width: None,
-                },
-                BrowseTableColumn {
-                    title: "Albums",
-                    width: Some(92.0),
-                },
-                BrowseTableColumn {
-                    title: "Tracks",
-                    width: Some(92.0),
-                },
+                ColumnResizeTarget::Artist(ArtistTableColumn::Artwork),
+                ColumnResizeTarget::Artist(ArtistTableColumn::Artist),
+                ColumnResizeTarget::Artist(ArtistTableColumn::Albums),
+                ColumnResizeTarget::Artist(ArtistTableColumn::Tracks),
             ],
             Self::render_artist_row,
             cx,
@@ -525,26 +507,11 @@ impl TempoApp {
             },
             album_indices,
             &[
-                BrowseTableColumn {
-                    title: "",
-                    width: Some(42.0),
-                },
-                BrowseTableColumn {
-                    title: "Album",
-                    width: None,
-                },
-                BrowseTableColumn {
-                    title: "Artist",
-                    width: Some(220.0),
-                },
-                BrowseTableColumn {
-                    title: "Year",
-                    width: Some(90.0),
-                },
-                BrowseTableColumn {
-                    title: "Tracks",
-                    width: Some(92.0),
-                },
+                ColumnResizeTarget::Album(AlbumTableColumn::Artwork),
+                ColumnResizeTarget::Album(AlbumTableColumn::Album),
+                ColumnResizeTarget::Album(AlbumTableColumn::Artist),
+                ColumnResizeTarget::Album(AlbumTableColumn::Year),
+                ColumnResizeTarget::Album(AlbumTableColumn::Tracks),
             ],
             Self::render_album_row,
             cx,
@@ -560,7 +527,7 @@ impl TempoApp {
         empty_title: &'static str,
         empty_body: &'static str,
         row_indices: Vec<usize>,
-        columns: &'static [BrowseTableColumn],
+        columns: &'static [ColumnResizeTarget],
         render_row: fn(&Self, usize, usize, &mut Context<Self>) -> Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -577,7 +544,7 @@ impl TempoApp {
             .flex_col()
             .border_t_1()
             .border_color(rgb(colors.border))
-            .child(self.render_browse_table_header(columns))
+            .child(self.render_resizable_table_header(34.0, columns, cx))
             .when(row_count == 0, |this| {
                 this.child(
                     div()
@@ -1049,28 +1016,6 @@ impl TempoApp {
         }
     }
 
-    fn render_browse_table_header(&self, columns: &[BrowseTableColumn]) -> AnyElement {
-        let colors = *self.colors();
-
-        div()
-            .h(px(34.0))
-            .flex_none()
-            .px_4()
-            .flex()
-            .items_center()
-            .gap_3()
-            .border_b_1()
-            .border_color(rgb(colors.border))
-            .text_xs()
-            .text_color(rgb(colors.text_faint))
-            .children(
-                columns
-                    .iter()
-                    .map(|column| Self::render_browse_table_cell(column.width, column.title)),
-            )
-            .into_any_element()
-    }
-
     fn render_artist_row(
         &self,
         row_ix: usize,
@@ -1101,15 +1046,21 @@ impl TempoApp {
             .bg(rgb(bg))
             .cursor_pointer()
             .hover(move |this| this.bg(rgb(colors.hover)))
-            .child(self.row_image(
-                SharedString::from(format!("artist-row-image-{}", artist.artist_id)),
-                artist.photo_path.as_ref(),
-                artist.initials.clone(),
-                artist.color,
-            ))
             .child(
                 div()
-                    .flex_1()
+                    .w(px(
+                        self.artist_table_column_width(ArtistTableColumn::Artwork)
+                    ))
+                    .child(self.row_image(
+                        SharedString::from(format!("artist-row-image-{}", artist.artist_id)),
+                        artist.photo_path.as_ref(),
+                        artist.initials.clone(),
+                        artist.color,
+                    )),
+            )
+            .child(
+                div()
+                    .w(px(self.artist_table_column_width(ArtistTableColumn::Artist)))
                     .min_w_0()
                     .flex()
                     .flex_col()
@@ -1133,13 +1084,13 @@ impl TempoApp {
             )
             .child(
                 div()
-                    .w(px(92.0))
+                    .w(px(self.artist_table_column_width(ArtistTableColumn::Albums)))
                     .text_color(rgb(colors.text_muted))
                     .child(artist.album_count.to_string()),
             )
             .child(
                 div()
-                    .w(px(92.0))
+                    .w(px(self.artist_table_column_width(ArtistTableColumn::Tracks)))
                     .text_color(rgb(colors.text_muted))
                     .child(artist.track_count.to_string()),
             )
@@ -1181,18 +1132,22 @@ impl TempoApp {
             .bg(rgb(bg))
             .cursor_pointer()
             .hover(move |this| this.bg(rgb(colors.hover)))
-            .child(self.row_image(
-                SharedString::from(format!(
-                    "album-row-image-{}-{}",
-                    album.artist_id, album.album_id
-                )),
-                album.artwork_path.as_ref(),
-                album.initials.clone(),
-                album.color,
-            ))
             .child(
                 div()
-                    .flex_1()
+                    .w(px(self.album_table_column_width(AlbumTableColumn::Artwork)))
+                    .child(self.row_image(
+                        SharedString::from(format!(
+                            "album-row-image-{}-{}",
+                            album.artist_id, album.album_id
+                        )),
+                        album.artwork_path.as_ref(),
+                        album.initials.clone(),
+                        album.color,
+                    )),
+            )
+            .child(
+                div()
+                    .w(px(self.album_table_column_width(AlbumTableColumn::Album)))
                     .min_w_0()
                     .text_color(rgb(colors.text_strong))
                     .overflow_hidden()
@@ -1201,7 +1156,7 @@ impl TempoApp {
             )
             .child(
                 div()
-                    .w(px(220.0))
+                    .w(px(self.album_table_column_width(AlbumTableColumn::Artist)))
                     .min_w_0()
                     .text_color(rgb(colors.text_muted))
                     .overflow_hidden()
@@ -1210,13 +1165,13 @@ impl TempoApp {
             )
             .child(
                 div()
-                    .w(px(90.0))
+                    .w(px(self.album_table_column_width(AlbumTableColumn::Year)))
                     .text_color(rgb(colors.text_muted))
                     .child(album.year.clone().unwrap_or_else(|| "Unknown".to_string())),
             )
             .child(
                 div()
-                    .w(px(92.0))
+                    .w(px(self.album_table_column_width(AlbumTableColumn::Tracks)))
                     .text_color(rgb(colors.text_muted))
                     .child(album.track_count.to_string()),
             )
@@ -1226,14 +1181,6 @@ impl TempoApp {
             }))
             .into_any_element()
             .into()
-    }
-
-    fn render_browse_table_cell(width: Option<f32>, child: impl IntoElement) -> AnyElement {
-        let cell = div().min_w_0().overflow_hidden().text_ellipsis();
-        match width {
-            Some(width) => cell.w(px(width)).child(child).into_any_element(),
-            None => cell.flex_1().child(child).into_any_element(),
-        }
     }
 
     fn render_artist_card(&self, artist: &Artist, cx: &mut Context<Self>) -> AnyElement {
@@ -1246,6 +1193,7 @@ impl TempoApp {
                 artist.artist_id
             )))
             .w(px(154.0))
+            .flex_none()
             .rounded_lg()
             .border_1()
             .border_color(rgb(colors.border))
@@ -1315,6 +1263,7 @@ impl TempoApp {
                 album.artist_id, album.album_id
             )))
             .w(px(154.0))
+            .flex_none()
             .rounded_lg()
             .border_1()
             .border_color(rgb(colors.border))
@@ -1375,26 +1324,18 @@ impl TempoApp {
             .into_any_element()
     }
 
-    fn render_artist_album_grid(&self, albums: &[&Album], cx: &mut Context<Self>) -> AnyElement {
-        let rows = albums
-            .chunks(4)
-            .enumerate()
-            .map(|(row_ix, row)| {
+    fn render_artist_album_strip(&self, albums: &[&Album], cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("artist-album-hero-strip")
+            .w_full()
+            .overflow_x_scroll()
+            .child(
                 div()
-                    .id(SharedString::from(format!(
-                        "artist-album-hero-row-{row_ix}"
-                    )))
                     .flex()
                     .gap_3()
-                    .children(row.iter().map(|album| self.render_album_card(album, cx)))
-            })
-            .collect::<Vec<_>>();
-
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .children(rows)
+                    .pb_2()
+                    .children(albums.iter().map(|album| self.render_album_card(album, cx))),
+            )
             .into_any_element()
     }
 

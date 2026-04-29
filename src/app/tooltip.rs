@@ -100,6 +100,28 @@ impl TempoApp {
         }
     }
 
+    pub(super) fn show_tooltip_now(
+        &mut self,
+        id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let id = id.into();
+        self.tooltip_generation = self.tooltip_generation.wrapping_add(1);
+        self.hovered_tooltip_id = Some(id.clone());
+        self.tooltip = Some(Tooltip {
+            id,
+            label: label.into(),
+            position,
+        });
+        cx.notify();
+    }
+
+    pub(super) fn hide_tooltip_now(&mut self, id: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.hide_tooltip(&id.into(), cx);
+    }
+
     pub(super) fn render_tooltip(&self, tooltip: &Tooltip) -> impl IntoElement + use<> {
         let colors = *self.colors();
 

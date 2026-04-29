@@ -8,11 +8,11 @@ use std::{
 
 use gpui::{
     Animation, AnimationExt as _, AnyElement, ClickEvent, ClipboardItem, Context, Corner,
-    CursorStyle, FocusHandle, Image, ImageFormat, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, ObjectFit, ParentElement,
-    PathPromptOptions, Pixels, Point, Render, ScrollStrategy, ScrollWheelEvent, SharedString,
-    Styled, UniformListScrollHandle, Window, anchored, div, img, point, prelude::*, px, rgb,
-    uniform_list,
+    CursorStyle, FocusHandle, Image, ImageFormat, IntoElement, KeyDownEvent, ModifiersChangedEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, ObjectFit,
+    ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollStrategy, ScrollWheelEvent,
+    SharedString, Styled, Subscription, UniformListScrollHandle, Window, anchored, div, img, point,
+    prelude::*, px, rgb, uniform_list,
 };
 use rodio::{Decoder, Source as _};
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,7 @@ use tempo::{
 
 mod artwork;
 mod browse_grids;
+mod history;
 mod library_state;
 mod library_view;
 mod menu;
@@ -49,26 +50,28 @@ use crate::{
 use text_input::TextInputState;
 use theme::{Theme, ThemeColors, bundled_themes, default_theme_id, resolve_theme_id};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Page {
     Library,
     Artists,
     Albums,
+    PlaybackHistory,
     ScanErrors,
     Settings,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum BrowseViewMode {
     Grid,
     Table,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum SortColumn {
     Index,
     Title,
     Artist,
+    AlbumByArtist,
     Album,
     TrackNumber,
     Format,
@@ -98,7 +101,7 @@ enum TableColumn {
     Loved,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum SortDirection {
     Ascending,
     Descending,
@@ -115,6 +118,13 @@ enum PlaybackMode {
 enum OutputMenuSource {
     Player,
     Settings,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NowPlayingLink {
+    Title,
+    Artist,
+    Album,
 }
 
 #[derive(Clone, Copy)]
@@ -157,8 +167,98 @@ impl Default for ColumnWidths {
 }
 
 #[derive(Clone, Copy)]
+struct ArtistTableColumnWidths {
+    artwork: f32,
+    artist: f32,
+    albums: f32,
+    tracks: f32,
+}
+
+impl Default for ArtistTableColumnWidths {
+    fn default() -> Self {
+        Self {
+            artwork: 42.0,
+            artist: 360.0,
+            albums: 92.0,
+            tracks: 92.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AlbumTableColumnWidths {
+    artwork: f32,
+    album: f32,
+    artist: f32,
+    year: f32,
+    tracks: f32,
+}
+
+impl Default for AlbumTableColumnWidths {
+    fn default() -> Self {
+        Self {
+            artwork: 42.0,
+            album: 260.0,
+            artist: 220.0,
+            year: 90.0,
+            tracks: 92.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ScanErrorColumnWidths {
+    index: f32,
+    path: f32,
+    error: f32,
+}
+
+impl Default for ScanErrorColumnWidths {
+    fn default() -> Self {
+        Self {
+            index: 52.0,
+            path: 420.0,
+            error: 420.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArtistTableColumn {
+    Artwork,
+    Artist,
+    Albums,
+    Tracks,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AlbumTableColumn {
+    Artwork,
+    Album,
+    Artist,
+    Year,
+    Tracks,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScanErrorColumn {
+    Index,
+    Path,
+    Error,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColumnResizeTarget {
+    Track(TableColumn),
+    Artist(ArtistTableColumn),
+    Album(AlbumTableColumn),
+    ScanError(ScanErrorColumn),
+    PlaybackHistoryPlayedAt,
+}
+
+#[derive(Clone, Copy)]
 struct ColumnResize {
-    column: TableColumn,
+    target: ColumnResizeTarget,
     start_x: f32,
     start_width: f32,
 }
@@ -360,7 +460,17 @@ struct Playlist {
     track_paths: Vec<PathBuf>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize)]
+struct PlaybackHistoryEntry {
+    played_at_unix_secs: u64,
+    track_path: PathBuf,
+    title: String,
+    artist: String,
+    album: String,
+    duration: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum TabSource {
     Library,
     Playlist(usize),
@@ -388,6 +498,9 @@ struct BrowseTab {
     sort_column: SortColumn,
     sort_direction: SortDirection,
     selected_track: usize,
+    table_scroll_top: f32,
+    restore_table_scroll_top: Option<f32>,
+    table_horizontal_scroll: f32,
     table_scroll_handle: UniformListScrollHandle,
     track_indices: Vec<usize>,
     scrollbar_markers: Vec<ScrollbarMarker>,
@@ -403,6 +516,12 @@ struct ScrollbarMarker {
 struct TableScrollbarDrag {
     thumb_offset: f32,
     start_offset: Point<Pixels>,
+}
+
+#[derive(Clone, Copy)]
+struct TableHorizontalScrollbarDrag {
+    thumb_offset: f32,
+    start_scroll: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -430,6 +549,15 @@ struct TableScrollbarMetrics {
     scroll_top: f32,
 }
 
+#[derive(Clone, Copy)]
+struct TableHorizontalScrollbarMetrics {
+    track_left: f32,
+    track_width: f32,
+    thumb_left: f32,
+    thumb_width: f32,
+    max_scroll: f32,
+}
+
 impl BrowseTab {
     fn library(id: u64) -> Self {
         Self {
@@ -439,6 +567,9 @@ impl BrowseTab {
             sort_column: SortColumn::Index,
             sort_direction: SortDirection::Ascending,
             selected_track: 0,
+            table_scroll_top: 0.0,
+            restore_table_scroll_top: None,
+            table_horizontal_scroll: 0.0,
             table_scroll_handle: UniformListScrollHandle::new(),
             track_indices: Vec::new(),
             scrollbar_markers: Vec::new(),
@@ -453,6 +584,9 @@ impl BrowseTab {
             sort_column: SortColumn::Index,
             sort_direction: SortDirection::Ascending,
             selected_track: 0,
+            table_scroll_top: 0.0,
+            restore_table_scroll_top: None,
+            table_horizontal_scroll: 0.0,
             table_scroll_handle: UniformListScrollHandle::new(),
             track_indices: Vec::new(),
             scrollbar_markers: Vec::new(),
@@ -467,6 +601,9 @@ impl BrowseTab {
             sort_column: SortColumn::Album,
             sort_direction: SortDirection::Ascending,
             selected_track: 0,
+            table_scroll_top: 0.0,
+            restore_table_scroll_top: None,
+            table_horizontal_scroll: 0.0,
             table_scroll_handle: UniformListScrollHandle::new(),
             track_indices: Vec::new(),
             scrollbar_markers: Vec::new(),
@@ -481,6 +618,9 @@ impl BrowseTab {
             sort_column: SortColumn::Index,
             sort_direction: SortDirection::Ascending,
             selected_track: 0,
+            table_scroll_top: 0.0,
+            restore_table_scroll_top: None,
+            table_horizontal_scroll: 0.0,
             table_scroll_handle: UniformListScrollHandle::new(),
             track_indices: Vec::new(),
             scrollbar_markers: Vec::new(),
@@ -502,6 +642,44 @@ struct AppState {
     volume: f32,
     #[serde(default = "default_visible_table_columns")]
     visible_table_columns: Vec<TableColumn>,
+    #[serde(default = "default_page")]
+    page: Page,
+    #[serde(default)]
+    tabs: Vec<SavedBrowseTab>,
+    #[serde(default)]
+    active_tab_id: Option<u64>,
+    #[serde(default = "default_browse_view_mode")]
+    artist_view_mode: BrowseViewMode,
+    #[serde(default = "default_browse_view_mode")]
+    album_view_mode: BrowseViewMode,
+    #[serde(default)]
+    artist_grid_scroll_top: f32,
+    #[serde(default)]
+    artist_table_scroll_top: f32,
+    #[serde(default)]
+    album_grid_scroll_top: f32,
+    #[serde(default)]
+    album_table_scroll_top: f32,
+    #[serde(default)]
+    playback_history: Vec<PlaybackHistoryEntry>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SavedBrowseTab {
+    id: u64,
+    source: TabSource,
+    #[serde(default)]
+    search_query: String,
+    #[serde(default = "default_sort_column")]
+    sort_column: SortColumn,
+    #[serde(default = "default_sort_direction")]
+    sort_direction: SortDirection,
+    #[serde(default)]
+    selected_track: usize,
+    #[serde(default)]
+    table_scroll_top: f32,
+    #[serde(default)]
+    table_horizontal_scroll: f32,
 }
 
 impl Default for AppState {
@@ -513,8 +691,34 @@ impl Default for AppState {
             output_device: None,
             volume: default_volume(),
             visible_table_columns: default_visible_table_columns(),
+            page: default_page(),
+            tabs: Vec::new(),
+            active_tab_id: None,
+            artist_view_mode: default_browse_view_mode(),
+            album_view_mode: default_browse_view_mode(),
+            artist_grid_scroll_top: 0.0,
+            artist_table_scroll_top: 0.0,
+            album_grid_scroll_top: 0.0,
+            album_table_scroll_top: 0.0,
+            playback_history: Vec::new(),
         }
     }
+}
+
+fn default_page() -> Page {
+    Page::Library
+}
+
+fn default_browse_view_mode() -> BrowseViewMode {
+    BrowseViewMode::Grid
+}
+
+fn default_sort_column() -> SortColumn {
+    SortColumn::Index
+}
+
+fn default_sort_direction() -> SortDirection {
+    SortDirection::Ascending
 }
 
 fn default_volume() -> f32 {
@@ -580,6 +784,7 @@ const PLAYER_BAR_PAD: f32 = 16.0;
 const PLAYER_ART_W: f32 = 54.0;
 const PLAYER_INFO_W: f32 = 220.0;
 const PLAYER_CONTROLS_W: f32 = 170.0;
+const PLAYER_VOLUME_BAR_W: f32 = 104.0;
 const PLAYER_GAP: f32 = 16.0;
 const TABLE_SCROLLBAR_W: f32 = 54.0;
 const TABLE_SCROLLBAR_TRACK_W: f32 = 6.0;
@@ -603,6 +808,10 @@ pub(crate) struct TempoApp {
     left_sidebar_collapsed: bool,
     right_sidebar_collapsed: bool,
     column_widths: ColumnWidths,
+    artist_table_column_widths: ArtistTableColumnWidths,
+    album_table_column_widths: AlbumTableColumnWidths,
+    scan_error_column_widths: ScanErrorColumnWidths,
+    playback_history_played_at_width: f32,
     column_resize: Option<ColumnResize>,
     visible_columns: Vec<TableColumn>,
     column_menu_open: bool,
@@ -614,6 +823,9 @@ pub(crate) struct TempoApp {
     back_history: Vec<NavigationEntry>,
     forward_history: Vec<NavigationEntry>,
     hovered_tooltip_id: Option<SharedString>,
+    now_playing_info_hovered: bool,
+    hovered_now_playing_link: Option<NowPlayingLink>,
+    alt_pressed: bool,
     tooltip: Option<Tooltip>,
     tooltip_generation: u64,
     playing_track: usize,
@@ -631,6 +843,7 @@ pub(crate) struct TempoApp {
     waveform_loading: Vec<bool>,
     library_roots: Vec<PathBuf>,
     playlists: Vec<Playlist>,
+    playback_history: Vec<PlaybackHistoryEntry>,
     theme_id: String,
     themes: Vec<Theme>,
     library_root_label: String,
@@ -641,21 +854,26 @@ pub(crate) struct TempoApp {
     output_menu_position: Point<Pixels>,
     volume: f32,
     pre_mute_volume: f32,
+    volume_dragging: bool,
+    volume_bar_scroll_handle: gpui::ScrollHandle,
     scan_progress: ScanProgress,
     scan_errors: Vec<IndexingError>,
     is_scanning: bool,
     table_scrollbar_drag: Option<TableScrollbarDrag>,
+    table_horizontal_scrollbar_drag: Option<TableHorizontalScrollbarDrag>,
     browse_scrollbar_drag: Option<BrowseScrollbarDrag>,
     artist_grid_scroll_handle: UniformListScrollHandle,
     artist_table_scroll_handle: UniformListScrollHandle,
     album_grid_scroll_handle: UniformListScrollHandle,
     album_table_scroll_handle: UniformListScrollHandle,
     scan_errors_scroll_handle: UniformListScrollHandle,
+    playback_history_scroll_handle: UniformListScrollHandle,
     table_is_scrolling: bool,
     table_scroll_generation: u64,
     catalog: Option<CatalogStore>,
     _library_watcher: Option<LibraryWatcher>,
     playback: Option<PlaybackController>,
+    _save_on_quit: Option<Subscription>,
 }
 
 impl TempoApp {
@@ -698,8 +916,31 @@ impl TempoApp {
         let initial_page = if roots.is_empty() {
             Page::Settings
         } else {
-            Page::Library
+            state.page
         };
+        let mut tabs = Self::restore_tabs(&state.tabs);
+        if tabs.is_empty() {
+            tabs.push(BrowseTab::library(1));
+        }
+        let active_tab = state
+            .active_tab_id
+            .and_then(|tab_id| tabs.iter().position(|tab| tab.id == tab_id))
+            .unwrap_or(0);
+        let next_tab_id = tabs
+            .iter()
+            .map(|tab| tab.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(2);
+        let artist_grid_scroll_top = state.artist_grid_scroll_top;
+        let artist_table_scroll_top = state.artist_table_scroll_top;
+        let album_grid_scroll_top = state.album_grid_scroll_top;
+        let album_table_scroll_top = state.album_table_scroll_top;
+        let save_on_quit = cx.on_app_quit(|app, _cx| {
+            app.save_app_state();
+            async {}
+        });
 
         let mut app = Self {
             focus_handle,
@@ -707,21 +948,28 @@ impl TempoApp {
             search_input: TextInputState::default(),
             browse_search_query: String::new(),
             search_debounce_generation: 0,
-            page: initial_page,
+            page: Self::resolved_page_for_roots(initial_page, &roots),
             left_sidebar_collapsed: false,
             right_sidebar_collapsed: false,
             column_widths: ColumnWidths::default(),
+            artist_table_column_widths: ArtistTableColumnWidths::default(),
+            album_table_column_widths: AlbumTableColumnWidths::default(),
+            scan_error_column_widths: ScanErrorColumnWidths::default(),
+            playback_history_played_at_width: 178.0,
             column_resize: None,
             visible_columns,
             column_menu_open: false,
             column_menu_x: 0.0,
             column_menu_y: 0.0,
-            tabs: vec![BrowseTab::library(1)],
-            active_tab: 0,
-            next_tab_id: 2,
+            tabs,
+            active_tab,
+            next_tab_id,
             back_history: Vec::new(),
             forward_history: Vec::new(),
             hovered_tooltip_id: None,
+            now_playing_info_hovered: false,
+            hovered_now_playing_link: None,
+            alt_pressed: false,
             tooltip: None,
             tooltip_generation: 0,
             playing_track: 0,
@@ -732,8 +980,8 @@ impl TempoApp {
             tracks: cached_tracks,
             artists: cached_artists,
             albums: cached_albums,
-            artist_view_mode: BrowseViewMode::Grid,
-            album_view_mode: BrowseViewMode::Grid,
+            artist_view_mode: state.artist_view_mode,
+            album_view_mode: state.album_view_mode,
             queue: Vec::new(),
             waveform_cache: Vec::new(),
             waveform_loading: Vec::new(),
@@ -753,24 +1001,52 @@ impl TempoApp {
             } else {
                 default_volume()
             },
+            volume_dragging: false,
+            volume_bar_scroll_handle: gpui::ScrollHandle::new(),
             scan_progress: ScanProgress::default(),
             scan_errors: Vec::new(),
             is_scanning: false,
             table_scrollbar_drag: None,
+            table_horizontal_scrollbar_drag: None,
             browse_scrollbar_drag: None,
             artist_grid_scroll_handle: UniformListScrollHandle::new(),
             artist_table_scroll_handle: UniformListScrollHandle::new(),
             album_grid_scroll_handle: UniformListScrollHandle::new(),
             album_table_scroll_handle: UniformListScrollHandle::new(),
             scan_errors_scroll_handle: UniformListScrollHandle::new(),
+            playback_history_scroll_handle: UniformListScrollHandle::new(),
             table_is_scrolling: false,
             table_scroll_generation: 0,
             catalog,
+            playback_history: state.playback_history,
             _library_watcher: library_watcher,
             playback,
+            _save_on_quit: Some(save_on_quit),
         };
 
+        app.artist_grid_scroll_handle
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.0), px(-artist_grid_scroll_top.max(0.0))));
+        app.artist_table_scroll_handle
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.0), px(-artist_table_scroll_top.max(0.0))));
+        app.album_grid_scroll_handle
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.0), px(-album_grid_scroll_top.max(0.0))));
+        app.album_table_scroll_handle
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.0), px(-album_table_scroll_top.max(0.0))));
+
         app.invalidate_track_indices();
+        app.clamp_track_indices();
         app.start_library_event_loop(event_rx, cx);
         app.start_playback_tick(cx);
         app
@@ -818,14 +1094,44 @@ impl TempoApp {
     }
 
     fn resolved_page(&self, page: Page) -> Page {
+        Self::resolved_page_for_roots(page, &self.library_roots)
+    }
+
+    fn resolved_page_for_roots(page: Page, library_roots: &[PathBuf]) -> Page {
         match page {
             Page::Library | Page::Artists | Page::Albums | Page::ScanErrors
-                if self.library_roots.is_empty() =>
+                if library_roots.is_empty() =>
             {
                 Page::Settings
             }
             page => page,
         }
+    }
+
+    fn restore_tabs(saved_tabs: &[SavedBrowseTab]) -> Vec<BrowseTab> {
+        let mut tabs = Vec::new();
+        for saved in saved_tabs {
+            if tabs.iter().any(|tab: &BrowseTab| tab.id == saved.id) {
+                continue;
+            }
+
+            let mut tab = match saved.source {
+                TabSource::Library => BrowseTab::library(saved.id),
+                TabSource::Playlist(playlist_ix) => BrowseTab::playlist(saved.id, playlist_ix),
+                TabSource::Artist(artist_id) => BrowseTab::artist(saved.id, artist_id),
+                TabSource::Album(album_id) => BrowseTab::album(saved.id, album_id),
+            };
+            tab.search_query = saved.search_query.clone();
+            tab.sort_column = saved.sort_column;
+            tab.sort_direction = saved.sort_direction;
+            tab.selected_track = saved.selected_track;
+            tab.table_scroll_top = saved.table_scroll_top.max(0.0);
+            tab.restore_table_scroll_top = Some(tab.table_scroll_top);
+            tab.table_horizontal_scroll = saved.table_horizontal_scroll.max(0.0);
+            tabs.push(tab);
+        }
+
+        tabs
     }
 
     fn set_page_without_history(&mut self, page: Page) {
@@ -1396,6 +1702,19 @@ impl Render for TempoApp {
             .on_mouse_down(
                 MouseButton::Navigate(NavigationDirection::Forward),
                 cx.listener(Self::navigate_forward_mouse),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                if this.drag_volume(event, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                    if this.finish_volume_drag(cx) {
+                        cx.stop_propagation();
+                    }
+                }),
             )
             .on_key_down(cx.listener(Self::handle_table_key_down))
             .size_full()

@@ -16,6 +16,7 @@ impl TempoApp {
                 .into_any_element(),
             Page::Artists => self.render_artists_page(window, cx).into_any_element(),
             Page::Albums => self.render_albums_page(window, cx).into_any_element(),
+            Page::PlaybackHistory => self.render_playback_history_page(cx).into_any_element(),
             Page::ScanErrors => self.render_scan_errors_page(cx).into_any_element(),
             Page::Settings => self.render_settings(cx).into_any_element(),
         }
@@ -475,7 +476,11 @@ impl TempoApp {
             )
     }
 
-    fn render_simple_page_header(&self, title: &'static str, subtitle: String) -> impl IntoElement {
+    pub(super) fn render_simple_page_header(
+        &self,
+        title: &'static str,
+        subtitle: String,
+    ) -> impl IntoElement {
         let colors = *self.colors();
 
         div()
@@ -515,22 +520,15 @@ impl TempoApp {
             .flex()
             .flex_col()
             .size_full()
-            .child(
-                div()
-                    .h(px(27.0))
-                    .px_4()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .border_b_1()
-                    .border_color(rgb(colors.border))
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rgb(colors.text_faint))
-                    .child(div().w(px(52.0)).flex_none().child("#"))
-                    .child(div().w(px(420.0)).flex_none().child("PATH"))
-                    .child(div().flex_1().min_w_0().child("ERROR")),
-            )
+            .child(self.render_resizable_table_header(
+                27.0,
+                &[
+                    ColumnResizeTarget::ScanError(ScanErrorColumn::Index),
+                    ColumnResizeTarget::ScanError(ScanErrorColumn::Path),
+                    ColumnResizeTarget::ScanError(ScanErrorColumn::Error),
+                ],
+                cx,
+            ))
             .when(self.scan_errors.is_empty(), |this| {
                 this.child(
                     div()
@@ -585,14 +583,14 @@ impl TempoApp {
             .gap_3()
             .child(
                 div()
-                    .w(px(52.0))
+                    .w(px(self.scan_error_column_width(ScanErrorColumn::Index)))
                     .flex_none()
                     .text_color(rgb(colors.text_faint))
                     .child((ix + 1).to_string()),
             )
             .child(
                 div()
-                    .w(px(420.0))
+                    .w(px(self.scan_error_column_width(ScanErrorColumn::Path)))
                     .flex_none()
                     .text_color(rgb(colors.text_strong))
                     .overflow_hidden()
@@ -601,7 +599,7 @@ impl TempoApp {
             )
             .child(
                 div()
-                    .flex_1()
+                    .w(px(self.scan_error_column_width(ScanErrorColumn::Error)))
                     .min_w_0()
                     .text_color(rgb(colors.text_muted))
                     .child(error.message.clone()),

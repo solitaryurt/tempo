@@ -1,7 +1,29 @@
 use super::*;
 
+const AUTOSIZE_TEXT_PADDING: f32 = 20.0;
+const AUTOSIZE_TEXT_CHAR_W: f32 = 7.2;
+const AUTOSIZE_ICON_COL_W: f32 = 34.0;
+const TABLE_HORIZONTAL_SCROLLBAR_H: f32 = 14.0;
+const TABLE_HORIZONTAL_SCROLLBAR_TRACK_H: f32 = 6.0;
+const TABLE_HORIZONTAL_SCROLLBAR_MARGIN: f32 = 4.0;
+const TABLE_HORIZONTAL_SCROLLBAR_MIN_THUMB_W: f32 = 32.0;
+
 impl TempoApp {
     pub(super) fn column_width(&self, column: TableColumn) -> f32 {
+        self.resize_target_width(ColumnResizeTarget::Track(column))
+    }
+
+    pub(super) fn resize_target_width(&self, target: ColumnResizeTarget) -> f32 {
+        match target {
+            ColumnResizeTarget::Track(column) => self.track_column_width(column),
+            ColumnResizeTarget::Artist(column) => self.artist_table_column_width(column),
+            ColumnResizeTarget::Album(column) => self.album_table_column_width(column),
+            ColumnResizeTarget::ScanError(column) => self.scan_error_column_width(column),
+            ColumnResizeTarget::PlaybackHistoryPlayedAt => self.playback_history_played_at_width,
+        }
+    }
+
+    fn track_column_width(&self, column: TableColumn) -> f32 {
         match column {
             TableColumn::Index => self.column_widths.index,
             TableColumn::Artwork => self.column_widths.artwork,
@@ -20,8 +42,62 @@ impl TempoApp {
         }
     }
 
-    pub(super) fn set_column_width(&mut self, column: TableColumn, width: f32) {
-        let width = width.max(Self::min_column_width(column));
+    pub(super) fn artist_table_column_width(&self, column: ArtistTableColumn) -> f32 {
+        match column {
+            ArtistTableColumn::Artwork => self.artist_table_column_widths.artwork,
+            ArtistTableColumn::Artist => self.artist_table_column_widths.artist,
+            ArtistTableColumn::Albums => self.artist_table_column_widths.albums,
+            ArtistTableColumn::Tracks => self.artist_table_column_widths.tracks,
+        }
+    }
+
+    pub(super) fn album_table_column_width(&self, column: AlbumTableColumn) -> f32 {
+        match column {
+            AlbumTableColumn::Artwork => self.album_table_column_widths.artwork,
+            AlbumTableColumn::Album => self.album_table_column_widths.album,
+            AlbumTableColumn::Artist => self.album_table_column_widths.artist,
+            AlbumTableColumn::Year => self.album_table_column_widths.year,
+            AlbumTableColumn::Tracks => self.album_table_column_widths.tracks,
+        }
+    }
+
+    pub(super) fn scan_error_column_width(&self, column: ScanErrorColumn) -> f32 {
+        match column {
+            ScanErrorColumn::Index => self.scan_error_column_widths.index,
+            ScanErrorColumn::Path => self.scan_error_column_widths.path,
+            ScanErrorColumn::Error => self.scan_error_column_widths.error,
+        }
+    }
+
+    pub(super) fn set_resize_target_width(&mut self, target: ColumnResizeTarget, width: f32) {
+        let width = width.max(Self::min_resize_target_width(target));
+        match target {
+            ColumnResizeTarget::Track(column) => self.set_track_column_width(column, width),
+            ColumnResizeTarget::Artist(column) => match column {
+                ArtistTableColumn::Artwork => self.artist_table_column_widths.artwork = width,
+                ArtistTableColumn::Artist => self.artist_table_column_widths.artist = width,
+                ArtistTableColumn::Albums => self.artist_table_column_widths.albums = width,
+                ArtistTableColumn::Tracks => self.artist_table_column_widths.tracks = width,
+            },
+            ColumnResizeTarget::Album(column) => match column {
+                AlbumTableColumn::Artwork => self.album_table_column_widths.artwork = width,
+                AlbumTableColumn::Album => self.album_table_column_widths.album = width,
+                AlbumTableColumn::Artist => self.album_table_column_widths.artist = width,
+                AlbumTableColumn::Year => self.album_table_column_widths.year = width,
+                AlbumTableColumn::Tracks => self.album_table_column_widths.tracks = width,
+            },
+            ColumnResizeTarget::ScanError(column) => match column {
+                ScanErrorColumn::Index => self.scan_error_column_widths.index = width,
+                ScanErrorColumn::Path => self.scan_error_column_widths.path = width,
+                ScanErrorColumn::Error => self.scan_error_column_widths.error = width,
+            },
+            ColumnResizeTarget::PlaybackHistoryPlayedAt => {
+                self.playback_history_played_at_width = width
+            }
+        }
+    }
+
+    fn set_track_column_width(&mut self, column: TableColumn, width: f32) {
         match column {
             TableColumn::Index => self.column_widths.index = width,
             TableColumn::Artwork => self.column_widths.artwork = width,
@@ -38,9 +114,121 @@ impl TempoApp {
             TableColumn::Duration => self.column_widths.duration = width,
             TableColumn::Loved => self.column_widths.loved = width,
         }
+
+        self.clamp_table_horizontal_scroll();
     }
 
-    pub(super) fn min_column_width(column: TableColumn) -> f32 {
+    pub(super) fn table_content_width(&self) -> f32 {
+        self.visible_columns
+            .iter()
+            .copied()
+            .map(|column| self.column_width(column))
+            .sum()
+    }
+
+    pub(super) fn table_render_width(&self) -> f32 {
+        self.table_horizontal_viewport_width()
+            .map(|viewport_width| self.table_content_width().max(viewport_width))
+            .unwrap_or_else(|| self.table_content_width())
+    }
+
+    pub(super) fn table_column_render_width(&self, column: TableColumn) -> f32 {
+        let width = self.column_width(column);
+        if self.visible_columns.last().copied() != Some(column) {
+            return width;
+        }
+
+        let extra_width = self
+            .table_horizontal_viewport_width()
+            .map(|viewport_width| (viewport_width - self.table_content_width()).max(0.0))
+            .unwrap_or(0.0);
+        width + extra_width
+    }
+
+    pub(super) fn table_horizontal_viewport_width(&self) -> Option<f32> {
+        let handle = self.active_tab().table_scroll_handle.clone();
+        let base_handle = handle.0.borrow().base_handle.clone();
+        let width = f32::from(base_handle.bounds().size.width) - 32.0 - TABLE_SCROLLBAR_W;
+        (width > 0.0).then_some(width)
+    }
+
+    pub(super) fn max_table_horizontal_scroll(&self) -> f32 {
+        let Some(viewport_width) = self.table_horizontal_viewport_width() else {
+            return 0.0;
+        };
+
+        (self.table_content_width() - viewport_width).max(0.0)
+    }
+
+    pub(super) fn current_table_horizontal_scroll(&self) -> f32 {
+        self.active_tab()
+            .table_horizontal_scroll
+            .clamp(0.0, self.max_table_horizontal_scroll())
+    }
+
+    pub(super) fn clamp_table_horizontal_scroll(&mut self) {
+        let scroll = self.current_table_horizontal_scroll();
+        self.active_tab_mut().table_horizontal_scroll = scroll;
+    }
+
+    pub(super) fn scroll_table_horizontally(&mut self, delta: f32) -> bool {
+        let max_scroll = self.max_table_horizontal_scroll();
+        if max_scroll <= 0.0 {
+            self.active_tab_mut().table_horizontal_scroll = 0.0;
+            return false;
+        }
+
+        let current = self.active_tab().table_horizontal_scroll;
+        let next = (current + delta).clamp(0.0, max_scroll);
+        if (next - current).abs() < 0.5 {
+            return false;
+        }
+
+        self.active_tab_mut().table_horizontal_scroll = next;
+        true
+    }
+
+    pub(super) fn handle_table_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if event.modifiers.shift {
+            let delta = event.delta.pixel_delta(px(TABLE_ROW_H));
+            let x = f32::from(delta.x);
+            let y = f32::from(delta.y);
+            let scroll_delta = if x.abs() > y.abs() { x } else { y };
+
+            if self.scroll_table_horizontally(scroll_delta) {
+                cx.stop_propagation();
+                cx.notify();
+            }
+            return;
+        }
+
+        self.mark_table_scrolling(cx);
+    }
+
+    pub(super) fn min_resize_target_width(target: ColumnResizeTarget) -> f32 {
+        match target {
+            ColumnResizeTarget::Track(column) => Self::min_track_column_width(column),
+            ColumnResizeTarget::Artist(ArtistTableColumn::Artwork)
+            | ColumnResizeTarget::Album(AlbumTableColumn::Artwork) => 34.0,
+            ColumnResizeTarget::Artist(ArtistTableColumn::Artist)
+            | ColumnResizeTarget::Album(AlbumTableColumn::Album)
+            | ColumnResizeTarget::Album(AlbumTableColumn::Artist)
+            | ColumnResizeTarget::ScanError(ScanErrorColumn::Path)
+            | ColumnResizeTarget::ScanError(ScanErrorColumn::Error) => 96.0,
+            ColumnResizeTarget::Artist(ArtistTableColumn::Albums)
+            | ColumnResizeTarget::Artist(ArtistTableColumn::Tracks)
+            | ColumnResizeTarget::Album(AlbumTableColumn::Year)
+            | ColumnResizeTarget::Album(AlbumTableColumn::Tracks)
+            | ColumnResizeTarget::ScanError(ScanErrorColumn::Index) => 52.0,
+            ColumnResizeTarget::PlaybackHistoryPlayedAt => 120.0,
+        }
+    }
+
+    fn min_track_column_width(column: TableColumn) -> f32 {
         match column {
             TableColumn::Index | TableColumn::Artwork | TableColumn::Loved => 24.0,
             TableColumn::Format => 44.0,
@@ -52,10 +240,18 @@ impl TempoApp {
     }
 
     pub(super) fn begin_column_resize(&mut self, column: TableColumn, event: &MouseDownEvent) {
+        self.begin_resize_target(ColumnResizeTarget::Track(column), event);
+    }
+
+    pub(super) fn begin_resize_target(
+        &mut self,
+        target: ColumnResizeTarget,
+        event: &MouseDownEvent,
+    ) {
         self.column_resize = Some(ColumnResize {
-            column,
+            target,
             start_x: f32::from(event.position.x),
-            start_width: self.column_width(column),
+            start_width: self.resize_target_width(target),
         });
         self.context_menu_track = None;
     }
@@ -65,13 +261,165 @@ impl TempoApp {
             return false;
         };
 
+        if !event.dragging() {
+            self.column_resize = None;
+            return false;
+        }
+
         let delta = f32::from(event.position.x) - resize.start_x;
-        self.set_column_width(resize.column, resize.start_width + delta);
+        self.set_resize_target_width(resize.target, resize.start_width + delta);
         true
     }
 
     pub(super) fn finish_column_resize(&mut self) -> bool {
         self.column_resize.take().is_some()
+    }
+
+    pub(super) fn autosize_table_column(&mut self, column: TableColumn) {
+        self.autosize_resize_target(ColumnResizeTarget::Track(column));
+    }
+
+    pub(super) fn autosize_resize_target(&mut self, target: ColumnResizeTarget) {
+        self.column_resize = None;
+        self.set_resize_target_width(target, self.autosize_resize_target_width(target));
+    }
+
+    pub(super) fn autosize_resize_target_width(&self, target: ColumnResizeTarget) -> f32 {
+        match target {
+            ColumnResizeTarget::Track(column) => self.autosize_table_column_width(column),
+            ColumnResizeTarget::Artist(ArtistTableColumn::Artwork)
+            | ColumnResizeTarget::Album(AlbumTableColumn::Artwork) => AUTOSIZE_ICON_COL_W,
+            _ => {
+                let header_width = Self::autosize_text_width(Self::resize_target_label(target));
+                let content_width = self
+                    .resize_target_texts(target)
+                    .into_iter()
+                    .map(|text| Self::autosize_text_width(&text))
+                    .fold(header_width, f32::max);
+
+                content_width + AUTOSIZE_TEXT_PADDING
+            }
+        }
+    }
+
+    pub(super) fn autosize_table_column_width(&self, column: TableColumn) -> f32 {
+        match column {
+            TableColumn::Artwork | TableColumn::Loved => return AUTOSIZE_ICON_COL_W,
+            _ => {}
+        }
+
+        let header_width = Self::autosize_text_width(Self::column_label(column));
+        let content_width = self
+            .current_track_indices()
+            .iter()
+            .filter_map(|track_ix| self.tracks.get(*track_ix).map(|track| (track, *track_ix)))
+            .map(|(track, track_ix)| {
+                Self::autosize_text_width(&self.table_column_text(column, track_ix, track))
+            })
+            .fold(header_width, f32::max);
+
+        content_width + AUTOSIZE_TEXT_PADDING
+    }
+
+    pub(super) fn table_column_text(
+        &self,
+        column: TableColumn,
+        track_ix: usize,
+        track: &Track,
+    ) -> String {
+        match column {
+            TableColumn::Index => format!("{:02}", track_ix + 1),
+            TableColumn::Artwork | TableColumn::Loved => String::new(),
+            TableColumn::Title => track.title.clone(),
+            TableColumn::Artist => track.artist.clone(),
+            TableColumn::Album => track.album.clone(),
+            TableColumn::TrackNumber => track
+                .track_number
+                .map(|track_number| track_number.to_string())
+                .unwrap_or_default(),
+            TableColumn::Format => track.codec.clone(),
+            TableColumn::Bitrate => Self::bitrate_cell_label(track),
+            TableColumn::FileSize => Self::file_size_label(track.file_size),
+            TableColumn::Year => track.year.clone(),
+            TableColumn::DateAdded => Self::date_label(track.date_added),
+            TableColumn::Plays => track.plays.to_string(),
+            TableColumn::Duration => track.duration.clone(),
+        }
+    }
+
+    pub(super) fn resize_target_label(target: ColumnResizeTarget) -> &'static str {
+        match target {
+            ColumnResizeTarget::Track(column) => Self::column_label(column),
+            ColumnResizeTarget::Artist(ArtistTableColumn::Artwork)
+            | ColumnResizeTarget::Album(AlbumTableColumn::Artwork) => "",
+            ColumnResizeTarget::Artist(ArtistTableColumn::Artist) => "Artist",
+            ColumnResizeTarget::Artist(ArtistTableColumn::Albums) => "Albums",
+            ColumnResizeTarget::Artist(ArtistTableColumn::Tracks) => "Tracks",
+            ColumnResizeTarget::Album(AlbumTableColumn::Album) => "Album",
+            ColumnResizeTarget::Album(AlbumTableColumn::Artist) => "Artist",
+            ColumnResizeTarget::Album(AlbumTableColumn::Year) => "Year",
+            ColumnResizeTarget::Album(AlbumTableColumn::Tracks) => "Tracks",
+            ColumnResizeTarget::ScanError(ScanErrorColumn::Index) => "#",
+            ColumnResizeTarget::ScanError(ScanErrorColumn::Path) => "PATH",
+            ColumnResizeTarget::ScanError(ScanErrorColumn::Error) => "ERROR",
+            ColumnResizeTarget::PlaybackHistoryPlayedAt => "PLAYED AT",
+        }
+    }
+
+    pub(super) fn resize_target_texts(&self, target: ColumnResizeTarget) -> Vec<String> {
+        match target {
+            ColumnResizeTarget::Artist(column) => self
+                .artists
+                .iter()
+                .map(|artist| match column {
+                    ArtistTableColumn::Artwork => String::new(),
+                    ArtistTableColumn::Artist => artist.name.clone(),
+                    ArtistTableColumn::Albums => artist.album_count.to_string(),
+                    ArtistTableColumn::Tracks => artist.track_count.to_string(),
+                })
+                .collect(),
+            ColumnResizeTarget::Album(column) => self
+                .albums
+                .iter()
+                .map(|album| match column {
+                    AlbumTableColumn::Artwork => String::new(),
+                    AlbumTableColumn::Album => album.title.clone(),
+                    AlbumTableColumn::Artist => album.artist.clone(),
+                    AlbumTableColumn::Year => {
+                        album.year.clone().unwrap_or_else(|| "Unknown".to_string())
+                    }
+                    AlbumTableColumn::Tracks => album.track_count.to_string(),
+                })
+                .collect(),
+            ColumnResizeTarget::ScanError(column) => self
+                .scan_errors
+                .iter()
+                .enumerate()
+                .map(|(ix, error)| match column {
+                    ScanErrorColumn::Index => (ix + 1).to_string(),
+                    ScanErrorColumn::Path => error.path.display().to_string(),
+                    ScanErrorColumn::Error => error.message.clone(),
+                })
+                .collect(),
+            ColumnResizeTarget::PlaybackHistoryPlayedAt => self
+                .playback_history
+                .iter()
+                .map(|entry| Self::history_played_at_label(entry.played_at_unix_secs))
+                .collect(),
+            ColumnResizeTarget::Track(_) => Vec::new(),
+        }
+    }
+
+    pub(super) fn autosize_text_width(text: &str) -> f32 {
+        text.chars()
+            .map(|ch| match ch {
+                'i' | 'j' | 'l' | 'I' | '!' | '|' | '.' | ',' | ':' | ';' | '\'' => 0.45,
+                'm' | 'w' | 'M' | 'W' | '@' | '#' | '%' | '&' => 1.35,
+                'A'..='Z' => 1.1,
+                _ => 1.0,
+            })
+            .sum::<f32>()
+            * AUTOSIZE_TEXT_CHAR_W
     }
 
     pub(super) fn sanitize_visible_columns(columns: Vec<TableColumn>) -> Vec<TableColumn> {
@@ -169,7 +517,10 @@ impl TempoApp {
         }
 
         if event.keystroke.key.as_str() == "escape" {
-            if self.cancel_table_scrollbar_drag() || self.cancel_browse_scrollbar_drag() {
+            if self.cancel_table_scrollbar_drag()
+                || self.cancel_table_horizontal_scrollbar_drag()
+                || self.cancel_browse_scrollbar_drag()
+            {
                 cx.stop_propagation();
                 cx.notify();
             }
@@ -340,6 +691,41 @@ impl TempoApp {
         })
     }
 
+    pub(super) fn table_horizontal_scrollbar_metrics(
+        &self,
+    ) -> Option<TableHorizontalScrollbarMetrics> {
+        let handle = self.active_tab().table_scroll_handle.clone();
+        let base_handle = handle.0.borrow().base_handle.clone();
+        let bounds = base_handle.bounds();
+        let viewport_width = self.table_horizontal_viewport_width()?;
+        let content_width = self.table_content_width();
+        let max_scroll = (content_width - viewport_width).max(0.0);
+        if max_scroll <= 0.0 {
+            return None;
+        }
+
+        let track_left = f32::from(bounds.origin.x) + 16.0;
+        let track_width = (f32::from(bounds.size.width) - 16.0 - TABLE_SCROLLBAR_W).max(1.0);
+        let thumb_width = ((viewport_width / content_width) * track_width)
+            .max(TABLE_HORIZONTAL_SCROLLBAR_MIN_THUMB_W)
+            .min(track_width);
+        let thumb_travel = (track_width - thumb_width).max(0.0);
+        let scroll_left = self.current_table_horizontal_scroll();
+        let thumb_left = if max_scroll > 0.0 && thumb_travel > 0.0 {
+            (scroll_left / max_scroll) * thumb_travel
+        } else {
+            0.0
+        };
+
+        Some(TableHorizontalScrollbarMetrics {
+            track_left,
+            track_width,
+            thumb_left,
+            thumb_width,
+            max_scroll,
+        })
+    }
+
     pub(super) fn begin_table_scrollbar_drag(&mut self, event: &MouseDownEvent) -> bool {
         let Some(metrics) = self.table_scrollbar_metrics() else {
             return false;
@@ -383,6 +769,53 @@ impl TempoApp {
         self.table_scrollbar_drag.take().is_some()
     }
 
+    pub(super) fn begin_table_horizontal_scrollbar_drag(&mut self, event: &MouseDownEvent) -> bool {
+        let Some(metrics) = self.table_horizontal_scrollbar_metrics() else {
+            return false;
+        };
+
+        let local_x = f32::from(event.position.x) - metrics.track_left;
+        let thumb_right = metrics.thumb_left + metrics.thumb_width;
+        let thumb_offset = if (metrics.thumb_left..=thumb_right).contains(&local_x) {
+            local_x - metrics.thumb_left
+        } else {
+            metrics.thumb_width / 2.0
+        };
+
+        self.table_horizontal_scrollbar_drag = Some(TableHorizontalScrollbarDrag {
+            thumb_offset,
+            start_scroll: self.current_table_horizontal_scroll(),
+        });
+        self.scroll_table_to_horizontal_scrollbar_x(event.position.x, thumb_offset)
+    }
+
+    pub(super) fn drag_table_horizontal_scrollbar(&mut self, event: &MouseMoveEvent) -> bool {
+        let Some(drag) = self.table_horizontal_scrollbar_drag else {
+            return false;
+        };
+
+        if !event.dragging() {
+            self.table_horizontal_scrollbar_drag = None;
+            return false;
+        }
+
+        self.scroll_table_to_horizontal_scrollbar_x(event.position.x, drag.thumb_offset)
+    }
+
+    pub(super) fn finish_table_horizontal_scrollbar_drag(&mut self) -> bool {
+        self.table_horizontal_scrollbar_drag.take().is_some()
+    }
+
+    pub(super) fn cancel_table_horizontal_scrollbar_drag(&mut self) -> bool {
+        let Some(drag) = self.table_horizontal_scrollbar_drag.take() else {
+            return false;
+        };
+
+        self.active_tab_mut().table_horizontal_scroll = drag.start_scroll;
+        self.clamp_table_horizontal_scroll();
+        true
+    }
+
     pub(super) fn cancel_table_scrollbar_drag(&mut self) -> bool {
         let Some(drag) = self.table_scrollbar_drag.take() else {
             return false;
@@ -395,8 +828,9 @@ impl TempoApp {
 
     pub(super) fn finish_table_drag_interactions(&mut self) -> bool {
         let scrolled = self.finish_table_scrollbar_drag();
+        let horizontal_scrolled = self.finish_table_horizontal_scrollbar_drag();
         let resized = self.finish_column_resize();
-        scrolled || resized
+        scrolled || horizontal_scrolled || resized
     }
 
     pub(super) fn mark_table_scrolling(&mut self, cx: &mut Context<Self>) {
@@ -476,6 +910,28 @@ impl TempoApp {
         true
     }
 
+    pub(super) fn scroll_table_to_horizontal_scrollbar_x(
+        &mut self,
+        mouse_x: Pixels,
+        thumb_offset: f32,
+    ) -> bool {
+        let Some(metrics) = self.table_horizontal_scrollbar_metrics() else {
+            return false;
+        };
+
+        let thumb_travel = (metrics.track_width - metrics.thumb_width).max(1.0);
+        let thumb_left =
+            (f32::from(mouse_x) - metrics.track_left - thumb_offset).clamp(0.0, thumb_travel);
+        let ratio = thumb_left / thumb_travel;
+        let next = ratio.clamp(0.0, 1.0) * metrics.max_scroll;
+        if (next - self.current_table_horizontal_scroll()).abs() < 0.5 {
+            return false;
+        }
+
+        self.active_tab_mut().table_horizontal_scroll = next;
+        true
+    }
+
     pub(super) fn table_scrollbar_base_handle(&self) -> gpui::ScrollHandle {
         self.active_tab()
             .table_scroll_handle
@@ -483,6 +939,16 @@ impl TempoApp {
             .borrow()
             .base_handle
             .clone()
+    }
+
+    pub(super) fn restore_active_table_scroll_position(&mut self) {
+        let Some(scroll_top) = self.active_tab_mut().restore_table_scroll_top.take() else {
+            return;
+        };
+
+        let base_handle = self.table_scrollbar_base_handle();
+        let current = base_handle.offset();
+        base_handle.set_offset(point(current.x, px(-scroll_top.max(0.0))));
     }
 
     pub(super) fn current_scrollbar_label(&self, metrics: TableScrollbarMetrics) -> Option<String> {
@@ -514,6 +980,7 @@ impl TempoApp {
     }
 
     pub(super) fn render_table(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        self.restore_active_table_scroll_position();
         let item_count = self.current_track_indices().len();
         let active_search_query = self.active_search_query().to_string();
         let has_no_search_results = item_count == 0
@@ -540,8 +1007,10 @@ impl TempoApp {
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
                 let scrolled = this.drag_table_scrollbar(event);
-                let resized = !scrolled && this.resize_column_from_mouse(event);
-                if scrolled || resized {
+                let horizontal_scrolled = !scrolled && this.drag_table_horizontal_scrollbar(event);
+                let resized =
+                    !scrolled && !horizontal_scrolled && this.resize_column_from_mouse(event);
+                if scrolled || horizontal_scrolled || resized {
                     cx.stop_propagation();
                     cx.notify();
                 }
@@ -602,14 +1071,15 @@ impl TempoApp {
                             )
                             .size_full()
                             .on_scroll_wheel(cx.listener(
-                                |this, _event: &ScrollWheelEvent, _window, cx| {
-                                    this.mark_table_scrolling(cx);
+                                |this, event: &ScrollWheelEvent, _window, cx| {
+                                    this.handle_table_scroll_wheel(event, cx);
                                 },
                             ))
                             .track_scroll(table_scroll_handle),
                         )
                     })
-                    .child(self.render_table_scrollbar(item_count, cx)),
+                    .child(self.render_table_scrollbar(item_count, cx))
+                    .child(self.render_table_horizontal_scrollbar(cx)),
             )
             .when(self.tracks.is_empty(), |this| {
                 let colors = *self.colors();
@@ -733,14 +1203,22 @@ impl TempoApp {
             .px_4()
             .flex()
             .items_center()
+            .overflow_hidden()
             .border_b_1()
             .border_color(rgb(colors.row_border))
             .bg(rgb(bg))
-            .children(
-                self.visible_columns
-                    .iter()
-                    .copied()
-                    .map(|column| self.track_cell(column, track_ix, track, active, true)),
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .ml(px(-self.current_table_horizontal_scroll()))
+                    .w(px(self.table_render_width()))
+                    .children(
+                        self.visible_columns
+                            .iter()
+                            .copied()
+                            .map(|column| self.track_cell(column, track_ix, track, active, true)),
+                    ),
             )
             .into_any_element()
     }
@@ -909,6 +1387,73 @@ impl TempoApp {
             .into_any_element()
     }
 
+    pub(super) fn render_table_horizontal_scrollbar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(metrics) = self.table_horizontal_scrollbar_metrics() else {
+            return div().into_any_element();
+        };
+
+        let colors = *self.colors();
+        div()
+            .id("table-horizontal-scrollbar")
+            .absolute()
+            .left(px(16.0))
+            .right(px(TABLE_SCROLLBAR_W))
+            .bottom_0()
+            .h(px(TABLE_HORIZONTAL_SCROLLBAR_H))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus_handle);
+                    if this.begin_table_horizontal_scrollbar_drag(event) {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                if this.drag_table_horizontal_scrollbar(event) {
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                    if this.finish_table_horizontal_scrollbar_drag() {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom(px(TABLE_HORIZONTAL_SCROLLBAR_MARGIN))
+                    .h(px(TABLE_HORIZONTAL_SCROLLBAR_TRACK_H))
+                    .rounded_full()
+                    .bg(rgb(colors.elevated))
+                    .opacity(0.95)
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(metrics.thumb_left))
+                            .top(px(1.0))
+                            .bottom(px(1.0))
+                            .w(px(metrics.thumb_width))
+                            .rounded_full()
+                            .bg(rgb(if self.table_horizontal_scrollbar_drag.is_some() {
+                                colors.text
+                            } else {
+                                colors.text_faint
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
     pub(super) fn render_table_header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let colors = *self.colors();
 
@@ -918,6 +1463,7 @@ impl TempoApp {
             .px_4()
             .flex()
             .items_center()
+            .overflow_hidden()
             .border_b_1()
             .border_color(rgb(colors.border))
             .text_xs()
@@ -931,12 +1477,48 @@ impl TempoApp {
                     cx.notify();
                 }),
             )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .ml(px(-self.current_table_horizontal_scroll()))
+                    .w(px(self.table_render_width()))
+                    .children(
+                        self.visible_columns
+                            .iter()
+                            .copied()
+                            .map(|column| self.header_cell(column, cx)),
+                    ),
+            )
+    }
+
+    pub(super) fn render_resizable_table_header(
+        &self,
+        height: f32,
+        columns: &[ColumnResizeTarget],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+
+        div()
+            .h(px(height))
+            .flex_none()
+            .px_4()
+            .flex()
+            .items_center()
+            .gap_3()
+            .border_b_1()
+            .border_color(rgb(colors.border))
+            .text_xs()
+            .font_weight(gpui::FontWeight::BOLD)
+            .text_color(rgb(colors.text_faint))
             .children(
-                self.visible_columns
+                columns
                     .iter()
                     .copied()
-                    .map(|column| self.header_cell(column, cx)),
+                    .map(|target| self.resizable_header_cell(target, cx)),
             )
+            .into_any_element()
     }
 
     pub(super) fn header_cell(
@@ -946,14 +1528,11 @@ impl TempoApp {
     ) -> impl IntoElement + use<> {
         let label = Self::column_label(column);
         let sort_column = Self::sort_column_for(column);
-        let width = self.column_width(column);
+        let width = self.table_column_render_width(column);
         let tab = self.active_tab();
-        let active = sort_column.is_some_and(|column| tab.sort_column == column);
+        let active = Self::header_sort_active(column, tab.sort_column);
         let colors = *self.colors();
-        let icon = match tab.sort_direction {
-            SortDirection::Ascending => "▲",
-            SortDirection::Descending => "▼",
-        };
+        let icon = Self::header_sort_icon(column, tab.sort_column, tab.sort_direction);
         let id = SharedString::from(format!("column-{}", Self::column_key(column)));
 
         div()
@@ -978,7 +1557,10 @@ impl TempoApp {
             .when_some(sort_column, |this, sort_column| {
                 this.on_click(cx.listener(move |this, _, _, cx| {
                     let tab = this.active_tab_mut();
-                    if tab.sort_column == sort_column {
+                    if column == TableColumn::Album {
+                        (tab.sort_column, tab.sort_direction) =
+                            Self::next_album_sort(tab.sort_column, tab.sort_direction);
+                    } else if tab.sort_column == sort_column {
                         tab.sort_direction = match tab.sort_direction {
                             SortDirection::Ascending => SortDirection::Descending,
                             SortDirection::Descending => SortDirection::Ascending,
@@ -1005,6 +1587,10 @@ impl TempoApp {
             }))
             .child(
                 div()
+                    .id(SharedString::from(format!(
+                        "column-resizer-{}",
+                        Self::column_key(column)
+                    )))
                     .absolute()
                     .top_0()
                     .right_0()
@@ -1019,8 +1605,66 @@ impl TempoApp {
                             cx.stop_propagation();
                             cx.notify();
                         }),
-                    ),
+                    )
+                    .on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
+                        if event.standard_click() && event.click_count() >= 2 {
+                            this.autosize_table_column(column);
+                            cx.notify();
+                        }
+                        cx.stop_propagation();
+                    })),
             )
+    }
+
+    pub(super) fn resizable_header_cell(
+        &self,
+        target: ColumnResizeTarget,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = Self::resize_target_label(target);
+        let width = self.resize_target_width(target);
+        let colors = *self.colors();
+        let id = SharedString::from(format!("header-{}", Self::resize_target_key(target)));
+
+        div()
+            .id(id)
+            .relative()
+            .h_full()
+            .w(px(width))
+            .flex()
+            .items_center()
+            .text_color(rgb(colors.text_faint))
+            .child(label)
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "header-resizer-{}",
+                        Self::resize_target_key(target)
+                    )))
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .w(px(6.0))
+                    .cursor(CursorStyle::ResizeColumn)
+                    .hover(move |this| this.bg(rgb(colors.border_strong)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                            this.begin_resize_target(target, event);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
+                        if event.standard_click() && event.click_count() >= 2 {
+                            this.autosize_resize_target(target);
+                            cx.notify();
+                        }
+                        cx.stop_propagation();
+                    })),
+            )
+            .into_any_element()
     }
 
     pub(super) fn render_track_row(
@@ -1047,6 +1691,7 @@ impl TempoApp {
             .px_4()
             .flex()
             .items_center()
+            .overflow_hidden()
             .border_b_1()
             .border_color(rgb(colors.row_border))
             .bg(rgb(bg))
@@ -1090,11 +1735,15 @@ impl TempoApp {
                         },
                     )
             })
-            .children(
-                self.visible_columns
-                    .iter()
-                    .copied()
-                    .map(|column| self.track_cell(column, track_ix, track, active, lightweight)),
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .ml(px(-self.current_table_horizontal_scroll()))
+                    .w(px(self.table_render_width()))
+                    .children(self.visible_columns.iter().copied().map(|column| {
+                        self.track_cell(column, track_ix, track, active, lightweight)
+                    })),
             )
     }
 
@@ -1116,7 +1765,7 @@ impl TempoApp {
         lightweight: bool,
     ) -> AnyElement {
         let colors = *self.colors();
-        let width = self.column_width(column);
+        let width = self.table_column_render_width(column);
         match column {
             TableColumn::Index => div()
                 .w(px(width))
@@ -1189,6 +1838,12 @@ impl TempoApp {
             Corner::TopLeft,
             point(px(2.0), px(2.0)),
             self.menu_panel(220.0)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_this, _event: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
+                    }),
+                )
                 .child(self.menu_header("Columns"))
                 .children(
                     ALL_TABLE_COLUMNS
@@ -1285,6 +1940,25 @@ impl TempoApp {
         }
     }
 
+    pub(super) fn resize_target_key(target: ColumnResizeTarget) -> &'static str {
+        match target {
+            ColumnResizeTarget::Track(column) => Self::column_key(column),
+            ColumnResizeTarget::Artist(ArtistTableColumn::Artwork) => "artist-artwork",
+            ColumnResizeTarget::Artist(ArtistTableColumn::Artist) => "artist-name",
+            ColumnResizeTarget::Artist(ArtistTableColumn::Albums) => "artist-albums",
+            ColumnResizeTarget::Artist(ArtistTableColumn::Tracks) => "artist-tracks",
+            ColumnResizeTarget::Album(AlbumTableColumn::Artwork) => "album-artwork",
+            ColumnResizeTarget::Album(AlbumTableColumn::Album) => "album-title",
+            ColumnResizeTarget::Album(AlbumTableColumn::Artist) => "album-artist",
+            ColumnResizeTarget::Album(AlbumTableColumn::Year) => "album-year",
+            ColumnResizeTarget::Album(AlbumTableColumn::Tracks) => "album-tracks",
+            ColumnResizeTarget::ScanError(ScanErrorColumn::Index) => "scan-error-index",
+            ColumnResizeTarget::ScanError(ScanErrorColumn::Path) => "scan-error-path",
+            ColumnResizeTarget::ScanError(ScanErrorColumn::Error) => "scan-error-error",
+            ColumnResizeTarget::PlaybackHistoryPlayedAt => "playback-history-played-at",
+        }
+    }
+
     pub(super) fn sort_column_for(column: TableColumn) -> Option<SortColumn> {
         match column {
             TableColumn::Index => Some(SortColumn::Index),
@@ -1300,6 +1974,53 @@ impl TempoApp {
             TableColumn::Plays => Some(SortColumn::Plays),
             TableColumn::Duration => Some(SortColumn::Duration),
             TableColumn::Artwork | TableColumn::Loved => None,
+        }
+    }
+
+    pub(super) fn header_sort_active(column: TableColumn, sort_column: SortColumn) -> bool {
+        match column {
+            TableColumn::Album => {
+                matches!(sort_column, SortColumn::Album | SortColumn::AlbumByArtist)
+            }
+            _ => Self::sort_column_for(column).is_some_and(|column| sort_column == column),
+        }
+    }
+
+    pub(super) fn header_sort_icon(
+        column: TableColumn,
+        sort_column: SortColumn,
+        sort_direction: SortDirection,
+    ) -> &'static str {
+        match (column, sort_column, sort_direction) {
+            (TableColumn::Album, SortColumn::AlbumByArtist, SortDirection::Ascending) => "▲ artist",
+            (TableColumn::Album, SortColumn::Album, SortDirection::Ascending) => "▲ A-Z",
+            (TableColumn::Album, SortColumn::AlbumByArtist, SortDirection::Descending) => {
+                "▼ artist"
+            }
+            (TableColumn::Album, SortColumn::Album, SortDirection::Descending) => "▼ Z-A",
+            (_, _, SortDirection::Ascending) => "▲",
+            (_, _, SortDirection::Descending) => "▼",
+        }
+    }
+
+    pub(super) fn next_album_sort(
+        sort_column: SortColumn,
+        sort_direction: SortDirection,
+    ) -> (SortColumn, SortDirection) {
+        match (sort_column, sort_direction) {
+            (SortColumn::AlbumByArtist, SortDirection::Ascending) => {
+                (SortColumn::Album, SortDirection::Ascending)
+            }
+            (SortColumn::Album, SortDirection::Ascending) => {
+                (SortColumn::AlbumByArtist, SortDirection::Descending)
+            }
+            (SortColumn::AlbumByArtist, SortDirection::Descending) => {
+                (SortColumn::Album, SortDirection::Descending)
+            }
+            (SortColumn::Album, SortDirection::Descending) => {
+                (SortColumn::AlbumByArtist, SortDirection::Ascending)
+            }
+            _ => (SortColumn::AlbumByArtist, SortDirection::Ascending),
         }
     }
 
@@ -1327,6 +2048,17 @@ impl TempoApp {
         let days = (duration.as_secs() / 86_400) as i64;
         let (year, month, day) = Self::civil_date_from_days(days);
         format!("{year:04}-{month:02}-{day:02}")
+    }
+
+    pub(super) fn date_time_label_from_unix(unix_secs: u64) -> String {
+        let days = (unix_secs / 86_400) as i64;
+        let seconds = unix_secs % 86_400;
+        let (year, month, day) = Self::civil_date_from_days(days);
+        let hour = seconds / 3_600;
+        let minute = (seconds % 3_600) / 60;
+        let second = seconds % 60;
+
+        format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
     }
 
     pub(super) fn civil_date_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
@@ -1366,12 +2098,20 @@ impl TempoApp {
                             }
                         })),
                 )
-                .child(self.context_menu_item("Add to queue").on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        this.queue_track(track_ix);
-                        cx.notify();
-                    },
-                )))
+                .child(
+                    self.context_menu_item("Add to start of queue")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.queue_track_at_start(track_ix);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    self.context_menu_item("Add to end of queue")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.queue_track_at_end(track_ix);
+                            cx.notify();
+                        })),
+                )
                 .child(self.context_menu_item("Queue Album").on_click(cx.listener(
                     move |this, _, _, cx| {
                         this.queue_album_from_track(track_ix, false);
