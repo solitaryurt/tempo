@@ -1,6 +1,50 @@
 use super::*;
 
 impl TempoApp {
+    fn render_marquee_text(
+        text: String,
+        animation_id: impl Into<SharedString>,
+        available_width: f32,
+        average_char_width: f32,
+        color: u32,
+    ) -> AnyElement {
+        let text_width = (text.chars().count() as f32 * average_char_width).max(1.0);
+
+        if text_width <= available_width {
+            return div()
+                .w_full()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_color(rgb(color))
+                .child(text)
+                .into_any_element();
+        }
+
+        let gap = 44.0;
+        let scroll_distance = text_width + gap;
+        let duration = Duration::from_millis(((scroll_distance / 18.0).max(7.0) * 1000.0) as u64);
+
+        div()
+            .w_full()
+            .overflow_hidden()
+            .text_color(rgb(color))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .child(div().w(px(text_width)).flex_none().child(text.clone()))
+                    .child(div().w(px(gap)).flex_none())
+                    .child(div().w(px(text_width)).flex_none().child(text))
+                    .with_animation(
+                        animation_id.into(),
+                        Animation::new(duration).repeat(),
+                        move |this, delta| this.ml(px(-scroll_distance * delta)),
+                    ),
+            )
+            .into_any_element()
+    }
+
     pub(super) fn start_playback_tick(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
@@ -51,6 +95,20 @@ impl TempoApp {
     }
 
     pub(super) fn queue_track(&mut self, track_ix: usize) {
+        self.queue_track_at_end(track_ix);
+    }
+
+    pub(super) fn queue_track_at_start(&mut self, track_ix: usize) {
+        if track_ix >= self.tracks.len() {
+            return;
+        }
+
+        self.queue.insert(0, track_ix);
+        self.right_sidebar_collapsed = false;
+        self.context_menu_track = None;
+    }
+
+    pub(super) fn queue_track_at_end(&mut self, track_ix: usize) {
         if track_ix >= self.tracks.len() {
             return;
         }
@@ -139,6 +197,10 @@ impl TempoApp {
     }
 
     pub(super) fn play_track(&mut self, track_ix: usize) {
+        self.play_track_with_history(track_ix, true);
+    }
+
+    pub(super) fn play_track_with_history(&mut self, track_ix: usize, record_history: bool) {
         let Some(track) = self.tracks.get(track_ix) else {
             return;
         };
@@ -162,6 +224,9 @@ impl TempoApp {
                     .unwrap_or_else(|| self.tracks[track_ix].plays.saturating_add(1));
                 if let Some(track) = self.tracks.get_mut(track_ix) {
                     track.plays = plays;
+                }
+                if record_history {
+                    self.record_playback_history(track_ix);
                 }
                 self.is_playing = true;
                 self.playback_status = "Playing".to_string();
@@ -243,7 +308,7 @@ impl TempoApp {
                 self.save_app_state();
 
                 if was_playing {
-                    self.play_track(self.playing_track);
+                    self.play_track_with_history(self.playing_track, false);
                 }
             }
             Err(error) => {
@@ -278,6 +343,56 @@ impl TempoApp {
 
     pub(super) fn set_max_volume(&mut self) {
         self.set_playback_volume(1.0);
+    }
+
+    pub(super) fn begin_volume_drag(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        self.volume_dragging = true;
+        self.set_volume_from_mouse(event.position, cx);
+        cx.stop_propagation();
+    }
+
+    pub(super) fn drag_volume(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) -> bool {
+        if !self.volume_dragging {
+            return false;
+        }
+
+        if !event.dragging() {
+            self.finish_volume_drag(cx);
+            return true;
+        }
+
+        self.set_volume_from_mouse(event.position, cx);
+        true
+    }
+
+    pub(super) fn finish_volume_drag(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.volume_dragging {
+            return false;
+        }
+
+        self.volume_dragging = false;
+        self.hide_tooltip_now("volume-tooltip", cx);
+        true
+    }
+
+    fn set_volume_from_mouse(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let volume = self.volume_from_x(position.x);
+        self.set_playback_volume(volume);
+        self.show_tooltip_now("volume-tooltip", self.volume_tooltip_label(), position, cx);
+    }
+
+    fn volume_from_x(&self, x: Pixels) -> f32 {
+        let bounds = self.volume_bar_scroll_handle.bounds();
+        let width = f32::from(bounds.size.width);
+        if width <= 0.0 {
+            return self.volume;
+        }
+
+        ((f32::from(x) - f32::from(bounds.origin.x)) / width).clamp(0.0, 1.0)
+    }
+
+    fn volume_tooltip_label(&self) -> SharedString {
+        SharedString::from(format!("Volume {}%", (self.volume * 100.0).round() as u8))
     }
 
     pub(super) fn play_adjacent_track(&mut self, delta: isize) {
@@ -703,9 +818,33 @@ impl TempoApp {
             (playback_position.as_secs_f32() / track.duration_value.as_secs_f32()).clamp(0.0, 1.0)
         };
         let now_playing_active_color = colors.accent;
-        let volume_fill = 104.0 * self.volume;
+        let show_alternate_now_playing_info =
+            self.now_playing_info_hovered && window.modifiers().alt;
+        let year_label = if track.year.eq_ignore_ascii_case("unknown year") {
+            "Unknown Year".to_string()
+        } else {
+            track.year.clone()
+        };
+        let alternate_status = format!("{} | {}", year_label, self.playback_status_label());
+        let title_color = if self.hovered_now_playing_link == Some(NowPlayingLink::Title) {
+            now_playing_active_color
+        } else {
+            colors.text_strong
+        };
+        let artist_color = if self.hovered_now_playing_link == Some(NowPlayingLink::Artist) {
+            now_playing_active_color
+        } else {
+            colors.text_muted
+        };
+        let album_color = if self.hovered_now_playing_link == Some(NowPlayingLink::Album) {
+            now_playing_active_color
+        } else {
+            colors.text_faint
+        };
+        let volume_fill = PLAYER_VOLUME_BAR_W * self.volume;
 
         div()
+            .id("player-bar")
             .relative()
             .h(px(86.0))
             .flex_none()
@@ -716,6 +855,12 @@ impl TempoApp {
             .border_t_1()
             .border_color(rgb(colors.button_hover))
             .bg(rgb(colors.player))
+            .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {
+                this.alt_pressed = event.modifiers.alt;
+                if this.now_playing_info_hovered {
+                    cx.notify();
+                }
+            }))
             .child(
                 div()
                     .id("now-playing-album-link")
@@ -732,69 +877,183 @@ impl TempoApp {
             )
             .child(
                 div()
+                    .id("now-playing-info")
                     .w(px(220.0))
+                    .flex_none()
+                    .min_w_0()
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .child(
+                    .justify_center()
+                    .gap(px(2.0))
+                    .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                        this.now_playing_info_hovered = *hovered;
+                        this.alt_pressed = window.modifiers().alt;
+                        cx.notify();
+                    }))
+                    .child(if show_alternate_now_playing_info {
                         div()
-                            .id("now-playing-title-link")
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(colors.text_strong))
-                            .cursor_pointer()
-                            .hover(move |this| this.text_color(rgb(now_playing_active_color)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.select_track_in_all_music(playing_track_ix);
-                                cx.notify();
-                            }))
-                            .child(track.title.clone()),
-                    )
-                    .child(
-                        div()
+                            .w_full()
+                            .min_w_0()
                             .flex()
-                            .items_center()
-                            .gap_1()
-                            .text_color(rgb(colors.text_muted))
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(colors.text_strong))
+                                    .child(Self::render_marquee_text(
+                                        track.codec.clone(),
+                                        SharedString::from(format!(
+                                            "now-playing-codec-marquee-{playing_track_ix}"
+                                        )),
+                                        220.0,
+                                        8.6,
+                                        colors.text_strong,
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_color(rgb(colors.text_muted))
+                                    .child(Self::render_marquee_text(
+                                        Self::bitrate_label(track),
+                                        SharedString::from(format!(
+                                            "now-playing-bitrate-marquee-{playing_track_ix}"
+                                        )),
+                                        220.0,
+                                        7.8,
+                                        colors.text_muted,
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_color(rgb(colors.text_faint))
+                                    .child(Self::render_marquee_text(
+                                        alternate_status,
+                                        SharedString::from(format!(
+                                            "now-playing-status-marquee-{playing_track_ix}"
+                                        )),
+                                        220.0,
+                                        7.8,
+                                        colors.text_faint,
+                                    )),
+                            )
+                    } else {
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .id("now-playing-title-link")
+                                    .w_full()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(title_color))
+                                    .cursor_pointer()
+                                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                        if *hovered {
+                                            this.hovered_now_playing_link =
+                                                Some(NowPlayingLink::Title);
+                                        } else if this.hovered_now_playing_link
+                                            == Some(NowPlayingLink::Title)
+                                        {
+                                            this.hovered_now_playing_link = None;
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.select_track_in_all_music(playing_track_ix);
+                                        cx.notify();
+                                    }))
+                                    .child(Self::render_marquee_text(
+                                        track.title.clone(),
+                                        SharedString::from(format!(
+                                            "now-playing-title-marquee-{playing_track_ix}"
+                                        )),
+                                        220.0,
+                                        8.6,
+                                        title_color,
+                                    )),
+                            )
                             .child(
                                 div()
                                     .id("now-playing-artist-link")
+                                    .w_full()
                                     .min_w_0()
                                     .overflow_hidden()
-                                    .text_ellipsis()
+                                    .text_color(rgb(artist_color))
                                     .cursor_pointer()
-                                    .hover(move |this| {
-                                        this.text_color(rgb(now_playing_active_color))
-                                    })
+                                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                        if *hovered {
+                                            this.hovered_now_playing_link =
+                                                Some(NowPlayingLink::Artist);
+                                        } else if this.hovered_now_playing_link
+                                            == Some(NowPlayingLink::Artist)
+                                        {
+                                            this.hovered_now_playing_link = None;
+                                        }
+                                        cx.notify();
+                                    }))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.open_artist_tab_for_track(playing_track_ix);
                                         cx.notify();
                                     }))
-                                    .child(track.artist.clone()),
+                                    .child(Self::render_marquee_text(
+                                        track.artist.clone(),
+                                        SharedString::from(format!(
+                                            "now-playing-artist-marquee-{playing_track_ix}"
+                                        )),
+                                        220.0,
+                                        7.8,
+                                        artist_color,
+                                    )),
                             )
-                            .child(div().text_color(rgb(colors.text_faint)).child("-"))
                             .child(
                                 div()
+                                    .id("now-playing-album-text-link")
+                                    .w_full()
                                     .min_w_0()
                                     .overflow_hidden()
-                                    .text_ellipsis()
-                                    .child(track.album.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(colors.text_faint))
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(track.codec.clone())
-                            .child("·")
-                            .child(Self::bitrate_label(track))
-                            .child("·")
-                            .child(track.year.clone())
-                            .child("·")
-                            .child(self.playback_status_dropdown(OutputMenuSource::Player, cx)),
-                    ),
+                                    .text_color(rgb(album_color))
+                                    .cursor_pointer()
+                                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                        if *hovered {
+                                            this.hovered_now_playing_link =
+                                                Some(NowPlayingLink::Album);
+                                        } else if this.hovered_now_playing_link
+                                            == Some(NowPlayingLink::Album)
+                                        {
+                                            this.hovered_now_playing_link = None;
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_album_tab_for_track(playing_track_ix);
+                                        cx.notify();
+                                    }))
+                                    .child(Self::render_marquee_text(
+                                        track.album.clone(),
+                                        SharedString::from(format!(
+                                            "now-playing-album-marquee-{playing_track_ix}"
+                                        )),
+                                        220.0,
+                                        7.8,
+                                        album_color,
+                                    )),
+                            )
+                    }),
             )
             .child(
                 div()
@@ -836,16 +1095,33 @@ impl TempoApp {
                             )
                             .child(
                                 div()
-                                    .flex_1()
-                                    .h(px(3.0))
-                                    .rounded_full()
-                                    .bg(rgb(colors.text_faint))
+                                    .id("volume-bar")
+                                    .w(px(PLAYER_VOLUME_BAR_W))
+                                    .h(px(18.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .cursor_pointer()
+                                    .track_scroll(&self.volume_bar_scroll_handle)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                                            this.begin_volume_drag(event, cx);
+                                        }),
+                                    )
                                     .child(
                                         div()
-                                            .w(px(volume_fill))
+                                            .w_full()
                                             .h(px(3.0))
                                             .rounded_full()
-                                            .bg(rgb(colors.text)),
+                                            .bg(rgb(colors.text_faint))
+                                            .child(
+                                                div()
+                                                    .w(px(volume_fill))
+                                                    .h(px(3.0))
+                                                    .rounded_full()
+                                                    .bg(rgb(colors.text)),
+                                            ),
                                     ),
                             )
                             .child(

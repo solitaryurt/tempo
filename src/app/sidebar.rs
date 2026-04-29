@@ -153,6 +153,13 @@ impl TempoApp {
                 Page::Albums,
                 cx,
             ))
+            .child(self.render_nav_item(
+                "History",
+                self.playback_history.len().to_string(),
+                self.page == Page::PlaybackHistory,
+                Page::PlaybackHistory,
+                cx,
+            ))
             .when(self.scan_progress.errors > 0, |this| {
                 this.child(self.render_nav_item(
                     "Scan Errors",
@@ -299,7 +306,15 @@ impl TempoApp {
             .bg(rgb(bg))
             .text_color(rgb(fg))
             .active(|this| this.opacity(0.82))
-            .child(label)
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Self::sidebar_nav_icon(target, active, colors))
+                    .child(div().overflow_hidden().text_ellipsis().child(label)),
+            )
             .child(
                 div()
                     .text_xs()
@@ -315,6 +330,68 @@ impl TempoApp {
                 cx.notify();
             }))
             .into_any_element()
+    }
+
+    pub(super) fn sidebar_nav_icon(target: Page, active: bool, colors: ThemeColors) -> AnyElement {
+        let color = format!(
+            "#{:06x}",
+            if active {
+                colors.text_strong
+            } else {
+                colors.text_muted
+            }
+        );
+        let accent = format!("#{:06x}", colors.accent);
+        let accent_stroke = if active {
+            accent.as_str()
+        } else {
+            color.as_str()
+        };
+        let paths = match target {
+            Page::Library => format!(
+                r#"<path d="M5 5.5H10.2C11.3 5.5 12 6.2 12 7.3V18.2C12 17.2 11.2 16.5 10.1 16.5H5V5.5Z" fill="none" stroke="{color}" stroke-width="1.6" stroke-linejoin="round"/>
+<path d="M19 5.5H13.8C12.7 5.5 12 6.2 12 7.3V18.2C12 17.2 12.8 16.5 13.9 16.5H19V5.5Z" fill="none" stroke="{color}" stroke-width="1.6" stroke-linejoin="round"/>
+<path d="M7.2 8.7H9.8M14.2 8.7H16.8M7.2 11.7H9.8M14.2 11.7H16.8" fill="none" stroke="{accent_stroke}" stroke-width="1.4" stroke-linecap="round"/>"#
+            ),
+            Page::Artists => format!(
+                r#"<circle cx="9" cy="8" r="3" fill="none" stroke="{color}" stroke-width="1.6"/>
+<path d="M3.8 18.5C4.7 15.6 6.5 14.2 9 14.2C11.5 14.2 13.3 15.6 14.2 18.5" fill="none" stroke="{color}" stroke-width="1.6" stroke-linecap="round"/>
+<circle cx="16.5" cy="9.2" r="2.2" fill="none" stroke="{accent_stroke}" stroke-width="1.5"/>
+<path d="M14.8 14.6C17.1 14.8 18.7 16.1 19.6 18.5" fill="none" stroke="{accent_stroke}" stroke-width="1.5" stroke-linecap="round"/>"#
+            ),
+            Page::Albums => format!(
+                r#"<rect x="4.2" y="4.2" width="15.6" height="15.6" rx="2.2" fill="none" stroke="{color}" stroke-width="1.6"/>
+<circle cx="12" cy="12" r="4.1" fill="none" stroke="{color}" stroke-width="1.6"/>
+<circle cx="12" cy="12" r="1.1" fill="{accent_stroke}"/>
+<path d="M15.1 8.9L17.1 6.9" fill="none" stroke="{accent_stroke}" stroke-width="1.5" stroke-linecap="round"/>"#
+            ),
+            Page::PlaybackHistory => format!(
+                r#"<circle cx="12" cy="12" r="7.6" fill="none" stroke="{color}" stroke-width="1.6"/>
+<path d="M12 7.4V12L15.5 14.1" fill="none" stroke="{accent_stroke}" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M5.5 6.3L3.8 4.6M18.5 6.3L20.2 4.6" fill="none" stroke="{color}" stroke-width="1.4" stroke-linecap="round"/>"#
+            ),
+            Page::ScanErrors => format!(
+                r#"<path d="M12 4.2L20 18.2H4L12 4.2Z" fill="none" stroke="{color}" stroke-width="1.6" stroke-linejoin="round"/>
+<path d="M12 9V13" fill="none" stroke="{accent_stroke}" stroke-width="1.8" stroke-linecap="round"/>
+<circle cx="12" cy="16" r="1" fill="{accent_stroke}"/>"#
+            ),
+            Page::Settings => format!(
+                r#"<circle cx="12" cy="12" r="3" fill="none" stroke="{color}" stroke-width="1.6"/>
+<path d="M12 4.5V6.5M12 17.5V19.5M4.5 12H6.5M17.5 12H19.5M6.7 6.7L8.1 8.1M15.9 15.9L17.3 17.3M17.3 6.7L15.9 8.1M8.1 15.9L6.7 17.3" fill="none" stroke="{accent_stroke}" stroke-width="1.5" stroke-linecap="round"/>"#
+            ),
+        };
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">{paths}</svg>"#
+        );
+
+        img(Arc::new(Image::from_bytes(
+            ImageFormat::Svg,
+            svg.into_bytes(),
+        )))
+        .w(px(15.0))
+        .h(px(15.0))
+        .flex_none()
+        .into_any_element()
     }
 
     pub(super) fn render_queue(&self, cx: &mut Context<Self>) -> AnyElement {
