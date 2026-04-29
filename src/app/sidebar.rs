@@ -57,30 +57,6 @@ impl TempoApp {
             .border_color(rgb(colors.border_subtle))
             .gap_2()
             .child(
-                self.sidebar_button("←", "navigate-back")
-                    .opacity(if self.back_history.is_empty() {
-                        0.4
-                    } else {
-                        1.0
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.navigate_back();
-                        cx.notify();
-                    })),
-            )
-            .child(
-                self.sidebar_button("→", "navigate-forward")
-                    .opacity(if self.forward_history.is_empty() {
-                        0.4
-                    } else {
-                        1.0
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.navigate_forward();
-                        cx.notify();
-                    })),
-            )
-            .child(
                 div()
                     .flex_1()
                     .font_weight(gpui::FontWeight::BOLD)
