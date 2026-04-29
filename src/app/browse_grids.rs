@@ -1,5 +1,11 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+struct BrowseGridMetrics {
+    columns: usize,
+    card_width: f32,
+}
+
 impl TempoApp {
     pub(super) fn render_detail_hero(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         match self.active_tab().source {
@@ -15,6 +21,9 @@ impl TempoApp {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let artist = self.artist_by_id(artist_id)?;
+        if artist.photo_path.is_none() || artist.bio.is_none() {
+            self.queue_artist_metadata_demand(artist.artist_id);
+        }
         let colors = *self.colors();
         let albums = self.albums_for_artist(artist.artist_id);
 
@@ -101,6 +110,9 @@ impl TempoApp {
         _cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let album = self.album_by_id(album_id)?;
+        if album.artwork_path.is_none() {
+            self.queue_album_cover_demand(album.album_id);
+        }
         let colors = *self.colors();
         let artist_bio = self
             .artist_by_id(album.artist_id)
@@ -195,7 +207,7 @@ impl TempoApp {
                 self.albums.len()
             )
         };
-        let grid_columns = self.browse_grid_columns(window);
+        let grid = self.browse_grid_metrics(window);
 
         div()
             .id("artists-page")
@@ -215,7 +227,7 @@ impl TempoApp {
                 this.child(self.render_tab_bar(cx))
             })
             .child(match self.artist_view_mode {
-                BrowseViewMode::Grid => self.render_artist_grid(grid_columns, artist_indices, cx),
+                BrowseViewMode::Grid => self.render_artist_grid(grid, artist_indices, cx),
                 BrowseViewMode::Table => self.render_artist_table(artist_indices, cx),
             })
     }
@@ -242,7 +254,7 @@ impl TempoApp {
                 self.tracks.len()
             )
         };
-        let grid_columns = self.browse_grid_columns(window);
+        let grid = self.browse_grid_metrics(window);
 
         div()
             .id("albums-page")
@@ -256,14 +268,14 @@ impl TempoApp {
                 this.child(self.render_tab_bar(cx))
             })
             .child(match self.album_view_mode {
-                BrowseViewMode::Grid => self.render_album_grid(grid_columns, album_indices, cx),
+                BrowseViewMode::Grid => self.render_album_grid(grid, album_indices, cx),
                 BrowseViewMode::Table => self.render_album_table(album_indices, cx),
             })
     }
 
     fn render_artist_grid(
         &self,
-        columns: usize,
+        grid: BrowseGridMetrics,
         artist_indices: Vec<usize>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -283,7 +295,7 @@ impl TempoApp {
                 "Add a music folder and Tempo will group indexed tracks by artist."
             },
             artist_indices,
-            columns,
+            grid,
             Self::render_artist_grid_row,
             cx,
         )
@@ -291,7 +303,7 @@ impl TempoApp {
 
     fn render_album_grid(
         &self,
-        columns: usize,
+        grid: BrowseGridMetrics,
         album_indices: Vec<usize>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -311,13 +323,13 @@ impl TempoApp {
                 "Add a music folder and Tempo will group indexed tracks by album."
             },
             album_indices,
-            columns,
+            grid,
             Self::render_album_grid_row,
             cx,
         )
     }
 
-    fn browse_grid_columns(&self, window: &Window) -> usize {
+    fn browse_grid_metrics(&self, window: &Window) -> BrowseGridMetrics {
         let sidebar_width = if self.left_sidebar_collapsed {
             0.0
         } else {
@@ -325,9 +337,16 @@ impl TempoApp {
         };
         let width = f32::from(window.viewport_size().width);
         let available = (width - sidebar_width - BROWSE_GRID_PAD_X).max(BROWSE_GRID_CARD_W);
-        ((available + BROWSE_GRID_GAP) / (BROWSE_GRID_CARD_W + BROWSE_GRID_GAP))
+        let columns = ((available + BROWSE_GRID_GAP) / (BROWSE_GRID_CARD_W + BROWSE_GRID_GAP))
             .floor()
-            .max(1.0) as usize
+            .max(1.0) as usize;
+        let total_gap = BROWSE_GRID_GAP * columns.saturating_sub(1) as f32;
+        let card_width = ((available - total_gap) / columns as f32).max(BROWSE_GRID_CARD_W);
+
+        BrowseGridMetrics {
+            columns,
+            card_width,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -339,8 +358,8 @@ impl TempoApp {
         empty_title: &'static str,
         empty_body: &'static str,
         item_indices: Vec<usize>,
-        columns: usize,
-        render_row: fn(&Self, usize, usize, &[usize], &mut Context<Self>) -> AnyElement,
+        grid: BrowseGridMetrics,
+        render_row: fn(&Self, usize, BrowseGridMetrics, &[usize], &mut Context<Self>) -> AnyElement,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let item_count = item_indices.len();
@@ -356,6 +375,7 @@ impl TempoApp {
         }
 
         let item_indices = Arc::new(item_indices);
+        let columns = grid.columns;
         let row_count = item_count.div_ceil(columns);
         let scroll_handle = self.browse_scroll_handle(target);
         div()
@@ -416,7 +436,7 @@ impl TempoApp {
                         );
                         let item_indices = item_indices.clone();
                         range
-                            .map(|row_ix| render_row(this, row_ix, columns, &item_indices, cx))
+                            .map(|row_ix| render_row(this, row_ix, grid, &item_indices, cx))
                             .collect()
                     }),
                 )
@@ -430,10 +450,11 @@ impl TempoApp {
     fn render_artist_grid_row(
         &self,
         row_ix: usize,
-        columns: usize,
+        grid: BrowseGridMetrics,
         artist_indices: &[usize],
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let columns = grid.columns;
         let start = row_ix * columns;
         let end = (start + columns).min(artist_indices.len());
 
@@ -446,7 +467,7 @@ impl TempoApp {
                 artist_indices[start..end]
                     .iter()
                     .filter_map(|artist_ix| self.artists.get(*artist_ix))
-                    .map(|artist| self.render_artist_card(artist, cx)),
+                    .map(|artist| self.render_artist_card(artist, grid.card_width, cx)),
             )
             .into_any_element()
     }
@@ -454,10 +475,11 @@ impl TempoApp {
     fn render_album_grid_row(
         &self,
         row_ix: usize,
-        columns: usize,
+        grid: BrowseGridMetrics,
         album_indices: &[usize],
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let columns = grid.columns;
         let start = row_ix * columns;
         let end = (start + columns).min(album_indices.len());
 
@@ -470,7 +492,7 @@ impl TempoApp {
                 album_indices[start..end]
                     .iter()
                     .filter_map(|album_ix| self.albums.get(*album_ix))
-                    .map(|album| self.render_album_card(album, cx)),
+                    .map(|album| self.render_album_card(album, grid.card_width, cx)),
             )
             .into_any_element()
     }
@@ -936,6 +958,9 @@ impl TempoApp {
                     .text_color(rgb(colors.text_faint))
                     .child(subtitle),
             )
+            .when_some(self.render_metadata_status(cx), |this, status| {
+                this.child(status)
+            })
             .child(div().flex_1())
             .child(self.render_search_box(window, "Search", cx))
             .child(
@@ -1196,16 +1221,24 @@ impl TempoApp {
             .into()
     }
 
-    fn render_artist_card(&self, artist: &Artist, cx: &mut Context<Self>) -> AnyElement {
+    fn render_artist_card(
+        &self,
+        artist: &Artist,
+        card_width: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let colors = *self.colors();
         let artist_id = artist.artist_id;
+        if artist.photo_path.is_none() {
+            self.queue_artist_metadata_demand(artist_id);
+        }
 
         div()
             .id(SharedString::from(format!(
                 "artist-card-{}",
                 artist.artist_id
             )))
-            .w(px(154.0))
+            .w(px(card_width))
             .flex_none()
             .rounded_lg()
             .border_1()
@@ -1223,7 +1256,7 @@ impl TempoApp {
                 artist.photo_path.as_ref(),
                 artist.initials.clone(),
                 artist.color,
-                154.0,
+                card_width,
             ))
             .child(
                 div()
@@ -1266,16 +1299,24 @@ impl TempoApp {
             .into_any_element()
     }
 
-    fn render_album_card(&self, album: &Album, cx: &mut Context<Self>) -> AnyElement {
+    fn render_album_card(
+        &self,
+        album: &Album,
+        card_width: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let colors = *self.colors();
         let album_id = album.album_id;
+        if album.artwork_path.is_none() {
+            self.queue_album_cover_demand(album_id);
+        }
 
         div()
             .id(SharedString::from(format!(
                 "album-card-{}-{}",
                 album.artist_id, album.album_id
             )))
-            .w(px(154.0))
+            .w(px(card_width))
             .flex_none()
             .rounded_lg()
             .border_1()
@@ -1296,7 +1337,7 @@ impl TempoApp {
                 album.artwork_path.as_ref(),
                 album.initials.clone(),
                 album.color,
-                154.0,
+                card_width,
             ))
             .child(
                 div()
@@ -1343,11 +1384,11 @@ impl TempoApp {
             .w_full()
             .overflow_x_scroll()
             .child(
-                div()
-                    .flex()
-                    .gap_3()
-                    .pb_2()
-                    .children(albums.iter().map(|album| self.render_album_card(album, cx))),
+                div().flex().gap_3().pb_2().children(
+                    albums
+                        .iter()
+                        .map(|album| self.render_album_card(album, BROWSE_GRID_CARD_W, cx)),
+                ),
             )
             .into_any_element()
     }

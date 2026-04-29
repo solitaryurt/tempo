@@ -12,9 +12,11 @@ impl TempoApp {
             .bg(rgb(colors.surface))
             .flex()
             .flex_col()
+            .min_h_0()
             .child(
                 div()
                     .h(px(54.0))
+                    .flex_none()
                     .px_4()
                     .flex()
                     .items_center()
@@ -67,6 +69,10 @@ impl TempoApp {
             )
             .child(
                 div()
+                    .id("settings-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .p_5()
                     .flex()
                     .flex_col()
@@ -76,6 +82,7 @@ impl TempoApp {
                     })
                     .child(self.render_theme_settings(cx))
                     .child(self.render_output_settings(cx))
+                    .child(self.render_online_metadata_settings(cx))
                     .child(self.render_library_settings(cx))
                     .child(self.render_playlist_settings(cx)),
             )
@@ -116,13 +123,18 @@ impl TempoApp {
             .collect::<Vec<_>>();
 
         div()
+            .flex_none()
             .rounded_lg()
             .border_1()
             .border_color(rgb(colors.border))
             .bg(rgb(colors.surface))
             .overflow_hidden()
+            .max_h(px(380.0))
+            .flex()
+            .flex_col()
             .child(
                 div()
+                    .flex_none()
                     .px_4()
                     .py_2()
                     .bg(rgb(colors.elevated))
@@ -139,6 +151,10 @@ impl TempoApp {
             )
             .child(
                 div()
+                    .id("theme-settings-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .px_4()
                     .py_3()
                     .border_t_1()
@@ -397,6 +413,116 @@ impl TempoApp {
                         )
                     }),
             )
+    }
+
+    pub(super) fn render_online_metadata_settings(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+
+        div()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.surface))
+            .overflow_hidden()
+            .child(
+                div()
+                    .px_4()
+                    .py_2()
+                    .bg(rgb(colors.elevated))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("Online Metadata"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(colors.text_muted))
+                            .child(self.online_metadata_mode.label()),
+                    ),
+            )
+            .child(
+                div()
+                    .px_4()
+                    .py_3()
+                    .border_t_1()
+                    .border_color(rgb(colors.border))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(colors.text_muted))
+                            .child(
+                                "Optional. Automatic mode contacts MusicBrainz to resolve artist IDs for future profile and discography enrichment.",
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(self.render_online_metadata_option(OnlineMetadataMode::Off, cx))
+                            .child(self.render_online_metadata_option(
+                                OnlineMetadataMode::Automatic,
+                                cx,
+                            )),
+                    ),
+            )
+    }
+
+    fn render_online_metadata_option(
+        &self,
+        mode: OnlineMetadataMode,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+        let selected = self.online_metadata_mode == mode;
+
+        div()
+            .id(SharedString::from(format!(
+                "online-metadata-{}",
+                mode.label().to_ascii_lowercase()
+            )))
+            .cursor_pointer()
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(if selected {
+                colors.accent
+            } else {
+                colors.waveform_border
+            }))
+            .bg(rgb(if selected {
+                colors.selected
+            } else {
+                colors.button
+            }))
+            .text_color(rgb(if selected {
+                colors.text_strong
+            } else {
+                colors.text
+            }))
+            .hover(move |this| {
+                this.bg(rgb(if selected {
+                    colors.selected
+                } else {
+                    colors.button_hover
+                }))
+            })
+            .active(|this| this.opacity(0.82))
+            .child(mode.label())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.set_online_metadata_mode(mode);
+                cx.notify();
+            }))
     }
 
     pub(super) fn render_library_root_row(

@@ -366,8 +366,35 @@ impl TempoApp {
                     ),
             )
             .child(self.render_scan_status(cx))
+            .when_some(self.render_metadata_status(cx), |this, status| {
+                this.child(status)
+            })
             .child(div().flex_1())
             .child(self.render_search_box(window, "Search library", cx))
+            .child(
+                self.sidebar_button("←", "navigate-back")
+                    .opacity(if self.back_history.is_empty() {
+                        0.4
+                    } else {
+                        1.0
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.navigate_back();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                self.sidebar_button("→", "navigate-forward")
+                    .opacity(if self.forward_history.is_empty() {
+                        0.4
+                    } else {
+                        1.0
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.navigate_forward();
+                        cx.notify();
+                    })),
+            )
             .child(
                 self.with_tooltip(
                     self.sidebar_button("⚙", "open-settings")
@@ -437,6 +464,81 @@ impl TempoApp {
                         })),
                 )
             })
+    }
+
+    pub(super) fn render_metadata_status(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
+        if self.online_metadata_mode != OnlineMetadataMode::Automatic
+            || !self.metadata_activity.is_active()
+        {
+            return None;
+        }
+
+        let colors = *self.colors();
+        let active = self.metadata_activity.running.max(1);
+        let pending = self.metadata_activity.pending;
+        let label = if pending > 0 {
+            format!("Syncing metadata: {active} active, {pending} queued")
+        } else {
+            format!("Syncing metadata: {active} active")
+        };
+
+        Some(
+            div()
+                .id("metadata-sync-status")
+                .text_xs()
+                .text_color(rgb(colors.accent))
+                .h(px(26.0))
+                .px_2()
+                .rounded_full()
+                .bg(rgb(colors.selected))
+                .border_1()
+                .border_color(rgb(colors.border))
+                .flex()
+                .items_center()
+                .gap_2()
+                .cursor_default()
+                .child(self.metadata_sync_glyph(colors))
+                .when(self.metadata_status_expanded, |this| {
+                    this.child(
+                        div()
+                            .text_color(rgb(colors.accent_soft))
+                            .whitespace_nowrap()
+                            .child(label),
+                    )
+                })
+                .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                    this.metadata_status_expanded = *hovered;
+                    cx.notify();
+                })),
+        )
+    }
+
+    fn metadata_sync_glyph(&self, colors: ThemeColors) -> AnyElement {
+        let color = format!("#{:06x}", colors.accent);
+        let muted = format!("#{:06x}", colors.text_muted);
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24">
+<g>
+<animateTransform attributeName="transform" attributeType="XML" type="rotate" from="0 12 12" to="360 12 12" dur="1.1s" repeatCount="indefinite"/>
+<path d="M19.2 8.2A8 8 0 0 0 5.7 5.7" fill="none" stroke="{muted}" stroke-width="2" stroke-linecap="round" opacity="0.45"/>
+<path d="M4.8 15.8A8 8 0 0 0 18.3 18.3" fill="none" stroke="{muted}" stroke-width="2" stroke-linecap="round" opacity="0.45"/>
+<path d="M18.8 4.8V8.8H14.8" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M5.2 19.2V15.2H9.2" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+</svg>"#
+        );
+
+        img(Arc::new(Image::from_bytes(
+            ImageFormat::Svg,
+            svg.into_bytes(),
+        )))
+        .w(px(16.0))
+        .h(px(16.0))
+        .flex_none()
+        .into_any_element()
     }
 
     pub(super) fn render_scan_errors_page(

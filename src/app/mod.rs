@@ -1,9 +1,10 @@
 use std::{
+    collections::HashSet,
     env, fs,
     ops::Range,
     path::PathBuf,
-    sync::{Arc, mpsc},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex, mpsc},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use gpui::{
@@ -18,13 +19,14 @@ use rodio::{Decoder, Source as _};
 use serde::{Deserialize, Serialize};
 use tempo::{
     catalog::{
-        CatalogAlbum, CatalogArtist, CatalogStore, CatalogTrack, individual_artist_names,
-        primary_artist_name,
+        CatalogAlbum, CatalogArtist, CatalogMetadataActivity, CatalogStore, CatalogTrack,
+        individual_artist_names, primary_artist_name,
     },
     library::{
         Artwork as LibraryArtwork, IndexingError, LibraryEvent, LibraryIndexer, LibraryWatcher,
         ScanProgress,
     },
+    metadata_worker::{MetadataEvent, MetadataWorker},
     perf,
     playback::PlaybackController,
 };
@@ -45,8 +47,9 @@ mod theme;
 mod tooltip;
 
 use crate::{
-    CloseTab, FocusSearch, MoveSelectionDown, MoveSelectionUp, NavigateBack, NavigateForward,
-    NewTab, NextTab, OpenSettings, PlayRandomTrack, PlaySelected, PreviousTab, TogglePause,
+    CloseAllTabs, CloseTab, FocusSearch, MoveSelectionDown, MoveSelectionUp, NavigateBack,
+    NavigateForward, NewTab, NextTab, OpenSettings, PlayRandomTrack, PlaySelected, PreviousTab,
+    TogglePause,
 };
 use text_input::TextInputState;
 use theme::{Theme, ThemeColors, bundled_themes, default_theme_id, resolve_theme_id};
@@ -74,6 +77,7 @@ enum SortColumn {
     Artist,
     AlbumByArtist,
     Album,
+    Genre,
     TrackNumber,
     Format,
     Bitrate,
@@ -91,6 +95,7 @@ enum TableColumn {
     Title,
     Artist,
     Album,
+    Genre,
     TrackNumber,
     Format,
     Bitrate,
@@ -115,6 +120,21 @@ enum PlaybackMode {
     Shuffle,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum OnlineMetadataMode {
+    Off,
+    Automatic,
+}
+
+impl OnlineMetadataMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Automatic => "Automatic",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OutputMenuSource {
     Player,
@@ -135,6 +155,7 @@ struct ColumnWidths {
     title: f32,
     artist: f32,
     album: f32,
+    genre: f32,
     track_number: f32,
     format: f32,
     bitrate: f32,
@@ -154,6 +175,7 @@ impl Default for ColumnWidths {
             title: TITLE_COL_W,
             artist: ARTIST_COL_W,
             album: ALBUM_COL_W,
+            genre: GENRE_COL_W,
             track_number: TRACK_NO_COL_W,
             format: FMT_COL_W,
             bitrate: BITRATE_COL_W,
@@ -272,6 +294,7 @@ struct Track {
     title: String,
     artist: String,
     album: String,
+    genre: String,
     track_number: Option<u32>,
     year: String,
     date_added: SystemTime,
@@ -310,6 +333,12 @@ struct Album {
     track_count: usize,
     initials: String,
     color: u32,
+}
+
+#[derive(Default)]
+struct MetadataDemandQueue {
+    artists: HashSet<i64>,
+    albums: HashSet<i64>,
 }
 
 #[derive(Clone)]
@@ -669,6 +698,8 @@ struct AppState {
     /// stays correct after the library is rescanned and indices shift.
     #[serde(default)]
     playing_track_path: Option<PathBuf>,
+    #[serde(default = "default_online_metadata_mode")]
+    online_metadata_mode: OnlineMetadataMode,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -709,8 +740,13 @@ impl Default for AppState {
             album_table_scroll_top: 0.0,
             playback_history: Vec::new(),
             playing_track_path: None,
+            online_metadata_mode: default_online_metadata_mode(),
         }
     }
+}
+
+fn default_online_metadata_mode() -> OnlineMetadataMode {
+    OnlineMetadataMode::Off
 }
 
 fn default_page() -> Page {
@@ -740,6 +776,23 @@ fn default_visible_table_columns() -> Vec<TableColumn> {
         TableColumn::Title,
         TableColumn::Artist,
         TableColumn::Album,
+        TableColumn::Genre,
+        TableColumn::TrackNumber,
+        TableColumn::Bitrate,
+        TableColumn::FileSize,
+        TableColumn::Year,
+        TableColumn::DateAdded,
+        TableColumn::Duration,
+    ]
+}
+
+fn old_default_visible_table_columns() -> Vec<TableColumn> {
+    vec![
+        TableColumn::Index,
+        TableColumn::Artwork,
+        TableColumn::Title,
+        TableColumn::Artist,
+        TableColumn::Album,
         TableColumn::TrackNumber,
         TableColumn::Bitrate,
         TableColumn::FileSize,
@@ -755,6 +808,7 @@ const ALL_TABLE_COLUMNS: &[TableColumn] = &[
     TableColumn::Title,
     TableColumn::Artist,
     TableColumn::Album,
+    TableColumn::Genre,
     TableColumn::TrackNumber,
     TableColumn::Format,
     TableColumn::Bitrate,
@@ -771,6 +825,7 @@ const ART_COL_W: f32 = 32.0;
 const TITLE_COL_W: f32 = 188.0;
 const ARTIST_COL_W: f32 = 160.0;
 const ALBUM_COL_W: f32 = 230.0;
+const GENRE_COL_W: f32 = 120.0;
 const TRACK_NO_COL_W: f32 = 58.0;
 const FMT_COL_W: f32 = 70.0;
 const BITRATE_COL_W: f32 = 86.0;
@@ -801,6 +856,7 @@ const TABLE_SCROLLBAR_MIN_THUMB_H: f32 = 32.0;
 const TABLE_SCROLLBAR_MAX_MARKERS: usize = 28;
 const TABLE_SCROLL_IDLE_DELAY: Duration = Duration::from_millis(120);
 const SEARCH_DEBOUNCE_DELAY: Duration = Duration::from_millis(90);
+const SCAN_BROWSE_RELOAD_INTERVAL: Duration = Duration::from_millis(750);
 const FAST_SCROLL_OVERSCAN_ROWS: usize = 4;
 const BROWSE_GRID_CARD_W: f32 = 154.0;
 const BROWSE_GRID_GAP: f32 = 16.0;
@@ -860,6 +916,7 @@ pub(crate) struct TempoApp {
     output_device: Option<String>,
     output_menu_source: Option<OutputMenuSource>,
     output_menu_position: Point<Pixels>,
+    online_metadata_mode: OnlineMetadataMode,
     volume: f32,
     pre_mute_volume: f32,
     volume_dragging: bool,
@@ -867,7 +924,9 @@ pub(crate) struct TempoApp {
     scan_progress: ScanProgress,
     scan_errors: Vec<IndexingError>,
     scan_changed_tracks: bool,
+    last_scan_browse_reload: Option<Instant>,
     is_scanning: bool,
+    metadata_activity: CatalogMetadataActivity,
     table_scrollbar_drag: Option<TableScrollbarDrag>,
     table_horizontal_scrollbar_drag: Option<TableHorizontalScrollbarDrag>,
     browse_scrollbar_drag: Option<BrowseScrollbarDrag>,
@@ -881,6 +940,10 @@ pub(crate) struct TempoApp {
     table_scroll_generation: u64,
     catalog: Option<CatalogStore>,
     _library_watcher: Option<LibraryWatcher>,
+    metadata_event_tx: mpsc::Sender<MetadataEvent>,
+    metadata_demand_queue: Arc<Mutex<MetadataDemandQueue>>,
+    metadata_status_expanded: bool,
+    _metadata_worker: Option<MetadataWorker>,
     playback: Option<PlaybackController>,
     _save_on_quit: Option<Subscription>,
 }
@@ -923,6 +986,8 @@ impl TempoApp {
             format!("albums={}", cached_albums.len()),
         );
         let (event_tx, event_rx) = mpsc::channel();
+        let (metadata_event_tx, metadata_event_rx) = mpsc::channel();
+        let metadata_demand_queue = Arc::new(Mutex::new(MetadataDemandQueue::default()));
         let (mut library_status, library_watcher) = perf::time(
             "startup.start_watcher",
             format!("roots={}", roots.len()),
@@ -1045,6 +1110,7 @@ impl TempoApp {
             output_device,
             output_menu_source: None,
             output_menu_position: Point::default(),
+            online_metadata_mode: state.online_metadata_mode,
             volume,
             pre_mute_volume: if volume > 0.0 {
                 volume
@@ -1056,7 +1122,9 @@ impl TempoApp {
             scan_progress: ScanProgress::default(),
             scan_errors: Vec::new(),
             scan_changed_tracks: false,
+            last_scan_browse_reload: None,
             is_scanning: false,
+            metadata_activity: CatalogMetadataActivity::default(),
             table_scrollbar_drag: None,
             table_horizontal_scrollbar_drag: None,
             browse_scrollbar_drag: None,
@@ -1071,6 +1139,10 @@ impl TempoApp {
             catalog,
             playback_history: state.playback_history,
             _library_watcher: library_watcher,
+            metadata_event_tx,
+            metadata_demand_queue,
+            metadata_status_expanded: false,
+            _metadata_worker: None,
             playback,
             _save_on_quit: Some(save_on_quit),
         };
@@ -1107,6 +1179,12 @@ impl TempoApp {
         perf::time("startup.start_library_event_loop", "", || {
             app.start_library_event_loop(event_rx, cx)
         });
+        perf::time("startup.start_metadata_event_loop", "", || {
+            app.start_metadata_event_loop(metadata_event_rx, cx)
+        });
+        perf::time("startup.start_metadata_activity_poll", "", || {
+            app.start_metadata_activity_poll(cx)
+        });
         perf::time("startup.start_playback_tick", "", || {
             app.start_playback_tick(cx)
         });
@@ -1125,7 +1203,102 @@ impl TempoApp {
         {
             app.spawn_snapshot_rebuild("initial_build");
         }
+        app.restart_metadata_worker();
         app
+    }
+
+    fn set_online_metadata_mode(&mut self, mode: OnlineMetadataMode) {
+        if self.online_metadata_mode == mode {
+            return;
+        }
+
+        self.online_metadata_mode = mode;
+        if mode == OnlineMetadataMode::Off {
+            self.metadata_activity = CatalogMetadataActivity::default();
+        }
+        self.restart_metadata_worker();
+        self.save_app_state();
+    }
+
+    fn queue_artist_metadata_demand(&self, artist_id: i64) {
+        if self.online_metadata_mode != OnlineMetadataMode::Automatic {
+            return;
+        }
+        let Some(catalog) = self.catalog.clone() else {
+            return;
+        };
+        let Ok(mut demand_queue) = self.metadata_demand_queue.lock() else {
+            return;
+        };
+        if !demand_queue.artists.insert(artist_id) {
+            return;
+        }
+        drop(demand_queue);
+
+        std::thread::Builder::new()
+            .name("tempo-metadata-demand".into())
+            .spawn(move || {
+                if let Err(error) = catalog.enqueue_artist_metadata_demand(artist_id) {
+                    perf::event(
+                        "metadata.demand.artist_error",
+                        format!("artist_id={artist_id} error={error:#}"),
+                    );
+                }
+            })
+            .ok();
+    }
+
+    fn queue_album_cover_demand(&self, album_id: i64) {
+        if self.online_metadata_mode != OnlineMetadataMode::Automatic {
+            return;
+        }
+        let Some(catalog) = self.catalog.clone() else {
+            return;
+        };
+        let Ok(mut demand_queue) = self.metadata_demand_queue.lock() else {
+            return;
+        };
+        if !demand_queue.albums.insert(album_id) {
+            return;
+        }
+        drop(demand_queue);
+
+        std::thread::Builder::new()
+            .name("tempo-metadata-demand".into())
+            .spawn(move || {
+                if let Err(error) = catalog.enqueue_album_cover_demand(album_id) {
+                    perf::event(
+                        "metadata.demand.album_error",
+                        format!("album_id={album_id} error={error:#}"),
+                    );
+                }
+            })
+            .ok();
+    }
+
+    fn restart_metadata_worker(&mut self) {
+        if let Some(worker) = self._metadata_worker.take() {
+            worker.stop();
+        }
+
+        if self.online_metadata_mode != OnlineMetadataMode::Automatic {
+            return;
+        }
+
+        let Some(catalog) = self.catalog.clone() else {
+            self.library_status =
+                "Online metadata unavailable: catalog cache is unavailable".to_string();
+            return;
+        };
+
+        match MetadataWorker::start(catalog, self.metadata_event_tx.clone()) {
+            Ok(worker) => {
+                self._metadata_worker = Some(worker);
+            }
+            Err(error) => {
+                self.library_status = format!("Online metadata worker failed: {error:#}");
+            }
+        }
     }
 
     fn create_playlist(&mut self) {
@@ -1211,6 +1384,7 @@ impl TempoApp {
     }
 
     fn set_page_without_history(&mut self, page: Page) {
+        self.clear_tooltip();
         self.page = self.resolved_page(page);
         if self.page != Page::Library {
             self.search_input.clear();
@@ -1484,6 +1658,7 @@ impl TempoApp {
         self.set_page_without_history(Page::Library);
         self.sync_search_input_to_active_tab();
         self.record_navigation_from(previous);
+        self.queue_artist_metadata_demand(artist_id);
     }
 
     fn open_album_tab(&mut self, album_id: i64) {
@@ -1504,6 +1679,7 @@ impl TempoApp {
         self.set_page_without_history(Page::Library);
         self.sync_search_input_to_active_tab();
         self.record_navigation_from(previous);
+        self.queue_album_cover_demand(album_id);
     }
 
     fn select_tab(&mut self, tab_ix: usize) {
@@ -1620,6 +1796,17 @@ impl TempoApp {
         self.context_menu_track = None;
     }
 
+    fn close_all_tabs(&mut self) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+
+        self.tabs.truncate(1);
+        self.active_tab = 0;
+        self.sync_search_input_to_active_tab();
+        self.context_menu_track = None;
+    }
+
     fn can_close_tab(&self, tab_ix: usize) -> bool {
         // The very first tab is the permanent "All Music" anchor and is
         // never closable. Every other tab (including additional All Music
@@ -1642,6 +1829,7 @@ impl From<tempo::library::Track> for Track {
             title: track.title,
             artist: track.artist,
             album: track.album,
+            genre: track.genre.unwrap_or_else(|| "Unknown genre".to_string()),
             track_number: track.track_number,
             year: track.year.unwrap_or_else(|| "Unknown year".to_string()),
             date_added: track.date_added,
@@ -1671,6 +1859,7 @@ impl From<CatalogTrack> for Track {
             title: track.title,
             artist: track.artist,
             album: track.album,
+            genre: track.genre.unwrap_or_else(|| "Unknown genre".to_string()),
             track_number: track.track_number,
             year: track.year.unwrap_or_else(|| "Unknown year".to_string()),
             date_added: track.date_added,
@@ -1778,6 +1967,7 @@ impl Render for TempoApp {
             .on_action(cx.listener(Self::move_selection_down))
             .on_action(cx.listener(Self::new_tab))
             .on_action(cx.listener(Self::close_active_tab))
+            .on_action(cx.listener(Self::close_all_tabs_action))
             .on_action(cx.listener(Self::next_tab_action))
             .on_action(cx.listener(Self::previous_tab_action))
             .on_action(cx.listener(Self::focus_search))
@@ -1929,6 +2119,11 @@ impl TempoApp {
 
     fn close_active_tab(&mut self, _: &CloseTab, _: &mut Window, cx: &mut Context<Self>) {
         self.close_tab(self.active_tab);
+        cx.notify();
+    }
+
+    fn close_all_tabs_action(&mut self, _: &CloseAllTabs, _: &mut Window, cx: &mut Context<Self>) {
+        self.close_all_tabs();
         cx.notify();
     }
 
