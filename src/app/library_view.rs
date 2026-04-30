@@ -603,13 +603,13 @@ impl TempoApp {
                 ),
             )
             .when(
-                // Only surface the reopen arrow when clicking it
-                // would actually show something. Tying the gate to
-                // the *active* view (not "any view has content")
-                // matches the sidebar's own early-return logic, so
-                // e.g. clearing the queue while in the Queue view
-                // hides both the sidebar and the reopen arrow.
-                self.right_sidebar_collapsed && self.right_sidebar_active_view_has_content(),
+                // Always surface the reopen arrow whenever the right
+                // sidebar is collapsed, even if the active view is
+                // empty (e.g. Up Next with an empty queue). The
+                // sidebar's own render path will show an empty-state
+                // message when reopened, which is preferable to the
+                // toggle silently disappearing.
+                self.right_sidebar_collapsed,
                 |this| {
                     this.child(self.sidebar_button("‹", "open-right-sidebar").on_click(
                         cx.listener(|this, _, _, cx| {

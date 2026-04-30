@@ -595,12 +595,6 @@ impl TempoApp {
         let queue_empty = queue_indices.is_empty();
         let history_indices = self.sorted_playback_history_indices();
         let history_empty = history_indices.is_empty();
-        // Hide the right sidebar entirely only if there is genuinely
-        // nothing the user could ever switch to. Playlists count as
-        // potential content even when empty so a ctrl+click on a
-        // newly-created playlist still surfaces the sidebar.
-        let nothing_to_show = queue_empty && history_empty && self.playlists.is_empty();
-
         let playlist_track_ix_for_view = match view {
             RightSidebarView::Playlist(ix) => Some(self.playlist_track_indices(ix)),
             _ => None,
@@ -621,7 +615,7 @@ impl TempoApp {
         // the sidebar chrome with an empty-state message — silently
         // closing the sidebar after the user picks "Up Next" while
         // the queue is empty made it look like the click was a no-op.
-        if collapsed || nothing_to_show {
+        if collapsed {
             return div().w(px(0.0)).flex_none().into_any_element();
         }
 
@@ -1637,27 +1631,6 @@ impl TempoApp {
         match self.right_sidebar_view {
             RightSidebarView::Playlist(ix) if ix >= self.playlists.len() => RightSidebarView::Queue,
             other => other,
-        }
-    }
-
-    /// Returns true when the active right-sidebar view has rows to
-    /// render. Used by both the sidebar render path (early-return
-    /// when the active view is empty) and the library top-bar's
-    /// reopen-arrow gating (so the arrow only appears when clicking
-    /// it would actually surface content).
-    ///
-    /// Filters the queue against `tracks.len()` to match the same
-    /// stale-index filtering `render_queue` applies, so a queue that
-    /// is non-empty in the raw `Vec` but consists entirely of stale
-    /// indices is correctly considered empty here too.
-    pub(super) fn right_sidebar_active_view_has_content(&self) -> bool {
-        match self.sanitized_right_sidebar_view() {
-            RightSidebarView::Queue => self
-                .queue
-                .iter()
-                .any(|track_ix| *track_ix < self.tracks.len()),
-            RightSidebarView::History => !self.playback_history.is_empty(),
-            RightSidebarView::Playlist(ix) => !self.playlist_track_indices(ix).is_empty(),
         }
     }
 
