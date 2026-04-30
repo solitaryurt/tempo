@@ -32,7 +32,9 @@ actions!(
         OpenSettings,
         PlayRandomTrack,
         NavigateBack,
-        NavigateForward
+        NavigateForward,
+        ToggleMiniPlayer,
+        CycleMiniPlayer
     ]
 );
 
@@ -77,6 +79,8 @@ fn main() {
             KeyBinding::new("/", FocusSearch, None),
             KeyBinding::new("alt-left", NavigateBack, None),
             KeyBinding::new("alt-right", NavigateForward, None),
+            KeyBinding::new("ctrl-m", ToggleMiniPlayer, None),
+            KeyBinding::new("ctrl-shift-m", CycleMiniPlayer, None),
         ]);
 
         cx.activate(true);

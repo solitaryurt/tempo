@@ -23,6 +23,7 @@
 //! 3. **No state change, just notify** — modifier-key changes for the
 //!    alt overlay use `cx.notify()` directly on the player.
 
+use super::mini;
 use super::visualizers::{self, VisualizerContext};
 use super::*;
 use entity::PlayingTrackSnapshot;
@@ -48,6 +49,16 @@ impl Render for PlayerEntity {
         let Some(snapshot) = self.playing_track.clone() else {
             return empty_player_bar(colors);
         };
+
+        // Mini player layout takes over the full window. The
+        // `mini::render` path owns its own marquee, transport
+        // overlay, progress / visualizer bar, and size-cycle button;
+        // it shares the same `PlayerEntity` event vocabulary as the
+        // full bar so click handlers reuse the parent's
+        // `handle_player_event` arms unchanged.
+        if let WindowMode::Mini(size) = self.window_mode {
+            return mini::render_mini_player(self, &snapshot, size, window, cx);
+        }
 
         let path = snapshot.path.clone();
         let (waveform_source, waveform_loading) = self.cached_waveform_for_path(&path, cx);
@@ -200,6 +211,7 @@ impl Render for PlayerEntity {
             .child(
                 div()
                     .id("now-playing-info")
+                    .relative()
                     .w(px(220.0))
                     .flex_none()
                     .min_w_0()
@@ -212,6 +224,14 @@ impl Render for PlayerEntity {
                         player.set_now_playing_info_hovered(*hovered, alt);
                         cx.notify();
                     }))
+                    // Mini-player toggle pinned to the bottom-right
+                    // of the now-playing info column. Spaced from the
+                    // seekbar (the next sibling of `now-playing-info`)
+                    // by the player bar's gap_4 + this column's
+                    // padding-right. The marquee text columns above
+                    // use `w_full().min_w_0().overflow_hidden()`, so
+                    // an absolute child stays out of their layout.
+                    .child(mini::mini_toggle_button(colors, cx))
                     .child(if show_alternate_now_playing_info {
                         div()
                             .w_full()
@@ -359,6 +379,15 @@ impl Render for PlayerEntity {
                                     .w_full()
                                     .min_w_0()
                                     .overflow_hidden()
+                                    // Reserve room for the mini-player
+                                    // toggle pinned to the bottom-right of
+                                    // this column so a long album title
+                                    // can't marquee underneath the button.
+                                    // Width here matches the visible space
+                                    // the button occupies inside the column
+                                    // (button is shifted partially into the
+                                    // bar gap via negative `right`).
+                                    .pr(px(14.0))
                                     .text_color(rgb(album_color))
                                     .cursor_pointer()
                                     .on_hover(cx.listener(|player, hovered: &bool, _, cx| {
@@ -385,7 +414,7 @@ impl Render for PlayerEntity {
                                             "now-playing-album-marquee-{}",
                                             snapshot.path.display()
                                         )),
-                                        220.0,
+                                        206.0,
                                         7.8,
                                         album_color,
                                     )),
@@ -678,7 +707,7 @@ pub(super) fn volume_speaker_icon(waves: usize, colors: ThemeColors) -> AnyEleme
 /// [`PlayerEvent::RequestSeekFromWaveformClick`] — the parent does
 /// the backend-empty restart logic that needs `tracks`.
 #[allow(clippy::too_many_arguments)]
-fn waveform_seekbar(
+pub(super) fn waveform_seekbar(
     elapsed: SharedString,
     duration: SharedString,
     progress: f32,
@@ -1383,7 +1412,7 @@ fn waveform_bar(
 /// parent handles the cross-region work (resolving the next track
 /// from the active tab's index list, smart pause/resume/restart,
 /// etc.).
-fn transport_overlay(
+pub(super) fn transport_overlay(
     is_playing: bool,
     mode_icon: &'static str,
     mode_active: bool,

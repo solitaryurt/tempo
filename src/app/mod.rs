@@ -9,12 +9,13 @@ use std::{
 };
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, ClickEvent, ClipboardItem, Context, Corner,
+    Animation, AnimationExt as _, AnyElement, Bounds, ClickEvent, ClipboardItem, Context, Corner,
     CursorStyle, Entity, FocusHandle, Image, ImageFormat, IntoElement, KeyDownEvent,
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     NavigationDirection, ObjectFit, ParentElement, PathPromptOptions, Pixels, Point, Render,
-    ScrollStrategy, ScrollWheelEvent, SharedString, Styled, Subscription, UniformListScrollHandle,
-    Window, anchored, div, img, point, prelude::*, px, relative, rgb, uniform_list,
+    ScrollStrategy, ScrollWheelEvent, SharedString, Size, Styled, Subscription,
+    UniformListScrollHandle, Window, WindowBounds, anchored, div, img, point, prelude::*, px,
+    relative, rgb, size, uniform_list,
 };
 use rodio::{Decoder, Source as _};
 use serde::{Deserialize, Serialize};
@@ -64,10 +65,10 @@ pub(in crate::app) use menu::{
 };
 
 use crate::{
-    CloseAllTabs, CloseTab, FocusSearch, MoveSelectionDown, MoveSelectionUp, NavigateBack,
-    NavigateForward, NewTab, NextTab, OpenSettings, PlayRandomTrack, PlaySelected, PreviousTab,
-    ReopenClosedTab, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
-    SelectTab7, SelectTab8, SelectTab9, SelectTab10, TogglePause,
+    CloseAllTabs, CloseTab, CycleMiniPlayer, FocusSearch, MoveSelectionDown, MoveSelectionUp,
+    NavigateBack, NavigateForward, NewTab, NextTab, OpenSettings, PlayRandomTrack, PlaySelected,
+    PreviousTab, ReopenClosedTab, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5,
+    SelectTab6, SelectTab7, SelectTab8, SelectTab9, SelectTab10, ToggleMiniPlayer, TogglePause,
 };
 use text_input::TextInputState;
 use theme::{Theme, ThemeColors, bundled_themes, default_theme_id, resolve_theme_id};
@@ -206,6 +207,104 @@ enum PlaybackMode {
     Straight,
     Loop,
     Shuffle,
+}
+
+/// Top-level window layout mode.
+///
+/// `Full` is the default many-pixel UI with sidebar, content pages, and
+/// the player bar at the bottom. `Mini(MiniSize)` shrinks the window
+/// down to a compact "now playing" surface — either a horizontal bar or
+/// one of two squares — with hover-revealed transport / volume / seek
+/// controls.
+///
+/// Mini mode is intentionally *runtime-only*: it is not serialized into
+/// `state.json`, so launching Tempo always starts in `Full`. The user
+/// re-enters mini mode via the 2D-glyph button in the bottom-right of
+/// the now-playing info column or via `Ctrl+M`.
+///
+/// TODO(always-on-top): GPUI 0.2.2 has no runtime API to mark a window
+/// as always-on-top. The mini player would benefit from "stay above
+/// other windows" semantics; revisit when GPUI exposes a setter, or
+/// when a platform shim (X11 `_NET_WM_STATE_ABOVE` / Wayland
+/// layer-shell) is added.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WindowMode {
+    Full,
+    Mini(MiniSize),
+}
+
+/// Two discrete mini-player layouts, toggled by the size-cycle icon
+/// inside the mini overlay (`CompactBar ↔ Square`).
+///
+/// `CompactBar` has a fixed shape (360x100) — there's nothing useful
+/// to drag-resize on a horizontal strip. `Square` always opens at the
+/// default 400x400; the user can drag-resize it freely while it's open
+/// and the album art fills whatever rectangle the window currently
+/// has, minus the bottom metadata strip. The size is *not* remembered
+/// across cycles — re-entering `Square` always reopens at 400x400.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MiniSize {
+    /// 360x100 horizontal bar with thumbnail on the left and
+    /// title/artist/album stacked on the right.
+    CompactBar,
+    /// 400x400 default; user-resizable while open. Album art fills
+    /// the available area above a thin metadata strip; controls
+    /// overlay on hover.
+    Square,
+}
+
+impl MiniSize {
+    /// Pixel size used when (re)opening the GPUI window for this
+    /// variant. Always returns the same value for a given variant —
+    /// `Square` is intentionally not "sticky" across cycles, so each
+    /// activation reopens at the default and the user is free to
+    /// resize from there.
+    pub(crate) fn default_window_size(self) -> Size<Pixels> {
+        let (w, h) = match self {
+            Self::CompactBar => (360.0, 100.0),
+            Self::Square => (400.0, 400.0),
+        };
+        size(px(w), px(h))
+    }
+
+    /// Next size in the cycle order.
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::CompactBar => Self::Square,
+            Self::Square => Self::CompactBar,
+        }
+    }
+}
+
+/// Deferred window-swap request — used only when *transitioning
+/// between* full and mini mode (full→mini and mini→full).
+///
+/// The render path consumes this on the next paint, opens a new window
+/// with the resolved bounds, mounts the existing `Entity<TempoApp>` as
+/// its root, and closes the old window. We have to swap-and-replace
+/// rather than `window.resize()` for these transitions because:
+///
+/// - Hyprland (and several other Wayland compositors) ignore most
+///   client-driven resize requests for tiled windows.
+/// - The full→mini size delta is huge (1280×820 → 360×100), and a
+///   full→mini in-place resize on Hyprland leaves the window tiled
+///   into its old slot and the compositor re-runs its placement
+///   rules anyway.
+///
+/// **Mini-mode size cycling** (CompactBar ↔ Square ↔ LargeSquare)
+/// uses [`PendingWindowResize`] instead — once the window is already
+/// floating, `window.resize()` is honored, so we keep the same window
+/// (and the user's manual move/anchor of the floating window).
+#[derive(Clone, Copy)]
+pub(crate) struct PendingWindowSwap {
+    /// Target content size for the new window.
+    pub(crate) target_size: Size<Pixels>,
+    /// If `Some`, the new window opens at exactly these bounds
+    /// (used when leaving mini mode to restore the pre-mini
+    /// position). If `None`, the render path keeps the new window
+    /// centered on the current window's center so the swap feels
+    /// "in place".
+    pub(crate) explicit_bounds: Option<Bounds<Pixels>>,
 }
 
 /// Which visualizer renders inside the seekbar surface.
@@ -1900,6 +1999,27 @@ pub(crate) struct TempoApp {
     /// app for the app's lifetime.
     _player_subscription: Subscription,
     _save_on_quit: Option<Subscription>,
+    /// Top-level window layout mode (full vs mini). Runtime-only;
+    /// not serialized to `state.json`.
+    pub(crate) window_mode: WindowMode,
+    /// Bounds the window had immediately before entering mini mode,
+    /// so we can restore them when returning to full. Captured the
+    /// frame `RequestEnterMini` is processed (see `enter_mini_mode`).
+    saved_full_bounds: Option<Bounds<Pixels>>,
+    /// `Some(_)` when any mini-mode change (enter / exit / size
+    /// cycle) has been requested. Causes a window-recreate (close
+    /// current, open a new one with the target bounds, mount the
+    /// same `Entity<TempoApp>` as root). See [`PendingWindowSwap`]
+    /// for why all three transitions go through this rather than
+    /// in-place `window.resize` — Wayland compositors generally
+    /// treat resize as advisory and ignore it for tiled windows,
+    /// so a real reopen is the only reliable way to change the
+    /// window's actual size.
+    pending_window_swap: Option<PendingWindowSwap>,
+    /// Same indirection for the OS title bar (used to surface the
+    /// current track in mini mode so the system task switcher /
+    /// taskbar shows useful info).
+    pending_window_title: Option<String>,
 }
 
 impl TempoApp {
@@ -2222,6 +2342,10 @@ impl TempoApp {
             eq_profile_save_as_focus_handle: None,
             _player_subscription: player_subscription,
             _save_on_quit: Some(save_on_quit),
+            window_mode: WindowMode::Full,
+            saved_full_bounds: None,
+            pending_window_swap: None,
+            pending_window_title: None,
         };
 
         app.artist_grid_scroll_handle
@@ -3952,6 +4076,122 @@ impl Render for TempoApp {
         // Keep the active tab visible in the horizontal tab strip.
         // No-op when active_tab hasn't changed since the last frame.
         self.auto_scroll_active_tab_into_view();
+
+        // Drain pending mini-mode window adjustments. Event handlers
+        // (e.g. `RequestEnterMini`) don't get a `&mut Window`, so
+        // they stash a target-bounds value here and the swap happens
+        // on the next paint where we have `&mut Window` + `&mut App`.
+        //
+        // The swap is implemented as "open a new window with the
+        // target bounds, mounting the same `Entity<TempoApp>` as its
+        // root, then close the current window" rather than
+        // `window.resize(...)`. Hyprland and several other Wayland
+        // compositors ignore most client-driven resize requests, so
+        // a real reopen is the only reliable way to actually shrink
+        // the window for the mini player. The shared entity means
+        // all in-memory state (current track, queue, history, audio
+        // backend) survives the swap — only the window itself is
+        // disposable.
+        if let Some(swap) = self.pending_window_swap.take() {
+            // Capture pre-mini bounds the moment we transition into
+            // mini mode (`saved_full_bounds.is_none()`) so a later
+            // `RequestExitMini` can restore exactly the same size +
+            // position. Done here rather than in the event handler
+            // because event handlers don't get `&mut Window`.
+            if matches!(self.window_mode, WindowMode::Mini(_)) && self.saved_full_bounds.is_none() {
+                self.saved_full_bounds = Some(match window.window_bounds() {
+                    WindowBounds::Windowed(b)
+                    | WindowBounds::Maximized(b)
+                    | WindowBounds::Fullscreen(b) => b,
+                });
+            }
+
+            // Resolve the target bounds. If the caller specified
+            // explicit bounds (the restore-to-full path), use them
+            // verbatim. Otherwise center the new window's content
+            // rect on the current window's center so size cycles
+            // don't drift to the corner of the screen.
+            let target_bounds = if let Some(b) = swap.explicit_bounds {
+                b
+            } else {
+                let current = window.bounds();
+                let cx_pt = current.origin.x + current.size.width / 2.0;
+                let cy_pt = current.origin.y + current.size.height / 2.0;
+                let new_origin = Point {
+                    x: cx_pt - swap.target_size.width / 2.0,
+                    y: cy_pt - swap.target_size.height / 2.0,
+                };
+                Bounds {
+                    origin: new_origin,
+                    size: swap.target_size,
+                }
+            };
+            let entity = cx.entity();
+            let current_handle = window.window_handle();
+            // Defer both the open and the close until *after* the
+            // current effect cycle. Calling `cx.open_window` directly
+            // here would re-enter the entity-update of `TempoApp`
+            // (because GPUI calls `window.draw` synchronously during
+            // `open_window`, which renders the new window's root,
+            // which is the same entity we're inside right now) and
+            // panic with "cannot update TempoApp while it is already
+            // being updated". Deferring drops the outer render's
+            // lease before the new window's first draw runs.
+            //
+            // Pick the toplevel "kind" hint for the replacement
+            // window. Tiling Wayland compositors (Hyprland, river,
+            // sway) generally float windows whose Wayland
+            // `xdg_toplevel` is flagged as transient (via
+            // `xdg_toplevel.set_parent`). GPUI's
+            // `WindowKind::Floating` does exactly that at window
+            // creation: it calls `toplevel.set_parent(focused_window)`,
+            // which Hyprland and friends read as "transient → float
+            // by default". Using it on the mini window means users
+            // don't need to add a `windowrulev2 = float, class:tempo`
+            // rule themselves.
+            //
+            // For the full window we go back to `Normal` so the
+            // restored full window tiles like a regular app window
+            // (matching the behaviour of the very first launch).
+            //
+            // TODO(always-on-top): GPUI 0.2.2 doesn't expose a
+            // runtime always-on-top API. Once it does (or once a
+            // platform shim using `_NET_WM_STATE_ABOVE` / a
+            // wlr-layer-shell client is added), set the new window
+            // to top-most when entering mini mode and unset on exit.
+            let target_kind = match self.window_mode {
+                WindowMode::Mini(_) => gpui::WindowKind::Floating,
+                WindowMode::Full => gpui::WindowKind::Normal,
+            };
+            cx.defer(move |cx| {
+                let options = gpui::WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(target_bounds)),
+                    app_id: Some("tempo".into()),
+                    kind: target_kind,
+                    ..Default::default()
+                };
+                match cx.open_window(options, |_window, _cx| entity) {
+                    Ok(_handle) => {
+                        // Close the previous window after the new
+                        // one has been mounted (deferred again to
+                        // sequence cleanly after the new window's
+                        // first draw).
+                        cx.defer(move |cx| {
+                            current_handle
+                                .update(cx, |_view, window, _cx| window.remove_window())
+                                .ok();
+                        });
+                    }
+                    Err(error) => {
+                        perf::event("mini.window_swap_failed", format!("error={error:#}"));
+                    }
+                }
+            });
+        }
+        if let Some(new_title) = self.pending_window_title.take() {
+            window.set_window_title(&new_title);
+        }
+
         let colors = self.colors();
 
         div()
@@ -3982,6 +4222,8 @@ impl Render for TempoApp {
             .on_action(cx.listener(Self::play_random_track_action))
             .on_action(cx.listener(Self::navigate_back_action))
             .on_action(cx.listener(Self::navigate_forward_action))
+            .on_action(cx.listener(Self::toggle_mini_player_action))
+            .on_action(cx.listener(Self::cycle_mini_player_action))
             .on_mouse_down(
                 MouseButton::Navigate(NavigationDirection::Back),
                 cx.listener(Self::navigate_back_mouse),
@@ -4034,14 +4276,19 @@ impl Render for TempoApp {
             .text_sm()
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .child(self.render_left_sidebar(cx))
-                    .child(self.render_content(window, cx)),
-            )
+            // Top region (sidebar + content) is hidden in mini
+            // mode; the mini player fills the whole window via the
+            // child below.
+            .when(matches!(self.window_mode, WindowMode::Full), |this| {
+                this.child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .child(self.render_left_sidebar(cx))
+                        .child(self.render_content(window, cx)),
+                )
+            })
             // Player bar: when the library is empty there's no
             // currently-playing track snapshot to render with, so we
             // fall back to an inline placeholder that knows about
@@ -4049,11 +4296,24 @@ impl Render for TempoApp {
             // child element — its `cx.notify()` calls only invalidate
             // the player's own subtree, which is what unlocks the
             // localized-invalidation perf win.
+            //
+            // In mini mode the player entity itself fills the entire
+            // window (it branches its own `Render` impl on
+            // `window_mode`), so the same `self.player.clone()`
+            // covers both layouts.
             .child(if self.tracks.is_empty() {
                 self.render_empty_player_bar(cx)
             } else {
                 let _ = window;
-                self.player.clone().into_any_element()
+                if matches!(self.window_mode, WindowMode::Mini(_)) {
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .child(self.player.clone())
+                        .into_any_element()
+                } else {
+                    self.player.clone().into_any_element()
+                }
             })
             .when_some(
                 self.context_menu_track
@@ -4381,6 +4641,39 @@ impl TempoApp {
         cx: &mut Context<Self>,
     ) {
         self.navigate_forward();
+        cx.notify();
+    }
+
+    fn toggle_mini_player_action(
+        &mut self,
+        _: &ToggleMiniPlayer,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.window_mode {
+            WindowMode::Full => self.enter_mini_mode(cx),
+            WindowMode::Mini(_) => self.exit_mini_mode(cx),
+        }
+        cx.notify();
+    }
+
+    /// Ctrl+Shift+M action handler.
+    ///
+    /// - When already in mini mode, rotates to the next mini size
+    ///   (`CompactBar → Square → LargeSquare → CompactBar`).
+    /// - When in full mode, enters mini mode at the default size,
+    ///   so this keybinding doubles as an alternate enter-mini
+    ///   shortcut alongside Ctrl+M.
+    fn cycle_mini_player_action(
+        &mut self,
+        _: &CycleMiniPlayer,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.window_mode {
+            WindowMode::Full => self.enter_mini_mode(cx),
+            WindowMode::Mini(_) => self.cycle_mini_size(cx),
+        }
         cx.notify();
     }
 

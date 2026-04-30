@@ -30,6 +30,7 @@ use super::*;
 use std::time::Instant;
 
 mod entity;
+mod mini;
 mod render;
 mod visualizers;
 
@@ -52,6 +53,12 @@ impl TempoApp {
                     && let Some(&ix) = self.track_path_index.get(path)
                 {
                     self.playing_track = ix;
+                }
+                // Keep the OS title bar in sync with the active
+                // track while we're in mini mode (the user can't
+                // see the in-app marquee from outside the window).
+                if matches!(self.window_mode, WindowMode::Mini(_)) {
+                    self.pending_window_title = Some(self.format_window_title());
                 }
                 cx.notify();
             }
@@ -128,7 +135,136 @@ impl TempoApp {
                 self.select_output_device(name.clone(), cx);
                 cx.notify();
             }
+            PlayerEvent::RequestEnterMini => {
+                self.enter_mini_mode(cx);
+                cx.notify();
+            }
+            PlayerEvent::RequestExitMini => {
+                self.exit_mini_mode(cx);
+                cx.notify();
+            }
+            PlayerEvent::RequestCycleMiniSize => {
+                self.cycle_mini_size(cx);
+                cx.notify();
+            }
         }
+    }
+
+    /// Switch from full-window layout to mini player. Defaults to
+    /// `MiniSize::CompactBar`. The actual swap (open new window,
+    /// close old) is deferred to the next render (which has
+    /// `&mut Window` + `&mut App`); see `pending_window_swap` in
+    /// `TempoApp::render`.
+    ///
+    /// TODO(always-on-top): when GPUI gains a runtime API to mark a
+    /// window as always-on-top (or when a platform shim is added),
+    /// flip it on here and clear it in `exit_mini_mode`. The mini
+    /// player particularly benefits because it's small enough that
+    /// other windows can easily cover it.
+    pub(super) fn enter_mini_mode(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.window_mode, WindowMode::Mini(_)) {
+            return;
+        }
+        let target = MiniSize::CompactBar;
+        self.window_mode = WindowMode::Mini(target);
+        self.pending_window_swap = Some(PendingWindowSwap {
+            target_size: self.target_size_for(target),
+            // Render-time computes the centered position so the new
+            // window pops up where the user is looking.
+            explicit_bounds: None,
+        });
+        // Title gets refreshed on the next track-change too, but
+        // push it now so the OS shell sees something useful even if
+        // playback never advances.
+        self.pending_window_title = Some(self.format_window_title());
+        self.player.update(cx, |player, player_cx| {
+            player.set_window_mode(WindowMode::Mini(target), player_cx);
+        });
+    }
+
+    /// Resolve the window size to open for a given mini variant.
+    ///
+    /// Both variants use their fixed default — `CompactBar` because
+    /// there's nothing useful to resize on a horizontal strip, and
+    /// `Square` because we intentionally don't persist the user's
+    /// drag-resize across cycles (each entry into `Square` reopens
+    /// at the 400x400 default and the user resizes from there).
+    pub(super) fn target_size_for(&self, mini: MiniSize) -> Size<Pixels> {
+        mini.default_window_size()
+    }
+
+    /// Restore the full-window layout. Reopens at the bounds
+    /// captured the moment we entered mini mode, or at a centered
+    /// default if none were captured.
+    pub(super) fn exit_mini_mode(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.window_mode, WindowMode::Mini(_)) {
+            return;
+        }
+        self.window_mode = WindowMode::Full;
+        // `saved_full_bounds` was captured at the top of `Render`
+        // the first frame we entered mini mode (we needed `&mut
+        // Window` for `window.bounds()`, which event handlers don't
+        // have).
+        let restore_bounds = self.saved_full_bounds.take();
+        self.pending_window_swap = Some(PendingWindowSwap {
+            target_size: restore_bounds
+                .map(|b| b.size)
+                .unwrap_or_else(|| size(px(1280.0), px(820.0))),
+            explicit_bounds: restore_bounds,
+        });
+        self.pending_window_title = Some("Tempo".to_string());
+        self.player.update(cx, |player, player_cx| {
+            player.set_window_mode(WindowMode::Full, player_cx);
+        });
+    }
+
+    /// Rotate to the next mini size. No-op when already in full mode.
+    ///
+    /// Cycling uses the same window-recreate path as full↔mini
+    /// transitions because in-place `window.resize()` is essentially
+    /// advisory on Wayland (the call updates GPUI's internal buffer
+    /// size but most compositors — including Hyprland — ignore the
+    /// hint and keep the outer window at whatever size their layout
+    /// rules dictated). Recreating the window with explicit
+    /// `WindowBounds::Windowed(...)` is the only reliable way to
+    /// actually shrink/grow the surface.
+    ///
+    /// The replacement window is opened with `WindowKind::Floating`
+    /// (set in the swap-drain block in `TempoApp::render`) which
+    /// asks the compositor to float the new window via
+    /// `xdg_toplevel.set_parent`. Hyprland reads that as "transient
+    /// → float by default", so users don't need a manual
+    /// `windowrulev2 = float, class:tempo` to keep the mini player
+    /// floating across size cycles.
+    pub(super) fn cycle_mini_size(&mut self, cx: &mut Context<Self>) {
+        let WindowMode::Mini(current) = self.window_mode else {
+            return;
+        };
+        let next = current.next();
+        self.window_mode = WindowMode::Mini(next);
+        self.pending_window_swap = Some(PendingWindowSwap {
+            target_size: self.target_size_for(next),
+            // Keep the new window centered on the current window's
+            // center — the swap-path render code computes this when
+            // `explicit_bounds` is `None`.
+            explicit_bounds: None,
+        });
+        self.player.update(cx, |player, player_cx| {
+            player.set_window_mode(WindowMode::Mini(next), player_cx);
+        });
+    }
+
+    /// Format the OS title bar text for the current track. Used
+    /// while in mini mode so the system task switcher / taskbar
+    /// shows what's playing without the user having to un-mini the
+    /// window.
+    pub(super) fn format_window_title(&self) -> String {
+        let Some(track) = self.tracks.get(self.playing_track) else {
+            return "Tempo".to_string();
+        };
+        // Em-dash separators read better than hyphens in title-bar
+        // ellipsis paths.
+        format!("{} — {} — {}", track.title, track.artist, track.album)
     }
 
     /// Refresh the denormalized `volume_snapshot` and

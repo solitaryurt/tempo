@@ -164,6 +164,21 @@ pub(crate) enum PlayerEvent {
     /// switches the audio backend; if playback was active, it
     /// restarts the current track.
     RequestSelectOutputDevice(String),
+
+    /// User clicked the mini-player toggle in the bottom-right of
+    /// the now-playing info column. Parent shrinks the window into
+    /// mini mode and mirrors the new `window_mode` back onto the
+    /// player entity.
+    RequestEnterMini,
+
+    /// User clicked the "return to full" icon in the mini overlay.
+    /// Parent restores the previous window bounds.
+    RequestExitMini,
+
+    /// User clicked the size-cycle icon in the mini overlay. Parent
+    /// rotates `MiniSize::CompactBar → Square → LargeSquare →
+    /// CompactBar` and resizes the window accordingly.
+    RequestCycleMiniSize,
 }
 
 /// The audio playback subsystem entity.
@@ -368,6 +383,14 @@ pub(crate) struct PlayerEntity {
     /// the player merely holds a clone so the audio backend it
     /// constructs picks up the same handle.
     pub(super) eq_state: tempo::equalizer::EqState,
+
+    // === Window mode ===
+    /// Mirror of `TempoApp::window_mode`, pushed in via
+    /// [`PlayerEntity::set_window_mode`] whenever the parent toggles
+    /// the mode. The render path branches on this between the
+    /// full-bar layout (in `render.rs`) and the compact mini-player
+    /// layout (in `mini.rs`).
+    pub(super) window_mode: WindowMode,
 }
 
 impl gpui::EventEmitter<PlayerEvent> for PlayerEntity {}
@@ -503,6 +526,7 @@ impl PlayerEntity {
             playing_track: None,
             theme_colors,
             eq_state,
+            window_mode: WindowMode::Full,
         }
     }
 
@@ -512,6 +536,22 @@ impl PlayerEntity {
     /// bar). Setting to `None` reverts to the empty placeholder.
     pub(crate) fn set_playing_track(&mut self, snapshot: Option<PlayingTrackSnapshot>) {
         self.playing_track = snapshot;
+    }
+
+    /// Push the parent's [`WindowMode`] in. Called from the relevant
+    /// arms of `TempoApp::handle_player_event` after a mini-mode
+    /// toggle so the next render branches on the new mode.
+    pub(crate) fn set_window_mode(&mut self, mode: WindowMode, cx: &mut Context<Self>) {
+        if self.window_mode != mode {
+            self.window_mode = mode;
+            cx.notify();
+        }
+    }
+
+    /// Read accessor for the current window mode.
+    #[allow(dead_code)]
+    pub(crate) fn window_mode(&self) -> WindowMode {
+        self.window_mode
     }
 
     /// Push the active theme colors. `ThemeColors: Copy` so this is
