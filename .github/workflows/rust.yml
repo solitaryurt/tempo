@@ -10,7 +10,7 @@ env:
 
 jobs:
   checks:
-    name: Format, lint, test, and build
+    name: Format, lint, test, and build (Linux)
     runs-on: ubuntu-latest
 
     steps:
@@ -57,3 +57,117 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --locked
+
+      - name: Stage Linux artifact
+        run: |
+          mkdir -p dist
+          cp target/release/tempo dist/tempo-linux-x86_64
+          chmod +x dist/tempo-linux-x86_64
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tempo-linux-x86_64
+          path: dist/tempo-linux-x86_64
+          if-no-files-found: error
+
+  build-macos:
+    name: Build (macOS)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-stable-macos
+          cache-on-failure: "true"
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Stage macOS artifact
+        run: |
+          mkdir -p dist
+          cp target/release/tempo dist/tempo-macos-aarch64
+          chmod +x dist/tempo-macos-aarch64
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tempo-macos-aarch64
+          path: dist/tempo-macos-aarch64
+          if-no-files-found: error
+
+  build-windows:
+    name: Build (Windows, may fail)
+    runs-on: windows-latest
+    # GPUI's Windows backend is still maturing in the 0.2.x line, so
+    # a Windows build break should not gate the rest of CI. Flip this
+    # to `false` once the Windows target is reliably green.
+    continue-on-error: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-stable-windows
+          cache-on-failure: "true"
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Stage Windows artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/tempo.exe dist/tempo-windows-x86_64.exe
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tempo-windows-x86_64
+          path: dist/tempo-windows-x86_64.exe
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    # Only run on version tags (e.g. v0.1.0). Pulls down the per-OS
+    # artifacts staged by the build jobs and attaches them to a
+    # release. `windows` is allowed to be missing because that job
+    # is `continue-on-error`.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [checks, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifact tree
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          ls -la release
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          fail_on_unmatched_files: false
