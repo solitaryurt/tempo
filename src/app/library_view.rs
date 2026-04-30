@@ -20,6 +20,13 @@ impl TempoApp {
             Page::Liked => self.render_liked_page(cx).into_any_element(),
             Page::PlaybackHistory => self.render_playback_history_page(cx).into_any_element(),
             Page::ScanErrors => self.render_scan_errors_page(cx).into_any_element(),
+            Page::Analytics => div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .child(self.render_analytics_page(cx))
+                .child(self.render_analytics_sidebar(cx))
+                .into_any_element(),
             Page::Settings => self.render_settings(cx).into_any_element(),
         }
     }

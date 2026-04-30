@@ -802,7 +802,11 @@ impl TempoApp {
                             cx.notify();
                         }
                     }
-                    Page::Liked | Page::PlaybackHistory | Page::ScanErrors | Page::Settings => {}
+                    Page::Liked
+                    | Page::PlaybackHistory
+                    | Page::ScanErrors
+                    | Page::Analytics
+                    | Page::Settings => {}
                 }
             }) else {
                 return;

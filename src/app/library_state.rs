@@ -181,6 +181,8 @@ impl TempoApp {
             album_table_sort_direction: self.album_table_sort_direction,
             genre_table_sort_column: self.genre_table_sort_column,
             genre_table_sort_direction: self.genre_table_sort_direction,
+            analytics_time_range: self.analytics_time_range,
+            analytics_sidebar_collapsed: self.analytics_sidebar_collapsed,
             genre_grid_scroll_top: Self::uniform_list_scroll_top(&self.genre_grid_scroll_handle),
             artist_grid_scroll_top: Self::uniform_list_scroll_top(&self.artist_grid_scroll_handle),
             artist_table_scroll_top: Self::uniform_list_scroll_top(

@@ -40,22 +40,7 @@ impl TempoApp {
                     .child(self.render_library_nav(cx))
                     .child(self.render_playlists_nav(cx))
                     .child(div().flex_1())
-                    .child(
-                        div()
-                            .px_4()
-                            .py_3()
-                            .border_t_1()
-                            .border_color(rgb(colors.border))
-                            .text_xs()
-                            .text_color(rgb(colors.text_faint))
-                            .flex()
-                            .justify_between()
-                            .child(format!(
-                                "{} tracks",
-                                Self::format_count_short(self.tracks.len())
-                            ))
-                            .child(Self::format_library_size_bytes(self.library_size_bytes)),
-                    ),
+                    .child(self.render_sidebar_footer(cx)),
             )
             .into_any_element()
     }
@@ -91,6 +76,59 @@ impl TempoApp {
                     cx,
                 ),
             )
+    }
+
+    /// Minimalist clickable footer: shows the original
+    /// `<count> tracks  <library size>` summary, but the whole row is
+    /// a click target that opens the Analytics page. A small accent
+    /// dot in front of the track count adds a quiet visual hook
+    /// (matches the dashboard's data-tile vibe) without expanding the
+    /// footer's chrome. Hover swaps the background to the standard
+    /// nav-item hover color so the affordance is obvious without
+    /// needing extra labels.
+    pub(super) fn render_sidebar_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = *self.colors();
+
+        div()
+            .id("sidebar-analytics-footer")
+            .px_4()
+            .py_3()
+            .border_t_1()
+            .border_color(rgb(colors.border))
+            .text_xs()
+            .text_color(rgb(colors.text_faint))
+            .flex()
+            .items_center()
+            .justify_between()
+            .cursor_pointer()
+            .hover(|this| {
+                this.bg(rgb(colors.button_hover))
+                    .text_color(rgb(colors.text_muted))
+            })
+            .active(|this| this.opacity(0.85))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(6.0))
+                            .h(px(6.0))
+                            .rounded_full()
+                            .bg(rgb(colors.accent))
+                            .flex_none(),
+                    )
+                    .child(format!(
+                        "{} tracks",
+                        Self::format_count_short(self.tracks.len())
+                    )),
+            )
+            .child(Self::format_library_size_bytes(self.library_size_bytes))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.open_page(Page::Analytics);
+                cx.notify();
+            }))
     }
 
     pub(super) fn sidebar_button(
@@ -575,6 +613,12 @@ impl TempoApp {
                 r#"<path d="M12 4.2L20 18.2H4L12 4.2Z" fill="none" stroke="{color}" stroke-width="1.6" stroke-linejoin="round"/>
 <path d="M12 9V13" fill="none" stroke="{accent_stroke}" stroke-width="1.8" stroke-linecap="round"/>
 <circle cx="12" cy="16" r="1" fill="{accent_stroke}"/>"#
+            ),
+            Page::Analytics => format!(
+                r#"<path d="M4 19.5H20" fill="none" stroke="{color}" stroke-width="1.6" stroke-linecap="round"/>
+<rect x="6" y="11" width="3" height="6.5" rx="0.6" fill="none" stroke="{color}" stroke-width="1.5"/>
+<rect x="10.5" y="7" width="3" height="10.5" rx="0.6" fill="none" stroke="{accent_stroke}" stroke-width="1.5"/>
+<rect x="15" y="13.5" width="3" height="4" rx="0.6" fill="none" stroke="{color}" stroke-width="1.5"/>"#
             ),
             Page::Settings => format!(
                 r#"<circle cx="12" cy="12" r="3" fill="none" stroke="{color}" stroke-width="1.6"/>

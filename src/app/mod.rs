@@ -32,8 +32,10 @@ use tempo::{
     playback::PlaybackController,
 };
 
+mod analytics;
 mod artwork;
 mod browse_grids;
+mod charts;
 mod equalizer_panel;
 mod history;
 mod library_state;
@@ -79,6 +81,7 @@ enum Page {
     Liked,
     PlaybackHistory,
     ScanErrors,
+    Analytics,
     Settings,
 }
 
@@ -86,6 +89,69 @@ enum Page {
 enum BrowseViewMode {
     Grid,
     Table,
+}
+
+/// Time-range filter for the Analytics page. `All` is the default
+/// (matches the dashboard's pre-filter behavior); the rest constrain
+/// the playback-history aggregations to a rolling window. Library
+/// stats (genre, codec, decades, etc.) are unaffected by the filter
+/// because they describe the whole indexed library.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
+enum AnalyticsTimeRange {
+    SevenDays,
+    ThirtyDays,
+    NinetyDays,
+    OneYear,
+    All,
+}
+
+impl Default for AnalyticsTimeRange {
+    fn default() -> Self {
+        Self::NinetyDays
+    }
+}
+
+impl AnalyticsTimeRange {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SevenDays => "7D",
+            Self::ThirtyDays => "30D",
+            Self::NinetyDays => "90D",
+            Self::OneYear => "1Y",
+            Self::All => "ALL",
+        }
+    }
+
+    fn long_label(self) -> &'static str {
+        match self {
+            Self::SevenDays => "Last 7 days",
+            Self::ThirtyDays => "Last 30 days",
+            Self::NinetyDays => "Last 90 days",
+            Self::OneYear => "Last 12 months",
+            Self::All => "All time",
+        }
+    }
+
+    /// Window length in days, or `None` for "all time" (no cutoff).
+    fn window_days(self) -> Option<u32> {
+        match self {
+            Self::SevenDays => Some(7),
+            Self::ThirtyDays => Some(30),
+            Self::NinetyDays => Some(90),
+            Self::OneYear => Some(365),
+            Self::All => None,
+        }
+    }
+
+    fn all() -> [Self; 5] {
+        [
+            Self::SevenDays,
+            Self::ThirtyDays,
+            Self::NinetyDays,
+            Self::OneYear,
+            Self::All,
+        ]
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1101,6 +1167,10 @@ struct AppState {
     #[serde(default = "default_sort_direction")]
     genre_table_sort_direction: SortDirection,
     #[serde(default)]
+    analytics_time_range: AnalyticsTimeRange,
+    #[serde(default)]
+    analytics_sidebar_collapsed: bool,
+    #[serde(default)]
     genre_grid_scroll_top: f32,
     #[serde(default)]
     artist_grid_scroll_top: f32,
@@ -1213,6 +1283,8 @@ impl Default for AppState {
             album_table_sort_direction: default_sort_direction(),
             genre_table_sort_column: default_genre_table_sort_column(),
             genre_table_sort_direction: default_sort_direction(),
+            analytics_time_range: AnalyticsTimeRange::default(),
+            analytics_sidebar_collapsed: false,
             genre_grid_scroll_top: 0.0,
             artist_grid_scroll_top: 0.0,
             artist_table_scroll_top: 0.0,
@@ -1676,6 +1748,14 @@ pub(crate) struct TempoApp {
     album_table_sort_direction: SortDirection,
     genre_table_sort_column: GenreTableColumn,
     genre_table_sort_direction: SortDirection,
+    /// Active time-range filter on the Analytics page. Persisted in
+    /// app state so the user's last choice sticks across launches.
+    analytics_time_range: AnalyticsTimeRange,
+    /// Whether the Analytics filter sidebar is collapsed. Independent
+    /// of `right_sidebar_collapsed` because the analytics sidebar is
+    /// a different surface (filters vs. queue/history) and users
+    /// typically want both states remembered separately.
+    analytics_sidebar_collapsed: bool,
     queue: Vec<usize>,
     /// Index into `self.queue` of the entry that is currently
     /// playing, or was most recently played from the queue. `None`
@@ -2085,6 +2165,8 @@ impl TempoApp {
             album_table_sort_direction: state.album_table_sort_direction,
             genre_table_sort_column: state.genre_table_sort_column,
             genre_table_sort_direction: state.genre_table_sort_direction,
+            analytics_time_range: state.analytics_time_range,
+            analytics_sidebar_collapsed: state.analytics_sidebar_collapsed,
             queue: Vec::new(),
             queue_cursor: None,
             library_roots: roots,
@@ -2902,6 +2984,7 @@ impl TempoApp {
             | Page::Genres
             | Page::Liked
             | Page::ScanErrors
+            | Page::Analytics
                 if library_roots.is_empty() =>
             {
                 Page::Settings
@@ -4057,6 +4140,7 @@ impl TempoApp {
             Page::Liked => "liked",
             Page::PlaybackHistory => "playback_history",
             Page::ScanErrors => "scan_errors",
+            Page::Analytics => "analytics",
             Page::Settings => "settings",
         }
     }
