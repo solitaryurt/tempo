@@ -126,7 +126,8 @@ impl TempoApp {
             .child(self.render_nav_item(
                 "All Music",
                 Self::format_count_short(self.tracks.len()),
-                self.page == Page::Library && self.active_tab().source == TabSource::Library,
+                self.page == Page::Library
+                    && matches!(&self.active_tab().source, TabSource::Library),
                 Page::Library,
                 cx,
             ))
@@ -142,6 +143,13 @@ impl TempoApp {
                 Self::format_count_short(self.albums.len()),
                 self.page == Page::Albums,
                 Page::Albums,
+                cx,
+            ))
+            .child(self.render_nav_item(
+                "Genres",
+                Self::format_count_short(self.genres.len()),
+                self.page == Page::Genres,
+                Page::Genres,
                 cx,
             ))
             .child(self.render_nav_item(
@@ -223,8 +231,8 @@ impl TempoApp {
         playlist: &Playlist,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let active =
-            self.page == Page::Library && self.active_tab().source == TabSource::Playlist(ix);
+        let active = self.page == Page::Library
+            && matches!(&self.active_tab().source, TabSource::Playlist(active_ix) if *active_ix == ix);
         let colors = *self.colors();
         let bg = if active {
             colors.button_hover
@@ -503,6 +511,11 @@ impl TempoApp {
 <circle cx="12" cy="12" r="4.1" fill="none" stroke="{color}" stroke-width="1.6"/>
 <circle cx="12" cy="12" r="1.1" fill="{accent_stroke}"/>
 <path d="M15.1 8.9L17.1 6.9" fill="none" stroke="{accent_stroke}" stroke-width="1.5" stroke-linecap="round"/>"#
+            ),
+            Page::Genres => format!(
+                r#"<path d="M5 17.5L9.8 6.2C10.2 5.3 11.2 4.9 12.1 5.3L18.9 8.2C19.8 8.6 20.2 9.6 19.8 10.5L15 21.8" fill="none" stroke="{color}" stroke-width="1.5" stroke-linecap="round"/>
+<path d="M4.2 15.5L6.8 5.7C7 4.8 8 4.2 8.9 4.5L16.2 6.5" fill="none" stroke="{accent_stroke}" stroke-width="1.5" stroke-linecap="round"/>
+<path d="M8.1 13.4L16.4 16.9M9.3 10.5L17.6 14" fill="none" stroke="{color}" stroke-width="1.2" stroke-linecap="round"/>"#
             ),
             Page::Liked => format!(
                 r#"<path d="M12 19.3L4.9 12.4C3 10.5 3 7.5 4.9 5.6C6.8 3.7 9.8 3.7 11.7 5.6L12 5.9L12.3 5.6C14.2 3.7 17.2 3.7 19.1 5.6C21 7.5 21 10.5 19.1 12.4L12 19.3Z" fill="none" stroke="{accent_stroke}" stroke-width="1.7" stroke-linejoin="round"/>"#

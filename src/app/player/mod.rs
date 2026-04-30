@@ -207,6 +207,25 @@ impl TempoApp {
         self.context_menu_track = None;
     }
 
+    pub(super) fn play_genre(&mut self, genre_key: &str, shuffled: bool, cx: &mut Context<Self>) {
+        let mut tracks = self.source_track_indices(TabSource::Genre(genre_key.to_string()));
+        if tracks.is_empty() {
+            return;
+        }
+
+        if shuffled {
+            let seed = Self::shuffle_seed();
+            tracks.sort_by_key(|track_ix| {
+                Self::shuffle_key(&self.tracks[*track_ix], *track_ix, seed)
+            });
+        }
+
+        let first = tracks[0];
+        self.queue = tracks.into_iter().skip(1).collect();
+        self.right_sidebar_collapsed = self.queue.is_empty();
+        self.play_track(first, cx);
+    }
+
     pub(super) fn shuffle_seed() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -327,6 +346,7 @@ impl TempoApp {
             if let Some(track) = self.tracks.get_mut(track_ix) {
                 track.plays = plays;
             }
+            self.rebuild_genres();
             if record_history {
                 self.record_playback_history(track_ix);
             }

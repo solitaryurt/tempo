@@ -164,11 +164,22 @@ impl TempoApp {
             online_metadata_mode: self.online_metadata_mode,
             volume: self.volume_snapshot,
             visible_table_columns: self.visible_columns.clone(),
+            visible_artist_table_columns: self.visible_artist_columns.clone(),
+            visible_album_table_columns: self.visible_album_columns.clone(),
+            visible_genre_table_columns: self.visible_genre_columns.clone(),
             page: self.page,
             tabs: self.saved_tabs(),
             active_tab_id: self.tabs.get(self.active_tab).map(|tab| tab.id),
-            artist_view_mode: self.artist_view_mode,
-            album_view_mode: self.album_view_mode,
+            artist_view_mode: self.browse_view_mode(),
+            album_view_mode: self.browse_view_mode(),
+            genre_view_mode: self.browse_view_mode(),
+            artist_table_sort_column: self.artist_table_sort_column,
+            artist_table_sort_direction: self.artist_table_sort_direction,
+            album_table_sort_column: self.album_table_sort_column,
+            album_table_sort_direction: self.album_table_sort_direction,
+            genre_table_sort_column: self.genre_table_sort_column,
+            genre_table_sort_direction: self.genre_table_sort_direction,
+            genre_grid_scroll_top: Self::uniform_list_scroll_top(&self.genre_grid_scroll_handle),
             artist_grid_scroll_top: Self::uniform_list_scroll_top(&self.artist_grid_scroll_handle),
             artist_table_scroll_top: Self::uniform_list_scroll_top(
                 &self.artist_table_scroll_handle,
@@ -226,7 +237,7 @@ impl TempoApp {
                 };
                 SavedBrowseTab {
                     id: tab.id,
-                    source: tab.source,
+                    source: tab.source.clone(),
                     search_query: tab.search_query.clone(),
                     sort_column: tab.sort_column,
                     sort_direction: tab.sort_direction,
@@ -776,6 +787,7 @@ impl TempoApp {
             self.albums_generation = self.albums_generation.wrapping_add(1);
             self.album_filter_cache.borrow_mut().invalidate();
         }
+        self.rebuild_genres();
     }
 
     pub(super) fn apply_library_event(&mut self, event: LibraryEvent, cx: &mut Context<Self>) {
@@ -845,6 +857,7 @@ impl TempoApp {
                         }
                     });
                 }
+                self.rebuild_genres();
 
                 let rebuild_start = Instant::now();
                 self.invalidate_track_indices();
@@ -913,6 +926,7 @@ impl TempoApp {
                     self.tracks = tracks;
                     self.track_path_index = build_track_path_index(&self.tracks);
                     self.library_size_bytes = self.tracks.iter().map(|track| track.file_size).sum();
+                    self.rebuild_genres();
                     self.player
                         .update(cx, |player, _| player.clear_waveform_cache());
                     self.invalidate_track_indices();
@@ -983,6 +997,7 @@ impl TempoApp {
         // upserts, and this rebuild is still O(N) instead of the prior
         // O(N*M) per-batch upsert scan it replaces.
         self.track_path_index = build_track_path_index(&self.tracks);
+        self.rebuild_genres();
 
         self.invalidate_track_indices();
         self.reload_catalog_browse_data();

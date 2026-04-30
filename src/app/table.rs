@@ -40,6 +40,7 @@ impl TempoApp {
             ColumnResizeTarget::Track(column) => self.track_column_width(column),
             ColumnResizeTarget::Artist(column) => self.artist_table_column_width(column),
             ColumnResizeTarget::Album(column) => self.album_table_column_width(column),
+            ColumnResizeTarget::Genre(column) => self.genre_table_column_width(column),
             ColumnResizeTarget::ScanError(column) => self.scan_error_column_width(column),
             ColumnResizeTarget::PlaybackHistoryPlayedAt => self.playback_history_played_at_width,
         }
@@ -71,6 +72,7 @@ impl TempoApp {
             ArtistTableColumn::Artist => self.artist_table_column_widths.artist,
             ArtistTableColumn::Albums => self.artist_table_column_widths.albums,
             ArtistTableColumn::Tracks => self.artist_table_column_widths.tracks,
+            ArtistTableColumn::Duration => self.artist_table_column_widths.duration,
         }
     }
 
@@ -81,6 +83,17 @@ impl TempoApp {
             AlbumTableColumn::Artist => self.album_table_column_widths.artist,
             AlbumTableColumn::Year => self.album_table_column_widths.year,
             AlbumTableColumn::Tracks => self.album_table_column_widths.tracks,
+            AlbumTableColumn::Duration => self.album_table_column_widths.duration,
+        }
+    }
+
+    pub(super) fn genre_table_column_width(&self, column: GenreTableColumn) -> f32 {
+        match column {
+            GenreTableColumn::Genre => self.genre_table_column_widths.genre,
+            GenreTableColumn::Artists => self.genre_table_column_widths.artists,
+            GenreTableColumn::Albums => self.genre_table_column_widths.albums,
+            GenreTableColumn::Tracks => self.genre_table_column_widths.tracks,
+            GenreTableColumn::Duration => self.genre_table_column_widths.duration,
         }
     }
 
@@ -101,6 +114,7 @@ impl TempoApp {
                 ArtistTableColumn::Artist => self.artist_table_column_widths.artist = width,
                 ArtistTableColumn::Albums => self.artist_table_column_widths.albums = width,
                 ArtistTableColumn::Tracks => self.artist_table_column_widths.tracks = width,
+                ArtistTableColumn::Duration => self.artist_table_column_widths.duration = width,
             },
             ColumnResizeTarget::Album(column) => match column {
                 AlbumTableColumn::Artwork => self.album_table_column_widths.artwork = width,
@@ -108,6 +122,14 @@ impl TempoApp {
                 AlbumTableColumn::Artist => self.album_table_column_widths.artist = width,
                 AlbumTableColumn::Year => self.album_table_column_widths.year = width,
                 AlbumTableColumn::Tracks => self.album_table_column_widths.tracks = width,
+                AlbumTableColumn::Duration => self.album_table_column_widths.duration = width,
+            },
+            ColumnResizeTarget::Genre(column) => match column {
+                GenreTableColumn::Genre => self.genre_table_column_widths.genre = width,
+                GenreTableColumn::Artists => self.genre_table_column_widths.artists = width,
+                GenreTableColumn::Albums => self.genre_table_column_widths.albums = width,
+                GenreTableColumn::Tracks => self.genre_table_column_widths.tracks = width,
+                GenreTableColumn::Duration => self.genre_table_column_widths.duration = width,
             },
             ColumnResizeTarget::ScanError(column) => match column {
                 ScanErrorColumn::Index => self.scan_error_column_widths.index = width,
@@ -239,15 +261,35 @@ impl TempoApp {
         }
 
         let delta = event.delta.pixel_delta(px(TABLE_ROW_H));
+        let dy = f32::from(delta.y);
+        // Bail out at the boundaries: if the user is already pinned to
+        // the top and is scrolling further up (positive dy → offset
+        // would move past 0), or pinned to the bottom and scrolling
+        // further down (negative dy past max_scroll), the underlying
+        // scroll offset can't move. Marking the table as "scrolling"
+        // anyway would needlessly swap inline album artwork to the
+        // lightweight placeholder for the idle-cooldown window. We also
+        // stop_propagation so any ancestor (future overflow:scroll) can
+        // never treat the overscroll as a pull-to-refresh.
+        let base_handle = self.table_scrollbar_base_handle();
+        let max_scroll = f32::from(base_handle.max_offset().height).max(0.0);
+        let scroll_top = (-f32::from(base_handle.offset().y)).clamp(0.0, max_scroll);
+        let at_top = scroll_top <= 0.5;
+        let at_bottom = scroll_top >= max_scroll - 0.5;
+        let overscroll_up = at_top && dy > 0.0;
+        let overscroll_down = at_bottom && dy < 0.0;
         perf::event(
             "table.scroll.wheel",
             format!(
-                "axis=vertical dx={:.1} dy={:.1} rows={}",
+                "axis=vertical dx={:.1} dy={dy:.1} rows={} top={scroll_top:.1} max={max_scroll:.1} overscroll_up={overscroll_up} overscroll_down={overscroll_down}",
                 f32::from(delta.x),
-                f32::from(delta.y),
                 self.current_track_indices().len()
             ),
         );
+        if overscroll_up || overscroll_down {
+            cx.stop_propagation();
+            return;
+        }
         self.mark_table_scrolling(cx);
     }
 
@@ -259,12 +301,19 @@ impl TempoApp {
             ColumnResizeTarget::Artist(ArtistTableColumn::Artist)
             | ColumnResizeTarget::Album(AlbumTableColumn::Album)
             | ColumnResizeTarget::Album(AlbumTableColumn::Artist)
+            | ColumnResizeTarget::Genre(GenreTableColumn::Genre)
+            | ColumnResizeTarget::Genre(GenreTableColumn::Artists)
             | ColumnResizeTarget::ScanError(ScanErrorColumn::Path)
             | ColumnResizeTarget::ScanError(ScanErrorColumn::Error) => 96.0,
             ColumnResizeTarget::Artist(ArtistTableColumn::Albums)
             | ColumnResizeTarget::Artist(ArtistTableColumn::Tracks)
+            | ColumnResizeTarget::Artist(ArtistTableColumn::Duration)
             | ColumnResizeTarget::Album(AlbumTableColumn::Year)
             | ColumnResizeTarget::Album(AlbumTableColumn::Tracks)
+            | ColumnResizeTarget::Album(AlbumTableColumn::Duration)
+            | ColumnResizeTarget::Genre(GenreTableColumn::Albums)
+            | ColumnResizeTarget::Genre(GenreTableColumn::Tracks)
+            | ColumnResizeTarget::Genre(GenreTableColumn::Duration)
             | ColumnResizeTarget::ScanError(ScanErrorColumn::Index) => 52.0,
             ColumnResizeTarget::PlaybackHistoryPlayedAt => 120.0,
         }
@@ -454,14 +503,29 @@ impl TempoApp {
             ColumnResizeTarget::Artist(ArtistTableColumn::Artist) => "Artist",
             ColumnResizeTarget::Artist(ArtistTableColumn::Albums) => "Albums",
             ColumnResizeTarget::Artist(ArtistTableColumn::Tracks) => "Tracks",
+            ColumnResizeTarget::Artist(ArtistTableColumn::Duration) => "Duration",
             ColumnResizeTarget::Album(AlbumTableColumn::Album) => "Album",
             ColumnResizeTarget::Album(AlbumTableColumn::Artist) => "Artist",
             ColumnResizeTarget::Album(AlbumTableColumn::Year) => "Year",
             ColumnResizeTarget::Album(AlbumTableColumn::Tracks) => "Tracks",
+            ColumnResizeTarget::Album(AlbumTableColumn::Duration) => "Duration",
+            ColumnResizeTarget::Genre(GenreTableColumn::Genre) => "Genre",
+            ColumnResizeTarget::Genre(GenreTableColumn::Artists) => "Artists",
+            ColumnResizeTarget::Genre(GenreTableColumn::Albums) => "Albums",
+            ColumnResizeTarget::Genre(GenreTableColumn::Tracks) => "Tracks",
+            ColumnResizeTarget::Genre(GenreTableColumn::Duration) => "Duration",
             ColumnResizeTarget::ScanError(ScanErrorColumn::Index) => "#",
             ColumnResizeTarget::ScanError(ScanErrorColumn::Path) => "PATH",
             ColumnResizeTarget::ScanError(ScanErrorColumn::Error) => "ERROR",
             ColumnResizeTarget::PlaybackHistoryPlayedAt => "PLAYED AT",
+        }
+    }
+
+    pub(super) fn resize_target_menu_label(target: ColumnResizeTarget) -> &'static str {
+        match target {
+            ColumnResizeTarget::Artist(ArtistTableColumn::Artwork)
+            | ColumnResizeTarget::Album(AlbumTableColumn::Artwork) => "Artwork",
+            _ => Self::resize_target_label(target),
         }
     }
 
@@ -475,6 +539,9 @@ impl TempoApp {
                     ArtistTableColumn::Artist => artist.name.clone(),
                     ArtistTableColumn::Albums => artist.album_count.to_string(),
                     ArtistTableColumn::Tracks => artist.track_count.to_string(),
+                    ArtistTableColumn::Duration => {
+                        format_duration_compact(self.artist_total_duration(artist.artist_id))
+                    }
                 })
                 .collect(),
             ColumnResizeTarget::Album(column) => self
@@ -488,6 +555,20 @@ impl TempoApp {
                         album.year.clone().unwrap_or_else(|| "Unknown".to_string())
                     }
                     AlbumTableColumn::Tracks => album.track_count.to_string(),
+                    AlbumTableColumn::Duration => {
+                        format_duration_compact(self.album_total_duration(album.album_id))
+                    }
+                })
+                .collect(),
+            ColumnResizeTarget::Genre(column) => self
+                .genres
+                .iter()
+                .map(|genre| match column {
+                    GenreTableColumn::Genre => genre.name.clone(),
+                    GenreTableColumn::Artists => genre.artists.join(", "),
+                    GenreTableColumn::Albums => genre.album_count.to_string(),
+                    GenreTableColumn::Tracks => genre.track_count.to_string(),
+                    GenreTableColumn::Duration => format_duration_compact(genre.duration_value),
                 })
                 .collect(),
             ColumnResizeTarget::ScanError(column) => self
@@ -549,6 +630,50 @@ impl TempoApp {
         }
     }
 
+    pub(super) fn sanitize_artist_table_columns(
+        columns: Vec<ArtistTableColumn>,
+    ) -> Vec<ArtistTableColumn> {
+        let mut sanitized = Self::sanitize_browse_columns(columns, ALL_ARTIST_TABLE_COLUMNS);
+        if !sanitized.contains(&ArtistTableColumn::Artist) {
+            sanitized.insert(0, ArtistTableColumn::Artist);
+        }
+        sanitized
+    }
+
+    pub(super) fn sanitize_album_table_columns(
+        columns: Vec<AlbumTableColumn>,
+    ) -> Vec<AlbumTableColumn> {
+        let mut sanitized = Self::sanitize_browse_columns(columns, ALL_ALBUM_TABLE_COLUMNS);
+        if !sanitized.contains(&AlbumTableColumn::Album) {
+            sanitized.insert(0, AlbumTableColumn::Album);
+        }
+        sanitized
+    }
+
+    pub(super) fn sanitize_genre_table_columns(
+        columns: Vec<GenreTableColumn>,
+    ) -> Vec<GenreTableColumn> {
+        let mut sanitized = Self::sanitize_browse_columns(columns, ALL_GENRE_TABLE_COLUMNS);
+        if !sanitized.contains(&GenreTableColumn::Genre) {
+            sanitized.insert(0, GenreTableColumn::Genre);
+        }
+        sanitized
+    }
+
+    fn sanitize_browse_columns<T: Copy + PartialEq>(columns: Vec<T>, all_columns: &[T]) -> Vec<T> {
+        let mut sanitized = Vec::new();
+        for column in columns {
+            if all_columns.contains(&column) && !sanitized.contains(&column) {
+                sanitized.push(column);
+            }
+        }
+        if sanitized.is_empty() {
+            all_columns.to_vec()
+        } else {
+            sanitized
+        }
+    }
+
     /// One-shot startup migration: any saved layout that had the
     /// (formerly inert) `Liked` / `Loved` column appended at the end
     /// gets it relocated to the new default slot right after `#`. We
@@ -571,6 +696,15 @@ impl TempoApp {
 
     pub(super) fn show_column_menu(&mut self, event: &MouseDownEvent) {
         self.column_menu_open = true;
+        self.column_menu_kind = ColumnMenuKind::Tracks;
+        self.column_menu_x = f32::from(event.position.x);
+        self.column_menu_y = f32::from(event.position.y);
+        self.context_menu_track = None;
+    }
+
+    pub(super) fn show_browse_column_menu(&mut self, kind: ColumnMenuKind, event: &MouseDownEvent) {
+        self.column_menu_open = true;
+        self.column_menu_kind = kind;
         self.column_menu_x = f32::from(event.position.x);
         self.column_menu_y = f32::from(event.position.y);
         self.context_menu_track = None;
@@ -628,6 +762,112 @@ impl TempoApp {
         }
         self.visible_columns.insert(to_ix, column);
         self.save_app_state();
+    }
+
+    pub(super) fn toggle_browse_column(&mut self, target: ColumnResizeTarget) {
+        match target {
+            ColumnResizeTarget::Artist(column) => {
+                if column == ArtistTableColumn::Artist {
+                    return;
+                }
+                Self::toggle_column_in(
+                    &mut self.visible_artist_columns,
+                    column,
+                    ALL_ARTIST_TABLE_COLUMNS,
+                );
+                self.visible_artist_columns =
+                    Self::sanitize_artist_table_columns(self.visible_artist_columns.clone());
+            }
+            ColumnResizeTarget::Album(column) => {
+                if column == AlbumTableColumn::Album {
+                    return;
+                }
+                Self::toggle_column_in(
+                    &mut self.visible_album_columns,
+                    column,
+                    ALL_ALBUM_TABLE_COLUMNS,
+                );
+                self.visible_album_columns =
+                    Self::sanitize_album_table_columns(self.visible_album_columns.clone());
+            }
+            ColumnResizeTarget::Genre(column) => {
+                if column == GenreTableColumn::Genre {
+                    return;
+                }
+                Self::toggle_column_in(
+                    &mut self.visible_genre_columns,
+                    column,
+                    ALL_GENRE_TABLE_COLUMNS,
+                );
+                self.visible_genre_columns =
+                    Self::sanitize_genre_table_columns(self.visible_genre_columns.clone());
+            }
+            ColumnResizeTarget::Track(_)
+            | ColumnResizeTarget::ScanError(_)
+            | ColumnResizeTarget::PlaybackHistoryPlayedAt => return,
+        }
+
+        self.save_app_state();
+    }
+
+    fn toggle_column_in<T: Copy + PartialEq>(
+        visible_columns: &mut Vec<T>,
+        column: T,
+        all_columns: &[T],
+    ) {
+        if let Some(ix) = visible_columns
+            .iter()
+            .position(|visible| *visible == column)
+        {
+            visible_columns.remove(ix);
+        } else if let Some(ix) = all_columns
+            .iter()
+            .position(|available| *available == column)
+        {
+            let insert_ix = all_columns[..ix]
+                .iter()
+                .filter(|available| visible_columns.contains(available))
+                .count();
+            visible_columns.insert(insert_ix, column);
+        }
+    }
+
+    pub(super) fn move_browse_column_before(
+        &mut self,
+        moving: ColumnResizeTarget,
+        target: ColumnResizeTarget,
+    ) {
+        match (moving, target) {
+            (ColumnResizeTarget::Artist(moving), ColumnResizeTarget::Artist(target)) => {
+                Self::move_column_before_in(&mut self.visible_artist_columns, moving, target);
+            }
+            (ColumnResizeTarget::Album(moving), ColumnResizeTarget::Album(target)) => {
+                Self::move_column_before_in(&mut self.visible_album_columns, moving, target);
+            }
+            (ColumnResizeTarget::Genre(moving), ColumnResizeTarget::Genre(target)) => {
+                Self::move_column_before_in(&mut self.visible_genre_columns, moving, target);
+            }
+            _ => return,
+        }
+
+        self.save_app_state();
+    }
+
+    fn move_column_before_in<T: Copy + PartialEq>(columns: &mut Vec<T>, moving: T, target: T) {
+        if moving == target {
+            return;
+        }
+        let Some(from_ix) = columns.iter().position(|column| *column == moving) else {
+            return;
+        };
+        let Some(mut to_ix) = columns.iter().position(|column| *column == target) else {
+            return;
+        };
+        let column = columns.remove(from_ix);
+        if from_ix < to_ix {
+            to_ix = to_ix.saturating_sub(1);
+        }
+        columns.insert(to_ix, column);
     }
 
     pub(super) fn handle_table_key_down(
@@ -1729,6 +1969,44 @@ impl TempoApp {
             .into_any_element()
     }
 
+    pub(super) fn render_browse_table_header(
+        &self,
+        kind: ColumnMenuKind,
+        height: f32,
+        columns: &[ColumnResizeTarget],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+
+        div()
+            .h(px(height))
+            .flex_none()
+            .px_4()
+            .flex()
+            .items_center()
+            .gap_3()
+            .border_b_1()
+            .border_color(rgb(colors.border))
+            .text_xs()
+            .font_weight(gpui::FontWeight::BOLD)
+            .text_color(rgb(colors.text_faint))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                    this.show_browse_column_menu(kind, event);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .children(
+                columns
+                    .iter()
+                    .copied()
+                    .map(|target| self.browse_header_cell(target, cx)),
+            )
+            .into_any_element()
+    }
+
     pub(super) fn header_cell(
         &self,
         column: TableColumn,
@@ -1873,6 +2151,90 @@ impl TempoApp {
             .items_center()
             .text_color(rgb(colors.text_faint))
             .child(label)
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "header-resizer-{}",
+                        Self::resize_target_key(target)
+                    )))
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .w(px(6.0))
+                    .cursor(CursorStyle::ResizeColumn)
+                    .hover(move |this| this.bg(rgb(colors.border_strong)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                            this.begin_resize_target(target, event);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
+                        if event.standard_click() && event.click_count() >= 2 {
+                            this.autosize_resize_target(target);
+                            cx.notify();
+                        }
+                        cx.stop_propagation();
+                    })),
+            )
+            .into_any_element()
+    }
+
+    pub(super) fn browse_header_cell(
+        &self,
+        target: ColumnResizeTarget,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = Self::resize_target_label(target);
+        let width = self.resize_target_width(target);
+        let colors = *self.colors();
+        let id = SharedString::from(format!("header-{}", Self::resize_target_key(target)));
+        let active = self.browse_sort_active(target);
+        let sortable = !matches!(
+            target,
+            ColumnResizeTarget::Artist(ArtistTableColumn::Artwork)
+                | ColumnResizeTarget::Album(AlbumTableColumn::Artwork)
+        );
+
+        div()
+            .id(id)
+            .relative()
+            .h_full()
+            .w(px(width))
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_color(rgb(if active {
+                colors.text
+            } else {
+                colors.text_faint
+            }))
+            .when(sortable, |this| {
+                this.cursor_pointer()
+                    .hover(move |this| this.text_color(rgb(colors.text)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_browse_table_sort(target);
+                        cx.notify();
+                    }))
+            })
+            .child(label)
+            .when(active, |this| this.child(self.browse_sort_icon(target)))
+            .on_drag(
+                BrowseColumnDrag::new(target, label),
+                |drag: &BrowseColumnDrag, position, _, cx| {
+                    let preview = drag.clone().position(position);
+                    cx.new(|_| preview)
+                },
+            )
+            .on_drop(
+                cx.listener(move |this, drag: &BrowseColumnDrag, _window, cx| {
+                    this.move_browse_column_before(drag.target, target);
+                    cx.notify();
+                }),
+            )
             .child(
                 div()
                     .id(SharedString::from(format!(
@@ -2234,13 +2596,42 @@ impl TempoApp {
                     }),
                 )
                 .child(menu_header("Columns", colors))
-                .children(
-                    ALL_TABLE_COLUMNS
-                        .iter()
-                        .copied()
-                        .map(|column| self.column_menu_item(column, cx)),
-                ),
+                .children(self.column_menu_items(cx)),
         )
+    }
+
+    fn column_menu_items(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        match self.column_menu_kind {
+            ColumnMenuKind::Tracks => ALL_TABLE_COLUMNS
+                .iter()
+                .copied()
+                .map(|column| self.column_menu_item(column, cx).into_any_element())
+                .collect(),
+            ColumnMenuKind::Artists => ALL_ARTIST_TABLE_COLUMNS
+                .iter()
+                .copied()
+                .map(|column| {
+                    self.browse_column_menu_item(ColumnResizeTarget::Artist(column), cx)
+                        .into_any_element()
+                })
+                .collect(),
+            ColumnMenuKind::Albums => ALL_ALBUM_TABLE_COLUMNS
+                .iter()
+                .copied()
+                .map(|column| {
+                    self.browse_column_menu_item(ColumnResizeTarget::Album(column), cx)
+                        .into_any_element()
+                })
+                .collect(),
+            ColumnMenuKind::Genres => ALL_GENRE_TABLE_COLUMNS
+                .iter()
+                .copied()
+                .map(|column| {
+                    self.browse_column_menu_item(ColumnResizeTarget::Genre(column), cx)
+                        .into_any_element()
+                })
+                .collect(),
+        }
     }
 
     pub(super) fn column_menu_item(
@@ -2277,6 +2668,59 @@ impl TempoApp {
         .when(!locked, |this| {
             this.on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                 this.toggle_table_column(column);
+                cx.stop_propagation();
+                cx.notify();
+            }))
+        })
+    }
+
+    pub(super) fn browse_column_menu_item(
+        &self,
+        target: ColumnResizeTarget,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+        let checked = match target {
+            ColumnResizeTarget::Artist(column) => self.visible_artist_columns.contains(&column),
+            ColumnResizeTarget::Album(column) => self.visible_album_columns.contains(&column),
+            ColumnResizeTarget::Genre(column) => self.visible_genre_columns.contains(&column),
+            ColumnResizeTarget::Track(_)
+            | ColumnResizeTarget::ScanError(_)
+            | ColumnResizeTarget::PlaybackHistoryPlayedAt => false,
+        };
+        let locked = matches!(
+            target,
+            ColumnResizeTarget::Artist(ArtistTableColumn::Artist)
+                | ColumnResizeTarget::Album(AlbumTableColumn::Album)
+                | ColumnResizeTarget::Genre(GenreTableColumn::Genre)
+        );
+
+        menu_item_base(
+            SharedString::from(format!("column-menu-{}", Self::resize_target_key(target))),
+            colors,
+        )
+        .gap_2()
+        .cursor(if locked {
+            CursorStyle::Arrow
+        } else {
+            CursorStyle::PointingHand
+        })
+        .text_color(rgb(if locked {
+            colors.text_faint
+        } else {
+            colors.text
+        }))
+        .child(
+            div()
+                .w(px(16.0))
+                .text_color(rgb(colors.accent))
+                .child(if checked { "✓" } else { "" }),
+        )
+        .child(div().flex_1().child(Self::resize_target_menu_label(target)))
+        .when(locked, |this| this.child(div().text_xs().child("required")))
+        .when(!locked, |this| {
+            this.on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                this.toggle_browse_column(target);
                 cx.stop_propagation();
                 cx.notify();
             }))
@@ -2338,15 +2782,98 @@ impl TempoApp {
             ColumnResizeTarget::Artist(ArtistTableColumn::Artist) => "artist-name",
             ColumnResizeTarget::Artist(ArtistTableColumn::Albums) => "artist-albums",
             ColumnResizeTarget::Artist(ArtistTableColumn::Tracks) => "artist-tracks",
+            ColumnResizeTarget::Artist(ArtistTableColumn::Duration) => "artist-duration",
             ColumnResizeTarget::Album(AlbumTableColumn::Artwork) => "album-artwork",
             ColumnResizeTarget::Album(AlbumTableColumn::Album) => "album-title",
             ColumnResizeTarget::Album(AlbumTableColumn::Artist) => "album-artist",
             ColumnResizeTarget::Album(AlbumTableColumn::Year) => "album-year",
             ColumnResizeTarget::Album(AlbumTableColumn::Tracks) => "album-tracks",
+            ColumnResizeTarget::Album(AlbumTableColumn::Duration) => "album-duration",
+            ColumnResizeTarget::Genre(GenreTableColumn::Genre) => "genre-name",
+            ColumnResizeTarget::Genre(GenreTableColumn::Artists) => "genre-artists",
+            ColumnResizeTarget::Genre(GenreTableColumn::Albums) => "genre-albums",
+            ColumnResizeTarget::Genre(GenreTableColumn::Tracks) => "genre-tracks",
+            ColumnResizeTarget::Genre(GenreTableColumn::Duration) => "genre-duration",
             ColumnResizeTarget::ScanError(ScanErrorColumn::Index) => "scan-error-index",
             ColumnResizeTarget::ScanError(ScanErrorColumn::Path) => "scan-error-path",
             ColumnResizeTarget::ScanError(ScanErrorColumn::Error) => "scan-error-error",
             ColumnResizeTarget::PlaybackHistoryPlayedAt => "playback-history-played-at",
+        }
+    }
+
+    pub(super) fn browse_sort_active(&self, target: ColumnResizeTarget) -> bool {
+        match target {
+            ColumnResizeTarget::Artist(column) => self.artist_table_sort_column == column,
+            ColumnResizeTarget::Album(column) => self.album_table_sort_column == column,
+            ColumnResizeTarget::Genre(column) => self.genre_table_sort_column == column,
+            ColumnResizeTarget::Track(_)
+            | ColumnResizeTarget::ScanError(_)
+            | ColumnResizeTarget::PlaybackHistoryPlayedAt => false,
+        }
+    }
+
+    pub(super) fn browse_sort_icon(&self, target: ColumnResizeTarget) -> &'static str {
+        let direction = match target {
+            ColumnResizeTarget::Artist(_) => self.artist_table_sort_direction,
+            ColumnResizeTarget::Album(_) => self.album_table_sort_direction,
+            ColumnResizeTarget::Genre(_) => self.genre_table_sort_direction,
+            ColumnResizeTarget::Track(_)
+            | ColumnResizeTarget::ScanError(_)
+            | ColumnResizeTarget::PlaybackHistoryPlayedAt => SortDirection::Ascending,
+        };
+
+        match direction {
+            SortDirection::Ascending => "▲",
+            SortDirection::Descending => "▼",
+        }
+    }
+
+    pub(super) fn toggle_browse_table_sort(&mut self, target: ColumnResizeTarget) {
+        match target {
+            ColumnResizeTarget::Artist(ArtistTableColumn::Artwork)
+            | ColumnResizeTarget::Album(AlbumTableColumn::Artwork) => return,
+            ColumnResizeTarget::Artist(column) => {
+                Self::toggle_sort(
+                    column,
+                    &mut self.artist_table_sort_column,
+                    &mut self.artist_table_sort_direction,
+                );
+            }
+            ColumnResizeTarget::Album(column) => {
+                Self::toggle_sort(
+                    column,
+                    &mut self.album_table_sort_column,
+                    &mut self.album_table_sort_direction,
+                );
+            }
+            ColumnResizeTarget::Genre(column) => {
+                Self::toggle_sort(
+                    column,
+                    &mut self.genre_table_sort_column,
+                    &mut self.genre_table_sort_direction,
+                );
+            }
+            ColumnResizeTarget::Track(_)
+            | ColumnResizeTarget::ScanError(_)
+            | ColumnResizeTarget::PlaybackHistoryPlayedAt => return,
+        }
+
+        self.save_app_state();
+    }
+
+    fn toggle_sort<T: Copy + PartialEq>(
+        next_column: T,
+        current_column: &mut T,
+        direction: &mut SortDirection,
+    ) {
+        if *current_column == next_column {
+            *direction = match *direction {
+                SortDirection::Ascending => SortDirection::Descending,
+                SortDirection::Descending => SortDirection::Ascending,
+            };
+        } else {
+            *current_column = next_column;
+            *direction = SortDirection::Ascending;
         }
     }
 

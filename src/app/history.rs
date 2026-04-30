@@ -46,9 +46,7 @@ impl TempoApp {
             .flex()
             .flex_col()
             .child(self.render_simple_page_header("Playback History", subtitle))
-            .when(self.tabs.len() > 1, |this| {
-                this.child(self.render_tab_bar(cx))
-            })
+            .child(self.render_tab_bar(cx))
             .child(
                 div()
                     .id("playback-history-scroll")

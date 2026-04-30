@@ -29,9 +29,7 @@ impl TempoApp {
             .flex()
             .flex_col()
             .child(self.render_simple_page_header("Liked", subtitle))
-            .when(self.tabs.len() > 1, |this| {
-                this.child(self.render_tab_bar(cx))
-            })
+            .child(self.render_tab_bar(cx))
             .child(
                 div()
                     .id("liked-scroll")

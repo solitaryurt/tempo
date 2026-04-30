@@ -8,9 +8,10 @@ struct BrowseGridMetrics {
 
 impl TempoApp {
     pub(super) fn render_detail_hero(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        match self.active_tab().source {
-            TabSource::Artist(artist_id) => self.render_artist_detail_hero(artist_id, cx),
-            TabSource::Album(album_id) => self.render_album_detail_hero(album_id, cx),
+        match &self.active_tab().source {
+            TabSource::Artist(artist_id) => self.render_artist_detail_hero(*artist_id, cx),
+            TabSource::Album(album_id) => self.render_album_detail_hero(*album_id, cx),
+            TabSource::Genre(genre_key) => self.render_genre_detail_hero(genre_key, cx),
             TabSource::Library | TabSource::Playlist(_) => None,
         }
     }
@@ -185,13 +186,127 @@ impl TempoApp {
         )
     }
 
+    fn render_genre_detail_hero(
+        &self,
+        genre_key: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let genre = self.genre_by_key(genre_key)?;
+        let colors = *self.colors();
+        let play_key = genre.key.clone();
+        let shuffle_key = genre.key.clone();
+        for album in &genre.top_albums {
+            if let Some(album_id) = album.album_id
+                && album.artwork_path.is_none()
+            {
+                self.queue_album_cover_demand(album_id);
+            }
+        }
+
+        Some(
+            div()
+                .id(SharedString::from(format!("genre-hero-{genre_key}")))
+                .flex_none()
+                .border_b_1()
+                .border_color(rgb(colors.border))
+                .bg(rgb(blend_rgb(genre.color, colors.elevated, 0.74)))
+                .flex()
+                .flex_col()
+                .gap_4()
+                .px_4()
+                .py_4()
+                .child(
+                    div()
+                        .id("all-genres-link")
+                        .text_xs()
+                        .text_color(rgb(colors.text_muted))
+                        .cursor_pointer()
+                        .child("‹ All genres")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.open_page(Page::Genres);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_5()
+                        .items_center()
+                        .child(self.render_genre_album_fan(
+                            SharedString::from(format!("genre-hero-fan-{genre_key}")),
+                            &genre.top_albums,
+                            genre.color,
+                            126.0,
+                        ))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .text_color(rgb(colors.text_faint))
+                                        .child("GENRE"),
+                                )
+                                .child(
+                                    div()
+                                        .text_lg()
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .text_color(rgb(colors.text_strong))
+                                        .child(genre.name.clone()),
+                                )
+                                .child(div().text_color(rgb(colors.text_muted)).child(format!(
+                                    "{} artists  ·  {} albums  ·  {} tracks  ·  {}",
+                                    genre.artist_count,
+                                    genre.album_count,
+                                    genre.track_count,
+                                    format_duration_compact(genre.duration_value)
+                                )))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .child(self.genre_action_button("Play all", true).on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.play_genre(&play_key, false, cx);
+                                                cx.notify();
+                                            }),
+                                        ))
+                                        .child(
+                                            self.genre_action_button("Shuffle", false).on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.play_genre(&shuffle_key, true, cx);
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                        ),
+                                ),
+                        ),
+                )
+                .when(!genre.artists.is_empty(), |this| {
+                    this.child(self.render_genre_artist_pills(genre))
+                })
+                .when(!genre.albums.is_empty(), |this| {
+                    this.child(self.render_genre_album_strip(genre, cx))
+                })
+                .into_any_element(),
+        )
+    }
+
     pub(super) fn render_artists_page(
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let colors = *self.colors();
-        let artist_indices = self.artist_indices_for_search_query(&self.browse_search_query);
+        let mut artist_indices = self.artist_indices_for_search_query(&self.browse_search_query);
+        if self.browse_view_mode() == BrowseViewMode::Table {
+            self.sort_artist_indices(&mut artist_indices);
+        }
         let is_searching = !self.browse_search_query.trim().is_empty();
         let subtitle = if is_searching {
             format!(
@@ -216,17 +331,11 @@ impl TempoApp {
             .bg(rgb(colors.surface))
             .flex()
             .flex_col()
-            .child(self.render_browse_header(
-                window,
-                "Artists",
-                subtitle,
-                self.artist_view_mode,
-                cx,
-            ))
-            .when(self.tabs.len() > 1, |this| {
-                this.child(self.render_tab_bar(cx))
-            })
-            .child(match self.artist_view_mode {
+            .child(self.render_browse_header(window, "Artists", subtitle, cx))
+            .child(
+                self.render_tab_bar_with_controls(Some(("Artists", self.browse_view_mode())), cx),
+            )
+            .child(match self.browse_view_mode() {
                 BrowseViewMode::Grid => self.render_artist_grid(grid, artist_indices, cx),
                 BrowseViewMode::Table => self.render_artist_table(artist_indices, cx),
             })
@@ -238,7 +347,10 @@ impl TempoApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let colors = *self.colors();
-        let album_indices = self.album_indices_for_search_query(&self.browse_search_query);
+        let mut album_indices = self.album_indices_for_search_query(&self.browse_search_query);
+        if self.browse_view_mode() == BrowseViewMode::Table {
+            self.sort_album_indices(&mut album_indices);
+        }
         let is_searching = !self.browse_search_query.trim().is_empty();
         let subtitle = if is_searching {
             format!(
@@ -263,14 +375,116 @@ impl TempoApp {
             .bg(rgb(colors.surface))
             .flex()
             .flex_col()
-            .child(self.render_browse_header(window, "Albums", subtitle, self.album_view_mode, cx))
-            .when(self.tabs.len() > 1, |this| {
-                this.child(self.render_tab_bar(cx))
-            })
-            .child(match self.album_view_mode {
+            .child(self.render_browse_header(window, "Albums", subtitle, cx))
+            .child(self.render_tab_bar_with_controls(Some(("Albums", self.browse_view_mode())), cx))
+            .child(match self.browse_view_mode() {
                 BrowseViewMode::Grid => self.render_album_grid(grid, album_indices, cx),
                 BrowseViewMode::Table => self.render_album_table(album_indices, cx),
             })
+    }
+
+    pub(super) fn render_genres_page(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+        let mut genre_indices = self.genre_indices_for_search_query(&self.browse_search_query);
+        if self.browse_view_mode() == BrowseViewMode::Table {
+            self.sort_genre_indices(&mut genre_indices);
+        }
+        let is_searching = !self.browse_search_query.trim().is_empty();
+        let subtitle = if is_searching {
+            format!(
+                "{} of {} genres  ·  {} tracks",
+                genre_indices.len(),
+                self.genres.len(),
+                self.tracks.len()
+            )
+        } else {
+            format!(
+                "{} genres  ·  {} tracks",
+                self.genres.len(),
+                self.tracks.len()
+            )
+        };
+        let grid = self.genre_grid_metrics(window);
+
+        div()
+            .id("genres-page")
+            .flex_1()
+            .min_w_0()
+            .bg(rgb(colors.surface))
+            .flex()
+            .flex_col()
+            .child(self.render_genres_header(window, subtitle, cx))
+            .child(self.render_tab_bar_with_controls(Some(("Genres", self.browse_view_mode())), cx))
+            .child(match self.browse_view_mode() {
+                BrowseViewMode::Grid => self.render_genre_grid(grid, genre_indices, cx),
+                BrowseViewMode::Table => self.render_genre_table(genre_indices, cx),
+            })
+    }
+
+    fn render_genres_header(
+        &self,
+        window: &Window,
+        subtitle: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+
+        div()
+            .h(px(54.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_4()
+            .px_4()
+            .border_b_1()
+            .border_color(rgb(colors.border))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .when(self.left_sidebar_collapsed, |this| {
+                        this.child(self.sidebar_button("›", "open-left-sidebar").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.left_sidebar_collapsed = false;
+                                cx.notify();
+                            }),
+                        ))
+                    })
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(colors.text_strong))
+                            .child("Genres"),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(colors.text_faint))
+                    .child(subtitle),
+            )
+            .when_some(self.render_metadata_status(cx), |this, status| {
+                this.child(status)
+            })
+            .child(div().flex_1())
+            .child(self.render_search_box(window, "Search", cx))
+            .child(
+                self.with_tooltip(
+                    self.sidebar_button("⚙", "genres-open-settings")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.open_page(Page::Settings);
+                            cx.notify();
+                        })),
+                    "genres-open-settings-tooltip",
+                    "Settings",
+                    cx,
+                ),
+            )
     }
 
     fn render_artist_grid(
@@ -329,6 +543,34 @@ impl TempoApp {
         )
     }
 
+    fn render_genre_grid(
+        &self,
+        grid: BrowseGridMetrics,
+        genre_indices: Vec<usize>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let is_searching = !self.browse_search_query.trim().is_empty();
+        self.render_browse_grid(
+            BrowseScrollbarTarget::GenresGrid,
+            "genres-grid-scroll",
+            "genre-grid-rows",
+            if is_searching {
+                "No matching genres"
+            } else {
+                "No genres yet"
+            },
+            if is_searching {
+                "No genres match the current search."
+            } else {
+                "Add genre tags to your music and Tempo will group them here."
+            },
+            genre_indices,
+            grid,
+            Self::render_genre_grid_row,
+            cx,
+        )
+    }
+
     fn browse_grid_metrics(&self, window: &Window) -> BrowseGridMetrics {
         let sidebar_width = if self.left_sidebar_collapsed {
             0.0
@@ -342,6 +584,26 @@ impl TempoApp {
             .max(1.0) as usize;
         let total_gap = BROWSE_GRID_GAP * columns.saturating_sub(1) as f32;
         let card_width = ((available - total_gap) / columns as f32).max(BROWSE_GRID_CARD_W);
+
+        BrowseGridMetrics {
+            columns,
+            card_width,
+        }
+    }
+
+    fn genre_grid_metrics(&self, window: &Window) -> BrowseGridMetrics {
+        let sidebar_width = if self.left_sidebar_collapsed {
+            0.0
+        } else {
+            LEFT_SIDEBAR_W
+        };
+        let width = f32::from(window.viewport_size().width);
+        let available = (width - sidebar_width - BROWSE_GRID_PAD_X).max(GENRE_GRID_CARD_W);
+        let columns = ((available + BROWSE_GRID_GAP) / (GENRE_GRID_CARD_W + BROWSE_GRID_GAP))
+            .floor()
+            .max(1.0) as usize;
+        let total_gap = BROWSE_GRID_GAP * columns.saturating_sub(1) as f32;
+        let card_width = ((available - total_gap) / columns as f32).max(GENRE_GRID_CARD_W);
 
         BrowseGridMetrics {
             columns,
@@ -506,6 +768,34 @@ impl TempoApp {
             .into_any_element()
     }
 
+    fn render_genre_grid_row(
+        &self,
+        row_ix: usize,
+        grid: BrowseGridMetrics,
+        genre_indices: &[usize],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let columns = grid.columns;
+        let start = row_ix * columns;
+        let end = (start + columns).min(genre_indices.len());
+
+        div()
+            .id(gpui::ElementId::NamedInteger(
+                "genre-grid-row".into(),
+                row_ix as u64,
+            ))
+            .flex()
+            .gap_4()
+            .pb_4()
+            .children(
+                genre_indices[start..end]
+                    .iter()
+                    .filter_map(|genre_ix| self.genres.get(*genre_ix))
+                    .map(|genre| self.render_genre_card(genre, grid.card_width, cx)),
+            )
+            .into_any_element()
+    }
+
     fn render_artist_table(
         &self,
         artist_indices: Vec<usize>,
@@ -527,12 +817,12 @@ impl TempoApp {
                 "Add a music folder and Tempo will group indexed tracks by artist."
             },
             artist_indices,
-            &[
-                ColumnResizeTarget::Artist(ArtistTableColumn::Artwork),
-                ColumnResizeTarget::Artist(ArtistTableColumn::Artist),
-                ColumnResizeTarget::Artist(ArtistTableColumn::Albums),
-                ColumnResizeTarget::Artist(ArtistTableColumn::Tracks),
-            ],
+            ColumnMenuKind::Artists,
+            self.visible_artist_columns
+                .iter()
+                .copied()
+                .map(ColumnResizeTarget::Artist)
+                .collect(),
             Self::render_artist_row,
             cx,
         )
@@ -555,16 +845,146 @@ impl TempoApp {
                 "Add a music folder and Tempo will group indexed tracks by album."
             },
             album_indices,
-            &[
-                ColumnResizeTarget::Album(AlbumTableColumn::Artwork),
-                ColumnResizeTarget::Album(AlbumTableColumn::Album),
-                ColumnResizeTarget::Album(AlbumTableColumn::Artist),
-                ColumnResizeTarget::Album(AlbumTableColumn::Year),
-                ColumnResizeTarget::Album(AlbumTableColumn::Tracks),
-            ],
+            ColumnMenuKind::Albums,
+            self.visible_album_columns
+                .iter()
+                .copied()
+                .map(ColumnResizeTarget::Album)
+                .collect(),
             Self::render_album_row,
             cx,
         )
+    }
+
+    fn render_genre_table(&self, genre_indices: Vec<usize>, cx: &mut Context<Self>) -> AnyElement {
+        let is_searching = !self.browse_search_query.trim().is_empty();
+        self.render_browse_table(
+            BrowseScrollbarTarget::GenresGrid,
+            "genres-table",
+            "genre-table-rows",
+            if is_searching {
+                "No matching genres"
+            } else {
+                "No genres yet"
+            },
+            if is_searching {
+                "No genres match the current search."
+            } else {
+                "Add genre tags to your music and Tempo will group them here."
+            },
+            genre_indices,
+            ColumnMenuKind::Genres,
+            self.visible_genre_columns
+                .iter()
+                .copied()
+                .map(ColumnResizeTarget::Genre)
+                .collect(),
+            Self::render_genre_row,
+            cx,
+        )
+    }
+
+    pub(super) fn sort_artist_indices(&self, artist_indices: &mut [usize]) {
+        artist_indices.sort_by(|left, right| {
+            let Some(left) = self.artists.get(*left) else {
+                return std::cmp::Ordering::Equal;
+            };
+            let Some(right) = self.artists.get(*right) else {
+                return std::cmp::Ordering::Equal;
+            };
+            let ordering = match self.artist_table_sort_column {
+                ArtistTableColumn::Artwork | ArtistTableColumn::Artist => {
+                    left.name.cmp(&right.name)
+                }
+                ArtistTableColumn::Albums => left
+                    .album_count
+                    .cmp(&right.album_count)
+                    .then(left.name.cmp(&right.name)),
+                ArtistTableColumn::Tracks => left
+                    .track_count
+                    .cmp(&right.track_count)
+                    .then(left.name.cmp(&right.name)),
+                ArtistTableColumn::Duration => self
+                    .artist_total_duration(left.artist_id)
+                    .cmp(&self.artist_total_duration(right.artist_id))
+                    .then(left.name.cmp(&right.name)),
+            };
+            match self.artist_table_sort_direction {
+                SortDirection::Ascending => ordering,
+                SortDirection::Descending => ordering.reverse(),
+            }
+        });
+    }
+
+    pub(super) fn sort_album_indices(&self, album_indices: &mut [usize]) {
+        album_indices.sort_by(|left, right| {
+            let Some(left) = self.albums.get(*left) else {
+                return std::cmp::Ordering::Equal;
+            };
+            let Some(right) = self.albums.get(*right) else {
+                return std::cmp::Ordering::Equal;
+            };
+            let ordering = match self.album_table_sort_column {
+                AlbumTableColumn::Artwork | AlbumTableColumn::Album => left
+                    .title
+                    .cmp(&right.title)
+                    .then(left.artist.cmp(&right.artist)),
+                AlbumTableColumn::Artist => left
+                    .artist
+                    .cmp(&right.artist)
+                    .then(left.title.cmp(&right.title)),
+                AlbumTableColumn::Year => left
+                    .year
+                    .cmp(&right.year)
+                    .then(left.title.cmp(&right.title)),
+                AlbumTableColumn::Tracks => left
+                    .track_count
+                    .cmp(&right.track_count)
+                    .then(left.title.cmp(&right.title)),
+                AlbumTableColumn::Duration => self
+                    .album_total_duration(left.album_id)
+                    .cmp(&self.album_total_duration(right.album_id))
+                    .then(left.title.cmp(&right.title)),
+            };
+            match self.album_table_sort_direction {
+                SortDirection::Ascending => ordering,
+                SortDirection::Descending => ordering.reverse(),
+            }
+        });
+    }
+
+    pub(super) fn sort_genre_indices(&self, genre_indices: &mut [usize]) {
+        genre_indices.sort_by(|left, right| {
+            let Some(left) = self.genres.get(*left) else {
+                return std::cmp::Ordering::Equal;
+            };
+            let Some(right) = self.genres.get(*right) else {
+                return std::cmp::Ordering::Equal;
+            };
+            let ordering = match self.genre_table_sort_column {
+                GenreTableColumn::Genre => left.name.cmp(&right.name),
+                GenreTableColumn::Artists => left
+                    .artist_count
+                    .cmp(&right.artist_count)
+                    .then(left.name.cmp(&right.name)),
+                GenreTableColumn::Albums => left
+                    .album_count
+                    .cmp(&right.album_count)
+                    .then(left.name.cmp(&right.name)),
+                GenreTableColumn::Tracks => left
+                    .track_count
+                    .cmp(&right.track_count)
+                    .then(left.name.cmp(&right.name)),
+                GenreTableColumn::Duration => left
+                    .duration_value
+                    .cmp(&right.duration_value)
+                    .then(left.name.cmp(&right.name)),
+            };
+            match self.genre_table_sort_direction {
+                SortDirection::Ascending => ordering,
+                SortDirection::Descending => ordering.reverse(),
+            }
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -576,7 +996,8 @@ impl TempoApp {
         empty_title: &'static str,
         empty_body: &'static str,
         row_indices: Vec<usize>,
-        columns: &'static [ColumnResizeTarget],
+        column_menu_kind: ColumnMenuKind,
+        columns: Vec<ColumnResizeTarget>,
         render_row: fn(&Self, usize, usize, &mut Context<Self>) -> Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -593,7 +1014,53 @@ impl TempoApp {
             .flex_col()
             .border_t_1()
             .border_color(rgb(colors.border))
-            .child(self.render_resizable_table_header(34.0, columns, cx))
+            // Mouse-move/up live on the outer container so column resizing
+            // works while the cursor is over the header *or* the body, and
+            // so a left-mouse-down anywhere in the table dismisses an open
+            // column menu (matching the All Music table behavior).
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus_handle);
+                    if this.column_menu_open {
+                        this.column_menu_open = false;
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                    let scrolled = this.drag_browse_scrollbar(target, event);
+                    let resized = !scrolled && this.resize_column_from_mouse(event);
+                    if scrolled || resized {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                    let scrolled = this.finish_browse_scrollbar_drag();
+                    let resized = this.finish_column_resize();
+                    if scrolled || resized {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                    let scrolled = this.finish_browse_scrollbar_drag();
+                    let resized = this.finish_column_resize();
+                    if scrolled || resized {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(self.render_browse_table_header(column_menu_kind, 34.0, &columns, cx))
             .when(row_count == 0, |this| {
                 this.child(
                     div()
@@ -608,38 +1075,6 @@ impl TempoApp {
                         .min_h_0()
                         .relative()
                         .overflow_hidden()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _event: &MouseDownEvent, window, _cx| {
-                                window.focus(&this.focus_handle);
-                            }),
-                        )
-                        .on_mouse_move(cx.listener(
-                            move |this, event: &MouseMoveEvent, _window, cx| {
-                                if this.drag_browse_scrollbar(target, event) {
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }
-                            },
-                        ))
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
-                                if this.finish_browse_scrollbar_drag() {
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }
-                            }),
-                        )
-                        .on_mouse_up_out(
-                            MouseButton::Left,
-                            cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
-                                if this.finish_browse_scrollbar_drag() {
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }
-                            }),
-                        )
                         .child(
                             uniform_list(
                                 list_id,
@@ -683,6 +1118,7 @@ impl TempoApp {
             BrowseScrollbarTarget::ArtistsTable => self.artist_table_scroll_handle.clone(),
             BrowseScrollbarTarget::AlbumsGrid => self.album_grid_scroll_handle.clone(),
             BrowseScrollbarTarget::AlbumsTable => self.album_table_scroll_handle.clone(),
+            BrowseScrollbarTarget::GenresGrid => self.genre_grid_scroll_handle.clone(),
             BrowseScrollbarTarget::PlaybackHistory => self.playback_history_scroll_handle.clone(),
             BrowseScrollbarTarget::Liked => self.liked_scroll_handle.clone(),
         }
@@ -919,6 +1355,7 @@ impl TempoApp {
             BrowseScrollbarTarget::ArtistsTable => "artists-table",
             BrowseScrollbarTarget::AlbumsGrid => "albums-grid",
             BrowseScrollbarTarget::AlbumsTable => "albums-table",
+            BrowseScrollbarTarget::GenresGrid => "genres-grid",
             BrowseScrollbarTarget::PlaybackHistory => "playback-history",
             BrowseScrollbarTarget::Liked => "liked",
         }
@@ -929,7 +1366,6 @@ impl TempoApp {
         window: &Window,
         title: &'static str,
         subtitle: String,
-        mode: BrowseViewMode,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let colors = *self.colors();
@@ -975,26 +1411,6 @@ impl TempoApp {
             .child(div().flex_1())
             .child(self.render_search_box(window, "Search", cx))
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        self.render_view_mode_button("Grid", title, mode == BrowseViewMode::Grid)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.set_browse_view_mode(title, BrowseViewMode::Grid);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        self.render_view_mode_button("Table", title, mode == BrowseViewMode::Table)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.set_browse_view_mode(title, BrowseViewMode::Table);
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
                 self.with_tooltip(
                     self.sidebar_button("⚙", "open-settings")
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -1008,7 +1424,7 @@ impl TempoApp {
             )
     }
 
-    fn render_view_mode_button(
+    pub(super) fn render_view_mode_button(
         &self,
         label: &'static str,
         page: &'static str,
@@ -1020,15 +1436,10 @@ impl TempoApp {
         } else {
             colors.button
         };
-        let fg = if active {
-            colors.text_strong
-        } else {
-            colors.text_muted
-        };
         let border = if active {
             colors.border_strong
         } else {
-            colors.waveform_border
+            colors.border
         };
 
         div()
@@ -1037,32 +1448,69 @@ impl TempoApp {
                 page.to_ascii_lowercase(),
                 label.to_ascii_lowercase()
             )))
-            .h(px(24.0))
-            .px_2()
-            .rounded_md()
-            .border_1()
+            .w(px(30.0))
+            .h_full()
+            .border_r_1()
             .border_color(rgb(border))
             .bg(rgb(bg))
             .cursor_pointer()
             .flex()
             .items_center()
             .justify_center()
-            .text_xs()
-            .text_color(rgb(fg))
             .hover(move |this| {
                 this.bg(rgb(colors.button_hover))
-                    .text_color(rgb(colors.text_strong))
+                    .border_color(rgb(colors.border_strong))
             })
             .active(|this| this.opacity(0.82))
-            .child(label)
+            .child(Self::view_mode_icon(label, active, colors))
     }
 
-    fn set_browse_view_mode(&mut self, page: &'static str, mode: BrowseViewMode) {
-        match page {
-            "Artists" => self.artist_view_mode = mode,
-            "Albums" => self.album_view_mode = mode,
-            _ => {}
-        }
+    fn view_mode_icon(label: &'static str, active: bool, colors: ThemeColors) -> AnyElement {
+        let color = if active {
+            colors.text_strong
+        } else {
+            colors.text_muted
+        };
+        let accent = if active { colors.accent } else { color };
+        let color = format!("#{:06x}", color);
+        let accent = format!("#{:06x}", accent);
+        let paths = match label {
+            "Grid" => format!(
+                r#"<rect x="5" y="5" width="5.4" height="5.4" rx="1" fill="none" stroke="{color}" stroke-width="1.6"/>
+<rect x="13.6" y="5" width="5.4" height="5.4" rx="1" fill="none" stroke="{accent}" stroke-width="1.6"/>
+<rect x="5" y="13.6" width="5.4" height="5.4" rx="1" fill="none" stroke="{accent}" stroke-width="1.6"/>
+<rect x="13.6" y="13.6" width="5.4" height="5.4" rx="1" fill="none" stroke="{color}" stroke-width="1.6"/>"#
+            ),
+            _ => format!(
+                r#"<path d="M6 7H18" fill="none" stroke="{color}" stroke-width="1.7" stroke-linecap="round"/>
+<path d="M6 12H18" fill="none" stroke="{accent}" stroke-width="1.7" stroke-linecap="round"/>
+<path d="M6 17H18" fill="none" stroke="{color}" stroke-width="1.7" stroke-linecap="round"/>
+<path d="M4 7H4.1M4 12H4.1M4 17H4.1" fill="none" stroke="{accent}" stroke-width="2.2" stroke-linecap="round"/>"#
+            ),
+        };
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">{paths}</svg>"#
+        );
+
+        img(Arc::new(Image::from_bytes(
+            ImageFormat::Svg,
+            svg.into_bytes(),
+        )))
+        .w(px(15.0))
+        .h(px(15.0))
+        .flex_none()
+        .into_any_element()
+    }
+
+    pub(super) fn set_browse_view_mode(&mut self, page: &'static str, mode: BrowseViewMode) {
+        let _ = page;
+        self.artist_view_mode = mode;
+        self.album_view_mode = mode;
+        self.genre_view_mode = mode;
+    }
+
+    pub(super) fn browse_view_mode(&self) -> BrowseViewMode {
+        self.artist_view_mode
     }
 
     fn render_artist_row(
@@ -1095,53 +1543,11 @@ impl TempoApp {
             .bg(rgb(bg))
             .cursor_pointer()
             .hover(move |this| this.bg(rgb(colors.hover)))
-            .child(
-                div()
-                    .w(px(
-                        self.artist_table_column_width(ArtistTableColumn::Artwork)
-                    ))
-                    .child(self.row_image(
-                        SharedString::from(format!("artist-row-image-{}", artist.artist_id)),
-                        artist.photo_path.as_ref(),
-                        artist.initials.clone(),
-                        artist.color,
-                    )),
-            )
-            .child(
-                div()
-                    .w(px(self.artist_table_column_width(ArtistTableColumn::Artist)))
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .text_color(rgb(colors.text_strong))
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(artist.name.clone()),
-                    )
-                    .when_some(artist.bio.as_ref(), |this, bio| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(colors.text_faint))
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .child(bio.clone()),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .w(px(self.artist_table_column_width(ArtistTableColumn::Albums)))
-                    .text_color(rgb(colors.text_muted))
-                    .child(artist.album_count.to_string()),
-            )
-            .child(
-                div()
-                    .w(px(self.artist_table_column_width(ArtistTableColumn::Tracks)))
-                    .text_color(rgb(colors.text_muted))
-                    .child(artist.track_count.to_string()),
+            .children(
+                self.visible_artist_columns
+                    .iter()
+                    .copied()
+                    .map(|column| self.artist_table_cell(column, artist)),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_artist_tab(artist_id);
@@ -1181,48 +1587,11 @@ impl TempoApp {
             .bg(rgb(bg))
             .cursor_pointer()
             .hover(move |this| this.bg(rgb(colors.hover)))
-            .child(
-                div()
-                    .w(px(self.album_table_column_width(AlbumTableColumn::Artwork)))
-                    .child(self.row_image(
-                        SharedString::from(format!(
-                            "album-row-image-{}-{}",
-                            album.artist_id, album.album_id
-                        )),
-                        album.artwork_path.as_ref(),
-                        album.initials.clone(),
-                        album.color,
-                    )),
-            )
-            .child(
-                div()
-                    .w(px(self.album_table_column_width(AlbumTableColumn::Album)))
-                    .min_w_0()
-                    .text_color(rgb(colors.text_strong))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .child(album.title.clone()),
-            )
-            .child(
-                div()
-                    .w(px(self.album_table_column_width(AlbumTableColumn::Artist)))
-                    .min_w_0()
-                    .text_color(rgb(colors.text_muted))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .child(album.artist.clone()),
-            )
-            .child(
-                div()
-                    .w(px(self.album_table_column_width(AlbumTableColumn::Year)))
-                    .text_color(rgb(colors.text_muted))
-                    .child(album.year.clone().unwrap_or_else(|| "Unknown".to_string())),
-            )
-            .child(
-                div()
-                    .w(px(self.album_table_column_width(AlbumTableColumn::Tracks)))
-                    .text_color(rgb(colors.text_muted))
-                    .child(album.track_count.to_string()),
+            .children(
+                self.visible_album_columns
+                    .iter()
+                    .copied()
+                    .map(|column| self.album_table_cell(column, album)),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_album_tab(album_id);
@@ -1230,6 +1599,217 @@ impl TempoApp {
             }))
             .into_any_element()
             .into()
+    }
+
+    fn render_genre_row(
+        &self,
+        row_ix: usize,
+        genre_ix: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let genre = self.genres.get(genre_ix)?;
+        let colors = *self.colors();
+        let bg = if row_ix.is_multiple_of(2) {
+            colors.surface
+        } else {
+            colors.panel_alt
+        };
+        let genre_key = genre.key.clone();
+        let artists = genre
+            .artists
+            .iter()
+            .take(4)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        div()
+            .id(SharedString::from(format!("genre-row-{}", genre.key)))
+            .h(px(50.0))
+            .px_4()
+            .flex()
+            .items_center()
+            .gap_3()
+            .border_b_1()
+            .border_color(rgb(colors.border_subtle))
+            .bg(rgb(bg))
+            .cursor_pointer()
+            .hover(move |this| this.bg(rgb(colors.hover)))
+            .children(
+                self.visible_genre_columns
+                    .iter()
+                    .copied()
+                    .map(|column| self.genre_table_cell(column, genre, &artists)),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_genre_tab(genre_key.clone());
+                cx.notify();
+            }))
+            .into_any_element()
+            .into()
+    }
+
+    fn artist_table_cell(&self, column: ArtistTableColumn, artist: &Artist) -> AnyElement {
+        let colors = *self.colors();
+        match column {
+            ArtistTableColumn::Artwork => div()
+                .w(px(self.artist_table_column_width(column)))
+                .child(self.row_image(
+                    SharedString::from(format!("artist-row-image-{}", artist.artist_id)),
+                    artist.photo_path.as_ref(),
+                    artist.initials.clone(),
+                    artist.color,
+                ))
+                .into_any_element(),
+            ArtistTableColumn::Artist => div()
+                .w(px(self.artist_table_column_width(column)))
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .text_color(rgb(colors.text_strong))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(artist.name.clone()),
+                )
+                .when_some(artist.bio.as_ref(), |this, bio| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(colors.text_faint))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(bio.clone()),
+                    )
+                })
+                .into_any_element(),
+            ArtistTableColumn::Albums => self
+                .cell(
+                    artist.album_count.to_string(),
+                    self.artist_table_column_width(column),
+                )
+                .into_any_element(),
+            ArtistTableColumn::Tracks => self
+                .cell(
+                    artist.track_count.to_string(),
+                    self.artist_table_column_width(column),
+                )
+                .into_any_element(),
+            ArtistTableColumn::Duration => self
+                .cell(
+                    format_duration_compact(self.artist_total_duration(artist.artist_id)),
+                    self.artist_table_column_width(column),
+                )
+                .into_any_element(),
+        }
+    }
+
+    fn album_table_cell(&self, column: AlbumTableColumn, album: &Album) -> AnyElement {
+        let colors = *self.colors();
+        match column {
+            AlbumTableColumn::Artwork => div()
+                .w(px(self.album_table_column_width(column)))
+                .child(self.row_image(
+                    SharedString::from(format!(
+                        "album-row-image-{}-{}",
+                        album.artist_id, album.album_id
+                    )),
+                    album.artwork_path.as_ref(),
+                    album.initials.clone(),
+                    album.color,
+                ))
+                .into_any_element(),
+            AlbumTableColumn::Album => div()
+                .w(px(self.album_table_column_width(column)))
+                .min_w_0()
+                .text_color(rgb(colors.text_strong))
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(album.title.clone())
+                .into_any_element(),
+            AlbumTableColumn::Artist => div()
+                .w(px(self.album_table_column_width(column)))
+                .min_w_0()
+                .text_color(rgb(colors.text_muted))
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(album.artist.clone())
+                .into_any_element(),
+            AlbumTableColumn::Year => self
+                .cell(
+                    album.year.clone().unwrap_or_else(|| "Unknown".to_string()),
+                    self.album_table_column_width(column),
+                )
+                .into_any_element(),
+            AlbumTableColumn::Tracks => self
+                .cell(
+                    album.track_count.to_string(),
+                    self.album_table_column_width(column),
+                )
+                .into_any_element(),
+            AlbumTableColumn::Duration => self
+                .cell(
+                    format_duration_compact(self.album_total_duration(album.album_id)),
+                    self.album_table_column_width(column),
+                )
+                .into_any_element(),
+        }
+    }
+
+    fn genre_table_cell(
+        &self,
+        column: GenreTableColumn,
+        genre: &Genre,
+        artists: &str,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        match column {
+            GenreTableColumn::Genre => div()
+                .w(px(self.genre_table_column_width(column)))
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(10.0))
+                        .h(px(10.0))
+                        .rounded_sm()
+                        .flex_none()
+                        .bg(rgb(genre.color)),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .text_color(rgb(colors.text_strong))
+                        .child(genre.name.clone()),
+                )
+                .into_any_element(),
+            GenreTableColumn::Artists => self
+                .cell(artists.to_string(), self.genre_table_column_width(column))
+                .into_any_element(),
+            GenreTableColumn::Albums => self
+                .cell(
+                    genre.album_count.to_string(),
+                    self.genre_table_column_width(column),
+                )
+                .into_any_element(),
+            GenreTableColumn::Tracks => self
+                .cell(
+                    genre.track_count.to_string(),
+                    self.genre_table_column_width(column),
+                )
+                .into_any_element(),
+            GenreTableColumn::Duration => self
+                .cell(
+                    format_duration_compact(genre.duration_value),
+                    self.genre_table_column_width(column),
+                )
+                .into_any_element(),
+        }
     }
 
     fn render_artist_card(
@@ -1305,6 +1885,113 @@ impl TempoApp {
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_artist_tab(artist_id);
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    fn render_genre_card(
+        &self,
+        genre: &Genre,
+        card_width: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let genre_key = genre.key.clone();
+        let play_genre_key = genre.key.clone();
+        let bg = blend_rgb(genre.color, colors.surface, 0.66);
+        for album in &genre.top_albums {
+            if let Some(album_id) = album.album_id
+                && album.artwork_path.is_none()
+            {
+                self.queue_album_cover_demand(album_id);
+            }
+        }
+
+        div()
+            .id(SharedString::from(format!("genre-card-{}", genre.key)))
+            .w(px(card_width))
+            .h(px(220.0))
+            .flex_none()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(blend_rgb(genre.color, colors.border, 0.45)))
+            .bg(rgb(bg))
+            .overflow_hidden()
+            .cursor_pointer()
+            .relative()
+            .hover(move |this| {
+                this.bg(rgb(blend_rgb(genre.color, colors.hover, 0.55)))
+                    .border_color(rgb(blend_rgb(genre.color, colors.border_strong, 0.35)))
+            })
+            .active(|this| this.opacity(0.9))
+            .child(
+                div()
+                    .h(px(142.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(self.render_genre_album_fan(
+                        SharedString::from(format!("genre-card-fan-{}", genre.key)),
+                        &genre.top_albums,
+                        genre.color,
+                        86.0,
+                    )),
+            )
+            .child(
+                div()
+                    .px_4()
+                    .pb_4()
+                    .flex()
+                    .items_end()
+                    .gap_3()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(colors.text_strong))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(genre.name.clone()),
+                            )
+                            .child(div().text_xs().text_color(rgb(colors.text_muted)).child(
+                                format!(
+                                    "{} albums  ·  {} tracks",
+                                    genre.album_count, genre.track_count
+                                ),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("genre-play-{}", genre.key)))
+                            .w(px(30.0))
+                            .h(px(30.0))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(rgb(blend_rgb(genre.color, colors.text_strong, 0.18)))
+                            .text_color(rgb(colors.surface))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .child("▶")
+                            .on_click(cx.listener(
+                                move |this, _event: &ClickEvent, _window, cx| {
+                                    this.play_genre(&play_genre_key, false, cx);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                },
+                            )),
+                    ),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_genre_tab(genre_key.clone());
                 cx.notify();
             }))
             .into_any_element()
@@ -1401,6 +2088,263 @@ impl TempoApp {
                         .map(|album| self.render_album_card(album, BROWSE_GRID_CARD_W, cx)),
                 ),
             )
+            .into_any_element()
+    }
+
+    fn render_genre_artist_pills(&self, genre: &Genre) -> AnyElement {
+        let colors = *self.colors();
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgb(colors.text_faint))
+                    .child("ARTISTS"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .children(genre.artists.iter().take(16).map(|artist| {
+                        div()
+                            .rounded_full()
+                            .border_1()
+                            .border_color(rgb(colors.border))
+                            .bg(rgb(colors.button))
+                            .px_2()
+                            .py_1()
+                            .text_xs()
+                            .text_color(rgb(colors.text))
+                            .child(artist.clone())
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn render_genre_album_strip(&self, genre: &Genre, cx: &mut Context<Self>) -> AnyElement {
+        let colors = *self.colors();
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgb(colors.text_faint))
+                    .child("ALBUMS"),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "genre-album-strip-scroll-{}",
+                        genre.key
+                    )))
+                    .w_full()
+                    .overflow_x_scroll()
+                    .child(
+                        div().flex().gap_3().pb_2().children(
+                            genre
+                                .albums
+                                .iter()
+                                .take(12)
+                                .map(|album| self.render_genre_album_card(album, cx)),
+                        ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_genre_album_card(
+        &self,
+        album: &GenreAlbumSummary,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let album_id = album.album_id;
+        if let Some(album_id) = album_id
+            && album.artwork_path.is_none()
+        {
+            self.queue_album_cover_demand(album_id);
+        }
+
+        div()
+            .id(SharedString::from(format!(
+                "genre-album-card-{}-{}",
+                album.artist, album.title
+            )))
+            .w(px(BROWSE_GRID_CARD_W))
+            .flex_none()
+            .cursor_pointer()
+            .child(
+                div()
+                    .w(px(BROWSE_GRID_CARD_W))
+                    .h(px(BROWSE_GRID_CARD_W))
+                    .relative()
+                    .child(self.render_genre_album_fan_card(
+                        SharedString::from(format!("genre-album-card-image-{}", album.title)),
+                        album,
+                        BROWSE_GRID_CARD_W,
+                        0.0,
+                        0.0,
+                    )),
+            )
+            .child(
+                div()
+                    .pt_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(colors.text_strong))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(album.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(colors.text_muted))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(format!("{}  ·  {} tracks", album.artist, album.track_count)),
+                    ),
+            )
+            .when_some(album_id, |this, album_id| {
+                this.on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_album_tab(album_id);
+                    cx.notify();
+                }))
+            })
+            .into_any_element()
+    }
+
+    fn genre_action_button(&self, label: &'static str, primary: bool) -> gpui::Stateful<gpui::Div> {
+        let colors = *self.colors();
+        let bg = if primary {
+            colors.accent
+        } else {
+            colors.button
+        };
+        let fg = if primary { colors.surface } else { colors.text };
+
+        div()
+            .id(SharedString::from(format!("genre-action-{}", label)))
+            .h(px(30.0))
+            .px_3()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(colors.border_strong))
+            .bg(rgb(bg))
+            .text_color(rgb(fg))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .hover(move |this| {
+                this.bg(rgb(if primary {
+                    colors.accent_soft
+                } else {
+                    colors.button_hover
+                }))
+            })
+            .active(|this| this.opacity(0.82))
+            .child(label)
+    }
+
+    fn render_genre_album_fan(
+        &self,
+        id: SharedString,
+        albums: &[GenreAlbumSummary],
+        fallback_color: u32,
+        cover_size: f32,
+    ) -> AnyElement {
+        let fan_width = cover_size * 2.35;
+        let fan_height = cover_size * 1.35;
+        let cards = if albums.is_empty() {
+            vec![GenreAlbumSummary {
+                album_id: None,
+                title: "Genre".to_string(),
+                artist: String::new(),
+                artwork_path: None,
+                track_count: 0,
+                play_count: 0,
+                initials: "#".to_string(),
+                color: fallback_color,
+            }]
+        } else {
+            albums.iter().take(3).cloned().collect::<Vec<_>>()
+        };
+        let count = cards.len();
+
+        div()
+            .id(id)
+            .w(px(fan_width))
+            .h(px(fan_height))
+            .relative()
+            .children(cards.into_iter().enumerate().map(|(ix, album)| {
+                let (left, top) = match (count, ix) {
+                    (1, _) => (fan_width / 2.0 - cover_size / 2.0, fan_height * 0.1),
+                    (2, 0) => (fan_width * 0.22 - cover_size / 2.0, fan_height * 0.16),
+                    (2, _) => (fan_width * 0.62 - cover_size / 2.0, fan_height * 0.04),
+                    (_, 0) => (fan_width * 0.18 - cover_size / 2.0, fan_height * 0.2),
+                    (_, 1) => (fan_width * 0.42 - cover_size / 2.0, fan_height * 0.08),
+                    (_, _) => (fan_width * 0.68 - cover_size / 2.0, fan_height * 0.16),
+                };
+                self.render_genre_album_fan_card(
+                    SharedString::from(format!("genre-fan-card-{}-{}", album.title, ix)),
+                    &album,
+                    cover_size,
+                    left,
+                    top,
+                )
+            }))
+            .into_any_element()
+    }
+
+    fn render_genre_album_fan_card(
+        &self,
+        id: SharedString,
+        album: &GenreAlbumSummary,
+        size: f32,
+        left: f32,
+        top: f32,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let fallback_initials = album.initials.clone();
+
+        div()
+            .id(id)
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(size))
+            .h(px(size))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(colors.border_strong))
+            .overflow_hidden()
+            .shadow_lg()
+            .child(match &album.artwork_path {
+                Some(path) => img(path.clone())
+                    .size_full()
+                    .object_fit(ObjectFit::Cover)
+                    .with_fallback({
+                        let initials = fallback_initials.clone();
+                        let color = album.color;
+                        move || artwork::album_tile_fallback(initials.clone(), color, colors)
+                    })
+                    .into_any_element(),
+                None => artwork::album_tile_fallback(album.initials.clone(), album.color, colors),
+            })
             .into_any_element()
     }
 

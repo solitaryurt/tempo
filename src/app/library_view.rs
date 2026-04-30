@@ -16,6 +16,7 @@ impl TempoApp {
                 .into_any_element(),
             Page::Artists => self.render_artists_page(window, cx).into_any_element(),
             Page::Albums => self.render_albums_page(window, cx).into_any_element(),
+            Page::Genres => self.render_genres_page(window, cx).into_any_element(),
             Page::Liked => self.render_liked_page(cx).into_any_element(),
             Page::PlaybackHistory => self.render_playback_history_page(cx).into_any_element(),
             Page::ScanErrors => self.render_scan_errors_page(cx).into_any_element(),
@@ -38,47 +39,94 @@ impl TempoApp {
             .relative()
             .bg(rgb(colors.surface))
             .child(self.render_library_header(window, cx))
-            .when(self.tabs.len() > 1, |this| {
-                this.child(self.render_tab_bar(cx))
-            })
+            .child(self.render_tab_bar(cx))
             .when_some(self.render_detail_hero(cx), |this, hero| this.child(hero))
             .child(self.render_table(cx))
     }
 
     pub(super) fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        self.render_tab_bar_with_controls(None, cx)
+    }
+
+    pub(super) fn render_tab_bar_with_controls(
+        &self,
+        view_controls: Option<(&'static str, BrowseViewMode)>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let colors = *self.colors();
+        let scroll_handle = self.tab_bar_scroll_handle.clone();
+        // Read the current scroll state out of the handle so the
+        // arrow buttons can show the right enabled/disabled visual.
+        // First-frame values are zero (the handle isn't painted yet);
+        // that just means the buttons render disabled until layout
+        // produces real bounds, which is fine.
+        let max_scroll_x = f32::from(scroll_handle.max_offset().width).max(0.0);
+        let scroll_x = -f32::from(scroll_handle.offset().x);
+        let can_scroll = max_scroll_x > 0.5;
+        let at_left = scroll_x <= 0.5;
+        let at_right = scroll_x >= max_scroll_x - 0.5;
 
         div()
-            .h(px(34.0))
+            .h(px(30.0))
             .flex_none()
-            .px_3()
             .border_b_1()
             .border_color(rgb(colors.border))
             .bg(rgb(colors.app))
             .flex()
-            .items_end()
-            .gap_1()
-            .children(
-                self.tabs
-                    .iter()
-                    .enumerate()
-                    .map(|(ix, tab)| self.render_tab(ix, tab, cx)),
+            .items_center()
+            .child(
+                // Scrollable strip containing only the tab list. The
+                // new-tab `+` button is intentionally a sibling (not
+                // a child) of this wrapper so it stays visible even
+                // when the tab list overflows. `flex_initial()`
+                // (grow=0, shrink=1, basis=auto) sizes the wrapper to
+                // its natural content when there's room to spare, but
+                // lets the parent flex squeeze it down when the tab
+                // list is wider than the available space -- at which
+                // point `overflow_x_scroll` clips the contents and
+                // exposes the scroll handle's max_offset for the
+                // arrow buttons. `min_w_0` is required for the shrink
+                // path because flex children otherwise refuse to
+                // shrink below their content's intrinsic min-content
+                // width. `overflow_x_scroll` also gives us the
+                // built-in wheel handler: when only the X axis is
+                // scrollable, vertical wheel input is mapped to
+                // horizontal scrolling, which matches the user's
+                // expected behavior.
+                div()
+                    .id("tab-bar-scroll")
+                    .flex_initial()
+                    .min_w_0()
+                    .h_full()
+                    .overflow_x_scroll()
+                    .track_scroll(&scroll_handle)
+                    .flex()
+                    .items_center()
+                    .children(
+                        self.tabs
+                            .iter()
+                            .enumerate()
+                            .map(|(ix, tab)| self.render_tab(ix, tab, cx)),
+                    ),
             )
             .child(
                 div()
                     .id("new-tab-button")
-                    .mb(px(5.0))
                     .w(px(24.0))
-                    .h(px(22.0))
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(colors.waveform_border))
+                    .h_full()
+                    .flex_none()
+                    .border_r_1()
+                    .border_color(rgb(colors.border))
                     .bg(rgb(colors.button))
                     .text_color(rgb(colors.text_muted))
                     .cursor_pointer()
                     .flex()
                     .items_center()
                     .justify_center()
+                    .hover(move |this| {
+                        this.bg(rgb(colors.button_hover))
+                            .text_color(rgb(colors.text_strong))
+                    })
                     .child("+")
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.new_library_tab();
@@ -86,6 +134,106 @@ impl TempoApp {
                         cx.notify();
                     })),
             )
+            .when(can_scroll, |this| {
+                this.child(self.render_tab_bar_arrow("tab-bar-scroll-left", "‹", at_left, -1, cx))
+                    .child(self.render_tab_bar_arrow("tab-bar-scroll-right", "›", at_right, 1, cx))
+            })
+            .child(div().flex_1())
+            .when_some(view_controls, |this, (page, mode)| {
+                this.child(
+                    div()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .border_l_1()
+                        .border_color(rgb(colors.border))
+                        .child(
+                            self.with_tooltip(
+                                self.render_view_mode_button(
+                                    "Grid",
+                                    page,
+                                    mode == BrowseViewMode::Grid,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.set_browse_view_mode(page, BrowseViewMode::Grid);
+                                        cx.notify();
+                                    },
+                                )),
+                                SharedString::from(format!("{page}-grid-view-tooltip")),
+                                "Grid view",
+                                cx,
+                            ),
+                        )
+                        .child(
+                            self.with_tooltip(
+                                self.render_view_mode_button(
+                                    "Table",
+                                    page,
+                                    mode == BrowseViewMode::Table,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.set_browse_view_mode(page, BrowseViewMode::Table);
+                                        cx.notify();
+                                    },
+                                )),
+                                SharedString::from(format!("{page}-table-view-tooltip")),
+                                "Table view",
+                                cx,
+                            ),
+                        ),
+                )
+            })
+    }
+
+    /// Per-arrow renderer for the tab-bar scroll arrows. `direction`
+    /// is `-1` for "scroll left" and `1` for "scroll right". When the
+    /// strip is at the corresponding edge the button still renders so
+    /// the layout doesn't jump, but is dimmed and short-circuits the
+    /// click.
+    fn render_tab_bar_arrow(
+        &self,
+        id: &'static str,
+        glyph: &'static str,
+        disabled: bool,
+        direction: i32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+
+        div()
+            .id(SharedString::from(id))
+            .w(px(20.0))
+            .h_full()
+            .flex_none()
+            .border_l_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.button))
+            .text_color(rgb(if disabled {
+                colors.text_faint
+            } else {
+                colors.text_muted
+            }))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .opacity(if disabled { 0.4 } else { 1.0 })
+            .hover(move |this| {
+                if disabled {
+                    this
+                } else {
+                    this.bg(rgb(colors.button_hover))
+                        .text_color(rgb(colors.text_strong))
+                }
+            })
+            .child(glyph)
+            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                if this.scroll_tab_bar_by(direction as f32 * TAB_BAR_ARROW_STEP) {
+                    cx.notify();
+                }
+            }))
     }
 
     pub(super) fn render_tab(
@@ -114,12 +262,11 @@ impl TempoApp {
 
         div()
             .id(SharedString::from(format!("browse-tab-{ix}")))
-            .max_w(px(210.0))
-            .h(px(28.0))
-            .px_3()
-            .rounded_t_md()
-            .border_1()
-            .border_b_0()
+            .max_w(px(176.0))
+            .flex_none()
+            .h_full()
+            .px_2()
+            .border_r_1()
             .border_color(rgb(border))
             .bg(rgb(bg))
             .text_color(rgb(fg))
@@ -127,7 +274,14 @@ impl TempoApp {
             .flex()
             .items_center()
             .gap_2()
+            .when(!active, |this| {
+                this.hover(move |this| {
+                    this.bg(rgb(colors.button_hover))
+                        .text_color(rgb(colors.text_strong))
+                })
+            })
             .active(|this| this.opacity(0.82))
+            .child(self.tab_source_icon(&tab.source, active))
             .child(
                 div()
                     .min_w_0()
@@ -168,9 +322,12 @@ impl TempoApp {
                 )
             })
             .when_some(
-                match tab.source {
-                    TabSource::Playlist(playlist_ix) => Some(playlist_ix),
-                    TabSource::Library | TabSource::Artist(_) | TabSource::Album(_) => None,
+                match &tab.source {
+                    TabSource::Playlist(playlist_ix) => Some(*playlist_ix),
+                    TabSource::Library
+                    | TabSource::Artist(_)
+                    | TabSource::Album(_)
+                    | TabSource::Genre(_) => None,
                 },
                 |this, playlist_ix| {
                     this.on_drop(cx.listener(move |this, drag: &TrackDrag, _window, cx| {
@@ -183,6 +340,43 @@ impl TempoApp {
                 this.select_tab(ix);
                 cx.notify();
             }))
+    }
+
+    fn tab_source_icon(&self, source: &TabSource, active: bool) -> AnyElement {
+        let colors = *self.colors();
+        match source {
+            TabSource::Library => Self::sidebar_nav_icon(Page::Library, active, colors),
+            TabSource::Artist(_) => Self::sidebar_nav_icon(Page::Artists, active, colors),
+            TabSource::Album(_) => Self::sidebar_nav_icon(Page::Albums, active, colors),
+            TabSource::Genre(_) => Self::sidebar_nav_icon(Page::Genres, active, colors),
+            TabSource::Playlist(_) => Self::playlist_tab_icon(active, colors),
+        }
+    }
+
+    fn playlist_tab_icon(active: bool, colors: ThemeColors) -> AnyElement {
+        let color = if active {
+            colors.text_strong
+        } else {
+            colors.text_muted
+        };
+        let accent = if active { colors.accent } else { color };
+        let color = format!("#{:06x}", color);
+        let accent = format!("#{:06x}", accent);
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+<path d="M6.2 5.5H11L12.6 7.3H17.8C18.9 7.3 19.6 8 19.6 9.1V17.5C19.6 18.5 18.9 19.2 17.8 19.2H6.2C5.1 19.2 4.4 18.5 4.4 17.5V7.2C4.4 6.2 5.1 5.5 6.2 5.5Z" fill="none" stroke="{color}" stroke-width="1.6" stroke-linejoin="round"/>
+<path d="M8 11.4H16M8 14.2H14.2" fill="none" stroke="{accent}" stroke-width="1.5" stroke-linecap="round"/>
+</svg>"#
+        );
+
+        img(Arc::new(Image::from_bytes(
+            ImageFormat::Svg,
+            svg.into_bytes(),
+        )))
+        .w(px(15.0))
+        .h(px(15.0))
+        .flex_none()
+        .into_any_element()
     }
 
     pub(super) fn render_search_box(
@@ -609,6 +803,7 @@ impl TempoApp {
             .flex()
             .flex_col()
             .child(self.render_simple_page_header("Scan Errors", subtitle))
+            .child(self.render_tab_bar(cx))
             .child(
                 div()
                     .id("scan-errors-scroll")

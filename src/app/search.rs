@@ -7,7 +7,7 @@ impl TempoApp {
     }
 
     pub(super) fn active_source_track_count(&self) -> usize {
-        self.source_track_count(self.active_tab().source)
+        self.source_track_count(self.active_tab().source.clone())
     }
 
     pub(super) fn invalidate_track_indices(&mut self) {
@@ -40,13 +40,13 @@ impl TempoApp {
             return;
         };
 
-        let source = tab.source;
+        let source = tab.source.clone();
         let search_query = tab.search_query.clone();
         let sort_column = tab.sort_column;
         let sort_direction = tab.sort_direction;
 
         let indices =
-            self.compute_track_indices(source, &search_query, sort_column, sort_direction);
+            self.compute_track_indices(source.clone(), &search_query, sort_column, sort_direction);
         let scrollbar_markers = self.compute_scrollbar_markers(&indices, sort_column);
         if let Some(tab) = self.tabs.get_mut(tab_ix) {
             tab.track_indices = indices;
@@ -58,7 +58,7 @@ impl TempoApp {
             Duration::from_millis(4),
             format!(
                 "tab={tab_ix} source={} query_len={} sort={} dir={} results={} markers={}",
-                Self::tab_source_label(source),
+                Self::tab_source_label(&source),
                 search_query.len(),
                 Self::sort_column_label(sort_column),
                 Self::sort_direction_label(sort_direction),
@@ -81,14 +81,14 @@ impl TempoApp {
         let total_start = Instant::now();
         let terms = Self::search_terms(search_query);
         let source_start = Instant::now();
-        let source_indices = self.source_track_indices(source);
+        let source_indices = self.source_track_indices(source.clone());
         perf::log_duration_if_slow(
             "search.source_track_indices",
             source_start.elapsed(),
             Duration::from_millis(4),
             format!(
                 "source={} tracks={} candidates={}",
-                Self::tab_source_label(source),
+                Self::tab_source_label(&source),
                 self.tracks.len(),
                 source_indices.len()
             ),
@@ -108,7 +108,7 @@ impl TempoApp {
             Duration::from_millis(4),
             format!(
                 "source={} terms={} results={}",
-                Self::tab_source_label(source),
+                Self::tab_source_label(&source),
                 terms.len(),
                 indices.len()
             ),
@@ -124,7 +124,7 @@ impl TempoApp {
                 Duration::from_millis(4),
                 format!(
                     "source={} query_len={} sort={} results={}",
-                    Self::tab_source_label(source),
+                    Self::tab_source_label(&source),
                     search_query.len(),
                     Self::sort_column_label(sort_column),
                     indices.len()
@@ -203,7 +203,7 @@ impl TempoApp {
             Duration::from_millis(4),
             format!(
                 "source={} query_len={} sort={} results={}",
-                Self::tab_source_label(source),
+                Self::tab_source_label(&source),
                 search_query.len(),
                 Self::sort_column_label(sort_column),
                 indices.len()
@@ -213,12 +213,13 @@ impl TempoApp {
         indices
     }
 
-    fn tab_source_label(source: TabSource) -> &'static str {
+    fn tab_source_label(source: &TabSource) -> &'static str {
         match source {
             TabSource::Library => "library",
             TabSource::Playlist(_) => "playlist",
             TabSource::Artist(_) => "artist",
             TabSource::Album(_) => "album",
+            TabSource::Genre(_) => "genre",
         }
     }
 
@@ -380,6 +381,10 @@ impl TempoApp {
                 let labels = self.browse_marker_labels(target);
                 Self::group_marker_labels(&labels)
             }
+            BrowseScrollbarTarget::GenresGrid => {
+                let labels = self.browse_marker_labels(target);
+                Self::alphanumeric_rail_markers(&labels)
+            }
             BrowseScrollbarTarget::PlaybackHistory => {
                 // Playback history is sorted by recency; an alphabetical
                 // rail makes no sense there. Skip the marker rail entirely
@@ -509,24 +514,48 @@ impl TempoApp {
 
     fn browse_marker_labels(&self, target: BrowseScrollbarTarget) -> Vec<String> {
         match target {
-            BrowseScrollbarTarget::ArtistsGrid | BrowseScrollbarTarget::ArtistsTable => self
-                .artist_indices_for_search_query(&self.browse_search_query)
-                .into_iter()
-                .filter_map(|ix| {
-                    self.artists
-                        .get(ix)
-                        .map(|artist| Self::marker_initial(&artist.name))
-                })
-                .collect(),
-            BrowseScrollbarTarget::AlbumsGrid | BrowseScrollbarTarget::AlbumsTable => self
-                .album_indices_for_search_query(&self.browse_search_query)
-                .into_iter()
-                .filter_map(|ix| {
-                    self.albums
-                        .get(ix)
-                        .map(|album| Self::marker_initial(&album.artist))
-                })
-                .collect(),
+            BrowseScrollbarTarget::ArtistsGrid | BrowseScrollbarTarget::ArtistsTable => {
+                let mut indices = self.artist_indices_for_search_query(&self.browse_search_query);
+                if matches!(target, BrowseScrollbarTarget::ArtistsTable) {
+                    self.sort_artist_indices(&mut indices);
+                }
+                indices
+                    .into_iter()
+                    .filter_map(|ix| {
+                        self.artists
+                            .get(ix)
+                            .map(|artist| Self::marker_initial(&artist.name))
+                    })
+                    .collect()
+            }
+            BrowseScrollbarTarget::AlbumsGrid | BrowseScrollbarTarget::AlbumsTable => {
+                let mut indices = self.album_indices_for_search_query(&self.browse_search_query);
+                if matches!(target, BrowseScrollbarTarget::AlbumsTable) {
+                    self.sort_album_indices(&mut indices);
+                }
+                indices
+                    .into_iter()
+                    .filter_map(|ix| {
+                        self.albums
+                            .get(ix)
+                            .map(|album| Self::marker_initial(&album.artist))
+                    })
+                    .collect()
+            }
+            BrowseScrollbarTarget::GenresGrid => {
+                let mut indices = self.genre_indices_for_search_query(&self.browse_search_query);
+                if self.browse_view_mode() == BrowseViewMode::Table {
+                    self.sort_genre_indices(&mut indices);
+                }
+                indices
+                    .into_iter()
+                    .filter_map(|ix| {
+                        self.genres
+                            .get(ix)
+                            .map(|genre| Self::marker_initial(&genre.name))
+                    })
+                    .collect()
+            }
             BrowseScrollbarTarget::PlaybackHistory => self
                 .sorted_playback_history_indices()
                 .into_iter()
@@ -655,15 +684,27 @@ impl TempoApp {
                     })
                     .collect()
             }
+            TabSource::Genre(genre_key) => self
+                .tracks
+                .iter()
+                .enumerate()
+                .filter_map(|(ix, track)| {
+                    genre_names_for(&track.genre)
+                        .iter()
+                        .any(|genre| genre_key_for(genre) == genre_key)
+                        .then_some(ix)
+                })
+                .collect(),
         }
     }
 
     pub(super) fn source_track_count(&self, source: TabSource) -> usize {
         match source {
             TabSource::Library => self.tracks.len(),
-            TabSource::Playlist(_) | TabSource::Artist(_) | TabSource::Album(_) => {
-                self.source_track_indices(source).len()
-            }
+            TabSource::Playlist(_)
+            | TabSource::Artist(_)
+            | TabSource::Album(_)
+            | TabSource::Genre(_) => self.source_track_indices(source).len(),
         }
     }
 
@@ -721,13 +762,14 @@ impl TempoApp {
 
     fn should_live_filter_active_tab(&self) -> bool {
         self.page == Page::Library
-            && (self.active_tab().source == TabSource::Library
+            && (matches!(&self.active_tab().source, TabSource::Library)
                 || !self.active_search_query().trim().is_empty())
     }
 
     fn schedule_current_search_input(&mut self, cx: &mut Context<Self>) {
         let query = self.search_input.text().to_string();
-        if self.should_live_filter_active_tab() || matches!(self.page, Page::Artists | Page::Albums)
+        if self.should_live_filter_active_tab()
+            || matches!(self.page, Page::Artists | Page::Albums | Page::Genres)
         {
             self.schedule_search_apply(query, cx);
         }
@@ -754,7 +796,7 @@ impl TempoApp {
                             cx.notify();
                         }
                     }
-                    Page::Artists | Page::Albums => {
+                    Page::Artists | Page::Albums | Page::Genres => {
                         if app.browse_search_query != query {
                             app.browse_search_query = query;
                             cx.notify();
@@ -783,14 +825,14 @@ impl TempoApp {
             if self
                 .tabs
                 .get(previous_tab)
-                .is_some_and(|tab| tab.source == TabSource::Library)
+                .is_some_and(|tab| matches!(&tab.source, TabSource::Library))
             {
                 if let Some(tab) = self.tabs.get_mut(previous_tab) {
                     tab.search_query.clear();
                 }
                 self.rebuild_track_indices_for_tab(previous_tab);
             }
-        } else if force_current_tab || self.active_tab().source == TabSource::Library {
+        } else if force_current_tab || matches!(&self.active_tab().source, TabSource::Library) {
             self.open_page(Page::Library);
             self.set_search_query(query);
         } else {
@@ -999,6 +1041,27 @@ impl TempoApp {
         indices
     }
 
+    pub(super) fn genre_indices_for_search_query(&self, query: &str) -> Vec<usize> {
+        let cache_key = (query.to_string(), self.genres_generation);
+        {
+            let cache = self.genre_filter_cache.borrow();
+            if cache.key.as_ref() == Some(&cache_key) {
+                return cache.indices.clone();
+            }
+        }
+        let terms = Self::search_terms(query);
+        let indices: Vec<usize> = self
+            .genres
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, genre)| Self::genre_matches_search_terms(genre, &terms).then_some(ix))
+            .collect();
+        let mut cache = self.genre_filter_cache.borrow_mut();
+        cache.key = Some(cache_key);
+        cache.indices = indices.clone();
+        indices
+    }
+
     pub(super) fn artist_matches_search_terms(artist: &Artist, terms: &[String]) -> bool {
         if terms.is_empty() {
             return true;
@@ -1020,5 +1083,15 @@ impl TempoApp {
         terms
             .iter()
             .all(|term| album.searchable_lower.contains(term))
+    }
+
+    pub(super) fn genre_matches_search_terms(genre: &Genre, terms: &[String]) -> bool {
+        if terms.is_empty() {
+            return true;
+        }
+
+        terms
+            .iter()
+            .all(|term| genre.searchable_lower.contains(term))
     }
 }

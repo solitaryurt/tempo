@@ -63,8 +63,8 @@ pub(in crate::app) use menu::{
 use crate::{
     CloseAllTabs, CloseTab, FocusSearch, MoveSelectionDown, MoveSelectionUp, NavigateBack,
     NavigateForward, NewTab, NextTab, OpenSettings, PlayRandomTrack, PlaySelected, PreviousTab,
-    SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8,
-    SelectTab9, SelectTab10, TogglePause,
+    ReopenClosedTab, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
+    SelectTab7, SelectTab8, SelectTab9, SelectTab10, TogglePause,
 };
 use text_input::TextInputState;
 use theme::{Theme, ThemeColors, bundled_themes, default_theme_id, resolve_theme_id};
@@ -74,6 +74,7 @@ enum Page {
     Library,
     Artists,
     Albums,
+    Genres,
     Liked,
     PlaybackHistory,
     ScanErrors,
@@ -215,6 +216,7 @@ struct ArtistTableColumnWidths {
     artist: f32,
     albums: f32,
     tracks: f32,
+    duration: f32,
 }
 
 impl Default for ArtistTableColumnWidths {
@@ -224,6 +226,7 @@ impl Default for ArtistTableColumnWidths {
             artist: 360.0,
             albums: 92.0,
             tracks: 92.0,
+            duration: 92.0,
         }
     }
 }
@@ -235,6 +238,7 @@ struct AlbumTableColumnWidths {
     artist: f32,
     year: f32,
     tracks: f32,
+    duration: f32,
 }
 
 impl Default for AlbumTableColumnWidths {
@@ -245,6 +249,28 @@ impl Default for AlbumTableColumnWidths {
             artist: 220.0,
             year: 90.0,
             tracks: 92.0,
+            duration: 92.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GenreTableColumnWidths {
+    genre: f32,
+    artists: f32,
+    albums: f32,
+    tracks: f32,
+    duration: f32,
+}
+
+impl Default for GenreTableColumnWidths {
+    fn default() -> Self {
+        Self {
+            genre: 260.0,
+            artists: 260.0,
+            albums: 92.0,
+            tracks: 92.0,
+            duration: 92.0,
         }
     }
 }
@@ -266,21 +292,32 @@ impl Default for ScanErrorColumnWidths {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum ArtistTableColumn {
     Artwork,
     Artist,
     Albums,
     Tracks,
+    Duration,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum AlbumTableColumn {
     Artwork,
     Album,
     Artist,
     Year,
     Tracks,
+    Duration,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum GenreTableColumn {
+    Genre,
+    Artists,
+    Albums,
+    Tracks,
+    Duration,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -295,8 +332,24 @@ enum ColumnResizeTarget {
     Track(TableColumn),
     Artist(ArtistTableColumn),
     Album(AlbumTableColumn),
+    Genre(GenreTableColumn),
     ScanError(ScanErrorColumn),
     PlaybackHistoryPlayedAt,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColumnMenuKind {
+    Tracks,
+    Artists,
+    Albums,
+    Genres,
+}
+
+#[derive(Clone)]
+struct BrowseColumnDrag {
+    target: ColumnResizeTarget,
+    label: SharedString,
+    position: Point<Pixels>,
 }
 
 #[derive(Clone, Copy)]
@@ -370,6 +423,33 @@ struct Album {
     searchable_lower: String,
 }
 
+#[derive(Clone)]
+struct GenreAlbumSummary {
+    album_id: Option<i64>,
+    title: String,
+    artist: String,
+    artwork_path: Option<PathBuf>,
+    track_count: usize,
+    play_count: u32,
+    initials: String,
+    color: u32,
+}
+
+#[derive(Clone)]
+struct Genre {
+    key: String,
+    name: String,
+    artist_count: usize,
+    album_count: usize,
+    track_count: usize,
+    duration_value: Duration,
+    artists: Vec<String>,
+    albums: Vec<GenreAlbumSummary>,
+    top_albums: Vec<GenreAlbumSummary>,
+    color: u32,
+    searchable_lower: String,
+}
+
 #[derive(Default)]
 struct MetadataDemandQueue {
     artists: HashSet<i64>,
@@ -431,6 +511,44 @@ impl ColumnDrag {
     fn position(mut self, position: Point<Pixels>) -> Self {
         self.position = position;
         self
+    }
+}
+
+impl BrowseColumnDrag {
+    fn new(target: ColumnResizeTarget, label: &'static str) -> Self {
+        Self {
+            target,
+            label: label.into(),
+            position: Point::default(),
+        }
+    }
+
+    fn position(mut self, position: Point<Pixels>) -> Self {
+        self.position = position;
+        self
+    }
+}
+
+impl Render for BrowseColumnDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .pl(self.position.x - px(14.0))
+            .pt(self.position.y - px(14.0))
+            .child(
+                div()
+                    .h(px(28.0))
+                    .px_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(0x4b4f5a))
+                    .bg(rgb(0x202229))
+                    .shadow_lg()
+                    .flex()
+                    .items_center()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgb(0xf0f0f4))
+                    .child(self.label.clone()),
+            )
     }
 }
 
@@ -542,13 +660,29 @@ struct PlaybackHistoryEntry {
     duration: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum TabSource {
     Library,
     Playlist(usize),
     Artist(i64),
     Album(i64),
+    Genre(String),
 }
+
+/// Lightweight snapshot of a closed tab's identity used by the
+/// reopen-closed-tab stack (Ctrl+Shift+T). We deliberately drop
+/// per-session ephemera (sort, scroll position, selection) and only
+/// preserve enough state to recreate the tab via the existing
+/// `open_*_tab` helpers. The `search_query` is preserved so a closed
+/// search Library tab reopens with the same query string.
+#[derive(Clone)]
+struct ClosedTab {
+    source: TabSource,
+    search_query: String,
+}
+
+/// Maximum number of recently-closed tabs the reopen stack remembers.
+const CLOSED_TABS_MAX: usize = 25;
 
 #[derive(Clone, PartialEq, Eq)]
 struct NavigationEntry {
@@ -602,6 +736,7 @@ enum BrowseScrollbarTarget {
     ArtistsTable,
     AlbumsGrid,
     AlbumsTable,
+    GenresGrid,
     PlaybackHistory,
     Liked,
 }
@@ -700,6 +835,23 @@ impl BrowseTab {
             scrollbar_markers: Vec::new(),
         }
     }
+
+    fn genre(id: u64, genre_key: String) -> Self {
+        Self {
+            id,
+            source: TabSource::Genre(genre_key),
+            search_query: String::new(),
+            sort_column: SortColumn::Album,
+            sort_direction: SortDirection::Ascending,
+            selected_track: 0,
+            table_scroll_top: 0.0,
+            restore_table_scroll_top: None,
+            table_horizontal_scroll: 0.0,
+            table_scroll_handle: UniformListScrollHandle::new(),
+            track_indices: Vec::new(),
+            scrollbar_markers: Vec::new(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -716,6 +868,12 @@ struct AppState {
     volume: f32,
     #[serde(default = "default_visible_table_columns")]
     visible_table_columns: Vec<TableColumn>,
+    #[serde(default = "default_visible_artist_table_columns")]
+    visible_artist_table_columns: Vec<ArtistTableColumn>,
+    #[serde(default = "default_visible_album_table_columns")]
+    visible_album_table_columns: Vec<AlbumTableColumn>,
+    #[serde(default = "default_visible_genre_table_columns")]
+    visible_genre_table_columns: Vec<GenreTableColumn>,
     #[serde(default = "default_page")]
     page: Page,
     #[serde(default)]
@@ -726,6 +884,22 @@ struct AppState {
     artist_view_mode: BrowseViewMode,
     #[serde(default = "default_browse_view_mode")]
     album_view_mode: BrowseViewMode,
+    #[serde(default = "default_browse_view_mode")]
+    genre_view_mode: BrowseViewMode,
+    #[serde(default = "default_artist_table_sort_column")]
+    artist_table_sort_column: ArtistTableColumn,
+    #[serde(default = "default_sort_direction")]
+    artist_table_sort_direction: SortDirection,
+    #[serde(default = "default_album_table_sort_column")]
+    album_table_sort_column: AlbumTableColumn,
+    #[serde(default = "default_sort_direction")]
+    album_table_sort_direction: SortDirection,
+    #[serde(default = "default_genre_table_sort_column")]
+    genre_table_sort_column: GenreTableColumn,
+    #[serde(default = "default_sort_direction")]
+    genre_table_sort_direction: SortDirection,
+    #[serde(default)]
+    genre_grid_scroll_top: f32,
     #[serde(default)]
     artist_grid_scroll_top: f32,
     #[serde(default)]
@@ -781,11 +955,22 @@ impl Default for AppState {
             output_device: None,
             volume: default_volume(),
             visible_table_columns: default_visible_table_columns(),
+            visible_artist_table_columns: default_visible_artist_table_columns(),
+            visible_album_table_columns: default_visible_album_table_columns(),
+            visible_genre_table_columns: default_visible_genre_table_columns(),
             page: default_page(),
             tabs: Vec::new(),
             active_tab_id: None,
             artist_view_mode: default_browse_view_mode(),
             album_view_mode: default_browse_view_mode(),
+            genre_view_mode: default_browse_view_mode(),
+            artist_table_sort_column: default_artist_table_sort_column(),
+            artist_table_sort_direction: default_sort_direction(),
+            album_table_sort_column: default_album_table_sort_column(),
+            album_table_sort_direction: default_sort_direction(),
+            genre_table_sort_column: default_genre_table_sort_column(),
+            genre_table_sort_direction: default_sort_direction(),
+            genre_grid_scroll_top: 0.0,
             artist_grid_scroll_top: 0.0,
             artist_table_scroll_top: 0.0,
             album_grid_scroll_top: 0.0,
@@ -843,6 +1028,74 @@ fn default_visible_table_columns() -> Vec<TableColumn> {
     ]
 }
 
+fn default_visible_artist_table_columns() -> Vec<ArtistTableColumn> {
+    vec![
+        ArtistTableColumn::Artwork,
+        ArtistTableColumn::Artist,
+        ArtistTableColumn::Albums,
+        ArtistTableColumn::Tracks,
+        ArtistTableColumn::Duration,
+    ]
+}
+
+fn default_visible_album_table_columns() -> Vec<AlbumTableColumn> {
+    vec![
+        AlbumTableColumn::Artwork,
+        AlbumTableColumn::Album,
+        AlbumTableColumn::Artist,
+        AlbumTableColumn::Year,
+        AlbumTableColumn::Tracks,
+        AlbumTableColumn::Duration,
+    ]
+}
+
+fn default_visible_genre_table_columns() -> Vec<GenreTableColumn> {
+    vec![
+        GenreTableColumn::Genre,
+        GenreTableColumn::Artists,
+        GenreTableColumn::Albums,
+        GenreTableColumn::Tracks,
+        GenreTableColumn::Duration,
+    ]
+}
+
+fn default_artist_table_sort_column() -> ArtistTableColumn {
+    ArtistTableColumn::Artist
+}
+
+fn default_album_table_sort_column() -> AlbumTableColumn {
+    AlbumTableColumn::Artist
+}
+
+fn default_genre_table_sort_column() -> GenreTableColumn {
+    GenreTableColumn::Genre
+}
+
+const ALL_ARTIST_TABLE_COLUMNS: &[ArtistTableColumn] = &[
+    ArtistTableColumn::Artwork,
+    ArtistTableColumn::Artist,
+    ArtistTableColumn::Albums,
+    ArtistTableColumn::Tracks,
+    ArtistTableColumn::Duration,
+];
+
+const ALL_ALBUM_TABLE_COLUMNS: &[AlbumTableColumn] = &[
+    AlbumTableColumn::Artwork,
+    AlbumTableColumn::Album,
+    AlbumTableColumn::Artist,
+    AlbumTableColumn::Year,
+    AlbumTableColumn::Tracks,
+    AlbumTableColumn::Duration,
+];
+
+const ALL_GENRE_TABLE_COLUMNS: &[GenreTableColumn] = &[
+    GenreTableColumn::Genre,
+    GenreTableColumn::Artists,
+    GenreTableColumn::Albums,
+    GenreTableColumn::Tracks,
+    GenreTableColumn::Duration,
+];
+
 /// Memoized output of `artist_indices_for_search_query` /
 /// `album_indices_for_search_query`. The cache stores both the filtered
 /// index list and a "generation" stamp so the consumer can also derive
@@ -872,6 +1125,51 @@ fn build_track_path_index(tracks: &[Track]) -> HashMap<PathBuf, usize> {
         .enumerate()
         .map(|(ix, track)| (track.path.clone(), ix))
         .collect()
+}
+
+fn genre_names_for(raw: &str) -> Vec<String> {
+    raw.split([';', '/', ',', '|', '+'])
+        .map(str::trim)
+        .filter(|genre| !genre.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn genre_key_for(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
+fn genre_searchable_lower(
+    name: &str,
+    artists: &[String],
+    albums: &[GenreAlbumSummary],
+    artist_count: usize,
+    album_count: usize,
+    track_count: usize,
+) -> String {
+    let mut value = format!("{name} {artist_count} {album_count} {track_count}");
+    for artist in artists {
+        value.push(' ');
+        value.push_str(artist);
+    }
+    for album in albums {
+        value.push(' ');
+        value.push_str(&album.title);
+        value.push(' ');
+        value.push_str(&album.artist);
+    }
+    value.to_lowercase()
+}
+
+fn blend_rgb(left: u32, right: u32, right_weight: f32) -> u32 {
+    let right_weight = right_weight.clamp(0.0, 1.0);
+    let left_weight = 1.0 - right_weight;
+    let channel = |shift| {
+        let left = ((left >> shift) & 0xff_u32) as f32;
+        let right = ((right >> shift) & 0xff_u32) as f32;
+        (left * left_weight + right * right_weight).round() as u32
+    };
+    (channel(16) << 16) | (channel(8) << 8) | channel(0)
 }
 
 fn old_default_visible_table_columns() -> Vec<TableColumn> {
@@ -967,8 +1265,16 @@ const SEARCH_DEBOUNCE_DELAY: Duration = Duration::from_millis(90);
 const SCAN_BROWSE_RELOAD_INTERVAL: Duration = Duration::from_millis(750);
 const FAST_SCROLL_OVERSCAN_ROWS: usize = 4;
 const BROWSE_GRID_CARD_W: f32 = 154.0;
+const GENRE_GRID_CARD_W: f32 = 330.0;
 const BROWSE_GRID_GAP: f32 = 16.0;
 const BROWSE_GRID_PAD_X: f32 = 32.0;
+
+/// Pixels the tab-bar arrow buttons (`‹` / `›`) move the strip per
+/// click. Sized so a click reveals roughly one full tab worth of
+/// content (max tab width is 176px), which feels right for keyboard-
+/// less navigation. Wheel scrolling uses the gpui-builtin per-line
+/// stepping instead.
+const TAB_BAR_ARROW_STEP: f32 = 160.0;
 
 pub(crate) struct TempoApp {
     focus_handle: FocusHandle,
@@ -982,11 +1288,16 @@ pub(crate) struct TempoApp {
     column_widths: ColumnWidths,
     artist_table_column_widths: ArtistTableColumnWidths,
     album_table_column_widths: AlbumTableColumnWidths,
+    genre_table_column_widths: GenreTableColumnWidths,
     scan_error_column_widths: ScanErrorColumnWidths,
     playback_history_played_at_width: f32,
     column_resize: Option<ColumnResize>,
     visible_columns: Vec<TableColumn>,
+    visible_artist_columns: Vec<ArtistTableColumn>,
+    visible_album_columns: Vec<AlbumTableColumn>,
+    visible_genre_columns: Vec<GenreTableColumn>,
     column_menu_open: bool,
+    column_menu_kind: ColumnMenuKind,
     column_menu_x: f32,
     column_menu_y: f32,
     tabs: Vec<BrowseTab>,
@@ -994,6 +1305,23 @@ pub(crate) struct TempoApp {
     next_tab_id: u64,
     back_history: Vec<NavigationEntry>,
     forward_history: Vec<NavigationEntry>,
+    /// LIFO stack of recently-closed tabs (most-recent at the back).
+    /// Capped at `CLOSED_TABS_MAX`; oldest entries are evicted from the
+    /// front when the cap is exceeded. Used by the Ctrl+Shift+T
+    /// reopen-closed-tab action. The first/anchor "All Music" tab
+    /// cannot be closed and therefore never lands here.
+    closed_tabs: Vec<ClosedTab>,
+    /// Horizontal scroll handle for the tab bar. Lets the tab strip
+    /// overflow when too many tabs are open: `track_scroll` registers
+    /// the inner row, which gives us viewport bounds, max scroll, and
+    /// `scroll_to_item` for auto-scrolling the active tab into view
+    /// after Ctrl+Tab / sidebar / drag-open / reopen actions.
+    tab_bar_scroll_handle: gpui::ScrollHandle,
+    /// Index of the active tab the last time we requested an
+    /// auto-scroll into view. Used so we only call `scroll_to_item`
+    /// when the active tab actually changes (not on every render),
+    /// preserving the user's manual horizontal-scroll position.
+    last_scrolled_active_tab: usize,
     hovered_tooltip_id: Option<SharedString>,
     tooltip: Option<Tooltip>,
     tooltip_generation: u64,
@@ -1044,6 +1372,7 @@ pub(crate) struct TempoApp {
     library_size_bytes: u64,
     artists: Vec<Artist>,
     albums: Vec<Album>,
+    genres: Vec<Genre>,
     /// Bumped whenever `self.artists` is reassigned. Used as a cache
     /// generation token by `artist_filter_cache` so a new artist load
     /// invalidates any memoized filter result without us needing to
@@ -1051,6 +1380,17 @@ pub(crate) struct TempoApp {
     artists_generation: u64,
     /// Bumped whenever `self.albums` is reassigned.
     albums_generation: u64,
+    /// Aggregate total play duration per `Artist::artist_id`. Rebuilt
+    /// from `self.tracks` whenever the track list changes; consumed
+    /// by the Artists table Duration column and its sort comparator.
+    /// Mirrors the genre duration aggregation since `CatalogArtist`
+    /// does not carry a duration field.
+    artist_durations: HashMap<i64, Duration>,
+    /// Aggregate total play duration per `Album::album_id`. See
+    /// [`Self::artist_durations`] for the rationale.
+    album_durations: HashMap<i64, Duration>,
+    /// Bumped whenever derived genre aggregates are rebuilt.
+    genres_generation: u64,
     /// Memoized filter results for the Browse pages. Key is the
     /// `browse_search_query` at the time of computation; if the query
     /// hasn't changed and `artists` hasn't been mutated, the cached
@@ -1059,8 +1399,16 @@ pub(crate) struct TempoApp {
     /// floating drag label).
     artist_filter_cache: RefCell<BrowseFilterCache>,
     album_filter_cache: RefCell<BrowseFilterCache>,
+    genre_filter_cache: RefCell<BrowseFilterCache>,
     artist_view_mode: BrowseViewMode,
     album_view_mode: BrowseViewMode,
+    genre_view_mode: BrowseViewMode,
+    artist_table_sort_column: ArtistTableColumn,
+    artist_table_sort_direction: SortDirection,
+    album_table_sort_column: AlbumTableColumn,
+    album_table_sort_direction: SortDirection,
+    genre_table_sort_column: GenreTableColumn,
+    genre_table_sort_direction: SortDirection,
     queue: Vec<usize>,
     library_roots: Vec<PathBuf>,
     playlists: Vec<Playlist>,
@@ -1083,6 +1431,7 @@ pub(crate) struct TempoApp {
     artist_table_scroll_handle: UniformListScrollHandle,
     album_grid_scroll_handle: UniformListScrollHandle,
     album_table_scroll_handle: UniformListScrollHandle,
+    genre_grid_scroll_handle: UniformListScrollHandle,
     scan_errors_scroll_handle: UniformListScrollHandle,
     playback_history_scroll_handle: UniformListScrollHandle,
     liked_scroll_handle: UniformListScrollHandle,
@@ -1173,6 +1522,15 @@ impl TempoApp {
             "startup.cached_albums.count",
             format!("albums={}", cached_albums.len()),
         );
+        let cached_genres = perf::time(
+            "startup.cached_genres.build",
+            format!(
+                "tracks={} albums={}",
+                cached_tracks.len(),
+                cached_albums.len()
+            ),
+            || Self::build_genres(&cached_tracks, &cached_albums),
+        );
         let (event_tx, event_rx) = mpsc::channel();
         let (metadata_event_tx, metadata_event_rx) = mpsc::channel();
         let metadata_demand_queue = Arc::new(Mutex::new(MetadataDemandQueue::default()));
@@ -1187,6 +1545,12 @@ impl TempoApp {
         let playlists = state.playlists;
         let volume = state.volume.clamp(0.0, 1.0);
         let mut visible_columns = Self::sanitize_visible_columns(state.visible_table_columns);
+        let visible_artist_columns =
+            Self::sanitize_artist_table_columns(state.visible_artist_table_columns);
+        let visible_album_columns =
+            Self::sanitize_album_table_columns(state.visible_album_table_columns);
+        let visible_genre_columns =
+            Self::sanitize_genre_table_columns(state.visible_genre_table_columns);
         // One-shot migration: relocate the formerly inert `Liked`
         // column from the trailing position into the new default slot
         // right after `#`. Gated on a saved-state flag so subsequent
@@ -1287,6 +1651,7 @@ impl TempoApp {
         let artist_table_scroll_top = state.artist_table_scroll_top;
         let album_grid_scroll_top = state.album_grid_scroll_top;
         let album_table_scroll_top = state.album_table_scroll_top;
+        let genre_grid_scroll_top = state.genre_grid_scroll_top;
         let save_on_quit = cx.on_app_quit(|app, cx| {
             // Refresh denormalized snapshots one last time so the
             // shutdown save reflects any in-flight player state.
@@ -1317,11 +1682,16 @@ impl TempoApp {
             column_widths: ColumnWidths::default(),
             artist_table_column_widths: ArtistTableColumnWidths::default(),
             album_table_column_widths: AlbumTableColumnWidths::default(),
+            genre_table_column_widths: GenreTableColumnWidths::default(),
             scan_error_column_widths: ScanErrorColumnWidths::default(),
             playback_history_played_at_width: 178.0,
             column_resize: None,
             visible_columns,
+            visible_artist_columns,
+            visible_album_columns,
+            visible_genre_columns,
             column_menu_open: false,
+            column_menu_kind: ColumnMenuKind::Tracks,
             column_menu_x: 0.0,
             column_menu_y: 0.0,
             tabs,
@@ -1329,6 +1699,9 @@ impl TempoApp {
             next_tab_id,
             back_history: Vec::new(),
             forward_history: Vec::new(),
+            closed_tabs: Vec::new(),
+            tab_bar_scroll_handle: gpui::ScrollHandle::new(),
+            last_scrolled_active_tab: active_tab,
             hovered_tooltip_id: None,
             tooltip: None,
             tooltip_generation: 0,
@@ -1345,12 +1718,24 @@ impl TempoApp {
             tracks: cached_tracks,
             artists: cached_artists,
             albums: cached_albums,
+            genres: cached_genres,
             artists_generation: 0,
             albums_generation: 0,
+            artist_durations: HashMap::new(),
+            album_durations: HashMap::new(),
+            genres_generation: 0,
             artist_filter_cache: RefCell::new(BrowseFilterCache::default()),
             album_filter_cache: RefCell::new(BrowseFilterCache::default()),
+            genre_filter_cache: RefCell::new(BrowseFilterCache::default()),
             artist_view_mode: state.artist_view_mode,
             album_view_mode: state.album_view_mode,
+            genre_view_mode: state.genre_view_mode,
+            artist_table_sort_column: state.artist_table_sort_column,
+            artist_table_sort_direction: state.artist_table_sort_direction,
+            album_table_sort_column: state.album_table_sort_column,
+            album_table_sort_direction: state.album_table_sort_direction,
+            genre_table_sort_column: state.genre_table_sort_column,
+            genre_table_sort_direction: state.genre_table_sort_direction,
             queue: Vec::new(),
             library_roots: roots,
             playlists,
@@ -1372,6 +1757,7 @@ impl TempoApp {
             artist_table_scroll_handle: UniformListScrollHandle::new(),
             album_grid_scroll_handle: UniformListScrollHandle::new(),
             album_table_scroll_handle: UniformListScrollHandle::new(),
+            genre_grid_scroll_handle: UniformListScrollHandle::new(),
             scan_errors_scroll_handle: UniformListScrollHandle::new(),
             playback_history_scroll_handle: UniformListScrollHandle::new(),
             liked_scroll_handle: UniformListScrollHandle::new(),
@@ -1411,7 +1797,17 @@ impl TempoApp {
             .borrow()
             .base_handle
             .set_offset(point(px(0.0), px(-album_table_scroll_top.max(0.0))));
+        app.genre_grid_scroll_handle
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.0), px(-genre_grid_scroll_top.max(0.0))));
 
+        perf::time(
+            "startup.initial_artist_album_durations",
+            format!("tracks={}", app.tracks.len()),
+            || app.rebuild_artist_album_durations(),
+        );
         perf::time(
             "startup.initial_index_rebuild",
             format!("tracks={} tabs={}", app.tracks.len(), app.tabs.len()),
@@ -1518,6 +1914,227 @@ impl TempoApp {
                 }
             })
             .ok();
+    }
+
+    fn rebuild_genres(&mut self) {
+        self.genres = Self::build_genres(&self.tracks, &self.albums);
+        self.genres_generation = self.genres_generation.wrapping_add(1);
+        self.genre_filter_cache.borrow_mut().invalidate();
+        self.rebuild_artist_album_durations();
+    }
+
+    /// Recompute `artist_durations` and `album_durations` from the
+    /// current `self.tracks`. Called from the same hot-paths that
+    /// trigger `rebuild_genres` so the artist/album Duration columns
+    /// stay in sync with the rest of the derived browse data.
+    fn rebuild_artist_album_durations(&mut self) {
+        let mut artist_durations: HashMap<i64, Duration> = HashMap::new();
+        let mut album_durations: HashMap<i64, Duration> = HashMap::new();
+        for track in &self.tracks {
+            if let Some(artist_id) = track.artist_id {
+                *artist_durations
+                    .entry(artist_id)
+                    .or_insert_with(|| Duration::from_secs(0)) += track.duration_value;
+            }
+            if let Some(album_id) = track.album_id {
+                *album_durations
+                    .entry(album_id)
+                    .or_insert_with(|| Duration::from_secs(0)) += track.duration_value;
+            }
+        }
+        self.artist_durations = artist_durations;
+        self.album_durations = album_durations;
+    }
+
+    pub(super) fn artist_total_duration(&self, artist_id: i64) -> Duration {
+        self.artist_durations
+            .get(&artist_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn album_total_duration(&self, album_id: i64) -> Duration {
+        self.album_durations
+            .get(&album_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn build_genres(tracks: &[Track], albums: &[Album]) -> Vec<Genre> {
+        struct AlbumAggregate {
+            album_id: Option<i64>,
+            title: String,
+            artist: String,
+            artwork_path: Option<PathBuf>,
+            track_count: usize,
+            play_count: u32,
+            initials: String,
+            color: u32,
+        }
+
+        struct GenreAggregate {
+            key: String,
+            name: String,
+            artist_names: HashSet<String>,
+            album_keys: HashSet<String>,
+            albums: HashMap<String, AlbumAggregate>,
+            track_count: usize,
+            duration_value: Duration,
+        }
+
+        let album_by_id = albums
+            .iter()
+            .map(|album| (album.album_id, album))
+            .collect::<HashMap<_, _>>();
+        let album_by_name = albums
+            .iter()
+            .map(|album| {
+                (
+                    format!(
+                        "{}:{}",
+                        genre_key_for(&album.artist),
+                        genre_key_for(&album.title)
+                    ),
+                    album,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let mut genres = HashMap::<String, GenreAggregate>::new();
+        for track in tracks {
+            for genre_name in genre_names_for(&track.genre) {
+                let genre_key = genre_key_for(&genre_name);
+                if genre_key.is_empty() {
+                    continue;
+                }
+
+                let aggregate = genres
+                    .entry(genre_key.clone())
+                    .or_insert_with(|| GenreAggregate {
+                        key: genre_key.clone(),
+                        name: genre_name.clone(),
+                        artist_names: HashSet::new(),
+                        album_keys: HashSet::new(),
+                        albums: HashMap::new(),
+                        track_count: 0,
+                        duration_value: Duration::from_secs(0),
+                    });
+
+                aggregate.track_count += 1;
+                aggregate.duration_value += track.duration_value;
+                for artist in individual_artist_names(&track.artist) {
+                    aggregate.artist_names.insert(artist);
+                }
+
+                let primary_artist = primary_artist_name(&track.artist);
+                let album_name_key = format!(
+                    "{}:{}",
+                    genre_key_for(&primary_artist),
+                    genre_key_for(&track.album)
+                );
+                let album = track
+                    .album_id
+                    .and_then(|album_id| album_by_id.get(&album_id).copied())
+                    .or_else(|| album_by_name.get(&album_name_key).copied());
+                let album_key = track
+                    .album_id
+                    .map(|album_id| format!("id:{album_id}"))
+                    .unwrap_or_else(|| album_name_key.clone());
+                aggregate.album_keys.insert(album_key.clone());
+
+                let album_entry = aggregate.albums.entry(album_key).or_insert_with(|| {
+                    let artwork_path =
+                        album
+                            .and_then(|album| album.artwork_path.clone())
+                            .or_else(|| match &track.artwork {
+                                Some(TrackArtwork::File(path)) => Some(path.clone()),
+                                Some(TrackArtwork::Embedded(_)) | None => None,
+                            });
+                    let title = album
+                        .map(|album| album.title.clone())
+                        .unwrap_or_else(|| track.album.to_string());
+                    let artist = album
+                        .map(|album| album.artist.clone())
+                        .unwrap_or_else(|| primary_artist.clone());
+                    AlbumAggregate {
+                        album_id: track.album_id,
+                        initials: album
+                            .map(|album| album.initials.clone())
+                            .unwrap_or_else(|| artwork::album_initials_for(&title, &track.title)),
+                        color: album
+                            .map(|album| album.color)
+                            .unwrap_or_else(|| artwork::album_color_for(&title, &artist)),
+                        title,
+                        artist,
+                        artwork_path,
+                        track_count: 0,
+                        play_count: 0,
+                    }
+                });
+                album_entry.track_count += 1;
+                album_entry.play_count = album_entry.play_count.saturating_add(track.plays);
+                if album_entry.artwork_path.is_none() {
+                    album_entry.artwork_path = album.and_then(|album| album.artwork_path.clone());
+                }
+            }
+        }
+
+        let mut genres = genres
+            .into_values()
+            .map(|genre| {
+                let mut artists = genre.artist_names.into_iter().collect::<Vec<_>>();
+                artists.sort_by_key(|artist| artist.to_lowercase());
+
+                let mut albums = genre
+                    .albums
+                    .into_values()
+                    .map(|album| GenreAlbumSummary {
+                        album_id: album.album_id,
+                        title: album.title,
+                        artist: album.artist,
+                        artwork_path: album.artwork_path,
+                        track_count: album.track_count,
+                        play_count: album.play_count,
+                        initials: album.initials,
+                        color: album.color,
+                    })
+                    .collect::<Vec<_>>();
+                albums.sort_by(|left, right| {
+                    right
+                        .play_count
+                        .cmp(&left.play_count)
+                        .then(right.track_count.cmp(&left.track_count))
+                        .then(left.artist.to_lowercase().cmp(&right.artist.to_lowercase()))
+                        .then(left.title.to_lowercase().cmp(&right.title.to_lowercase()))
+                });
+                let top_albums = albums.iter().take(3).cloned().collect::<Vec<_>>();
+                let artist_count = artists.len();
+                let album_count = genre.album_keys.len();
+                let searchable_lower = genre_searchable_lower(
+                    &genre.name,
+                    &artists,
+                    &albums,
+                    artist_count,
+                    album_count,
+                    genre.track_count,
+                );
+                Genre {
+                    key: genre.key,
+                    color: artwork::color_for(&genre.name, "genre"),
+                    name: genre.name,
+                    artist_count,
+                    album_count,
+                    track_count: genre.track_count,
+                    duration_value: genre.duration_value,
+                    artists,
+                    albums,
+                    top_albums,
+                    searchable_lower,
+                }
+            })
+            .collect::<Vec<_>>();
+        genres.sort_by_key(|genre| genre.name.to_lowercase());
+        genres
     }
 
     fn restart_metadata_worker(&mut self) {
@@ -1828,8 +2445,8 @@ impl TempoApp {
         // aligned with the new `playlists` Vec.
         let mut tab_ix = 0;
         while tab_ix < self.tabs.len() {
-            match self.tabs[tab_ix].source {
-                TabSource::Playlist(ix) if ix == playlist_ix => {
+            match &self.tabs[tab_ix].source {
+                TabSource::Playlist(ix) if *ix == playlist_ix => {
                     // Skip the closability check used for normal tab
                     // close: when the underlying playlist is gone,
                     // the tab has nothing to render so it must be
@@ -1842,8 +2459,8 @@ impl TempoApp {
                     }
                     continue;
                 }
-                TabSource::Playlist(ix) if ix > playlist_ix => {
-                    self.tabs[tab_ix].source = TabSource::Playlist(ix - 1);
+                TabSource::Playlist(ix) if *ix > playlist_ix => {
+                    self.tabs[tab_ix].source = TabSource::Playlist(*ix - 1);
                 }
                 _ => {}
             }
@@ -1858,17 +2475,31 @@ impl TempoApp {
             .chain(self.forward_history.iter_mut())
         {
             if let Some(tab) = entry.tab.as_mut() {
-                match tab.source {
-                    TabSource::Playlist(ix) if ix == playlist_ix => {
+                match &tab.source {
+                    TabSource::Playlist(ix) if *ix == playlist_ix => {
                         entry.tab = None;
                     }
-                    TabSource::Playlist(ix) if ix > playlist_ix => {
-                        tab.source = TabSource::Playlist(ix - 1);
+                    TabSource::Playlist(ix) if *ix > playlist_ix => {
+                        tab.source = TabSource::Playlist(*ix - 1);
                     }
                     _ => {}
                 }
             }
         }
+
+        // Same shift for the reopen-closed-tab stack. Drop entries
+        // that pointed at the deleted playlist and decrement higher
+        // indices; otherwise Ctrl+Shift+T could resurrect a stale
+        // playlist tab pointing at the wrong (or out-of-bounds) row.
+        self.closed_tabs
+            .retain_mut(|closed| match &mut closed.source {
+                TabSource::Playlist(ix) if *ix == playlist_ix => false,
+                TabSource::Playlist(ix) if *ix > playlist_ix => {
+                    *ix -= 1;
+                    true
+                }
+                _ => true,
+            });
 
         self.sync_search_input_to_active_tab();
         self.context_menu_track = None;
@@ -1898,7 +2529,12 @@ impl TempoApp {
 
     fn resolved_page_for_roots(page: Page, library_roots: &[PathBuf]) -> Page {
         match page {
-            Page::Library | Page::Artists | Page::Albums | Page::Liked | Page::ScanErrors
+            Page::Library
+            | Page::Artists
+            | Page::Albums
+            | Page::Genres
+            | Page::Liked
+            | Page::ScanErrors
                 if library_roots.is_empty() =>
             {
                 Page::Settings
@@ -1914,11 +2550,12 @@ impl TempoApp {
                 continue;
             }
 
-            let mut tab = match saved.source {
+            let mut tab = match &saved.source {
                 TabSource::Library => BrowseTab::library(saved.id),
-                TabSource::Playlist(playlist_ix) => BrowseTab::playlist(saved.id, playlist_ix),
-                TabSource::Artist(artist_id) => BrowseTab::artist(saved.id, artist_id),
-                TabSource::Album(album_id) => BrowseTab::album(saved.id, album_id),
+                TabSource::Playlist(playlist_ix) => BrowseTab::playlist(saved.id, *playlist_ix),
+                TabSource::Artist(artist_id) => BrowseTab::artist(saved.id, *artist_id),
+                TabSource::Album(album_id) => BrowseTab::album(saved.id, *album_id),
+                TabSource::Genre(genre_key) => BrowseTab::genre(saved.id, genre_key.clone()),
             };
             tab.search_query = saved.search_query.clone();
             tab.sort_column = saved.sort_column;
@@ -1949,7 +2586,7 @@ impl TempoApp {
             page: self.page,
             tab: (self.page == Page::Library).then(|| NavigationTab {
                 tab_id: self.active_tab().id,
-                source: self.active_tab().source,
+                source: self.active_tab().source.clone(),
                 search_query: self.active_search_query().to_string(),
             }),
         }
@@ -1994,11 +2631,12 @@ impl TempoApp {
         }
 
         self.reserve_tab_id(nav_tab.tab_id);
-        let mut tab = match nav_tab.source {
+        let mut tab = match &nav_tab.source {
             TabSource::Library => BrowseTab::library(nav_tab.tab_id),
-            TabSource::Playlist(playlist_ix) => BrowseTab::playlist(nav_tab.tab_id, playlist_ix),
-            TabSource::Artist(artist_id) => BrowseTab::artist(nav_tab.tab_id, artist_id),
-            TabSource::Album(album_id) => BrowseTab::album(nav_tab.tab_id, album_id),
+            TabSource::Playlist(playlist_ix) => BrowseTab::playlist(nav_tab.tab_id, *playlist_ix),
+            TabSource::Artist(artist_id) => BrowseTab::artist(nav_tab.tab_id, *artist_id),
+            TabSource::Album(album_id) => BrowseTab::album(nav_tab.tab_id, *album_id),
+            TabSource::Genre(genre_key) => BrowseTab::genre(nav_tab.tab_id, genre_key.clone()),
         };
         tab.search_query = nav_tab.search_query.clone();
         self.tabs.push(tab);
@@ -2108,21 +2746,25 @@ impl TempoApp {
             return query.to_string();
         }
 
-        match tab.source {
+        match &tab.source {
             TabSource::Library => "All Music".to_string(),
             TabSource::Playlist(playlist_ix) => self
                 .playlists
-                .get(playlist_ix)
+                .get(*playlist_ix)
                 .map(|playlist| playlist.name.clone())
                 .unwrap_or_else(|| "Missing Playlist".to_string()),
             TabSource::Artist(artist_id) => self
-                .artist_by_id(artist_id)
+                .artist_by_id(*artist_id)
                 .map(|artist| artist.name.clone())
                 .unwrap_or_else(|| "Missing Artist".to_string()),
             TabSource::Album(album_id) => self
-                .album_by_id(album_id)
+                .album_by_id(*album_id)
                 .map(|album| album.title.clone())
                 .unwrap_or_else(|| "Missing Album".to_string()),
+            TabSource::Genre(genre_key) => self
+                .genre_by_key(genre_key)
+                .map(|genre| genre.name.clone())
+                .unwrap_or_else(|| "Missing Genre".to_string()),
         }
     }
 
@@ -2154,11 +2796,9 @@ impl TempoApp {
 
     fn open_all_music_tab(&mut self) {
         let previous = self.current_navigation_entry();
-        if let Some(tab_ix) = self
-            .tabs
-            .iter()
-            .position(|tab| tab.source == TabSource::Library && tab.search_query.trim().is_empty())
-        {
+        if let Some(tab_ix) = self.tabs.iter().position(|tab| {
+            matches!(&tab.source, TabSource::Library) && tab.search_query.trim().is_empty()
+        }) {
             self.active_tab = tab_ix;
         } else {
             let tab_id = self.allocate_tab_id();
@@ -2181,7 +2821,7 @@ impl TempoApp {
         if let Some(tab_ix) = self
             .tabs
             .iter()
-            .position(|tab| tab.source == TabSource::Playlist(playlist_ix))
+            .position(|tab| matches!(&tab.source, TabSource::Playlist(ix) if *ix == playlist_ix))
         {
             self.active_tab = tab_ix;
         } else {
@@ -2201,7 +2841,7 @@ impl TempoApp {
         if let Some(tab_ix) = self
             .tabs
             .iter()
-            .position(|tab| tab.source == TabSource::Artist(artist_id))
+            .position(|tab| matches!(&tab.source, TabSource::Artist(id) if *id == artist_id))
         {
             self.active_tab = tab_ix;
         } else {
@@ -2222,7 +2862,7 @@ impl TempoApp {
         if let Some(tab_ix) = self
             .tabs
             .iter()
-            .position(|tab| tab.source == TabSource::Album(album_id))
+            .position(|tab| matches!(&tab.source, TabSource::Album(id) if *id == album_id))
         {
             self.active_tab = tab_ix;
         } else {
@@ -2238,6 +2878,30 @@ impl TempoApp {
         self.queue_album_cover_demand(album_id);
     }
 
+    fn open_genre_tab(&mut self, genre_key: String) {
+        if !self.genres.iter().any(|genre| genre.key == genre_key) {
+            return;
+        }
+
+        let previous = self.current_navigation_entry();
+        if let Some(tab_ix) = self
+            .tabs
+            .iter()
+            .position(|tab| matches!(&tab.source, TabSource::Genre(key) if key == &genre_key))
+        {
+            self.active_tab = tab_ix;
+        } else {
+            let tab_id = self.allocate_tab_id();
+            self.tabs.push(BrowseTab::genre(tab_id, genre_key.clone()));
+            self.active_tab = self.tabs.len() - 1;
+            self.rebuild_track_indices_for_tab(self.active_tab);
+        }
+
+        self.set_page_without_history(Page::Library);
+        self.sync_search_input_to_active_tab();
+        self.record_navigation_from(previous);
+    }
+
     fn select_tab(&mut self, tab_ix: usize) {
         if tab_ix >= self.tabs.len() {
             return;
@@ -2250,6 +2914,44 @@ impl TempoApp {
         self.record_navigation_from(previous);
     }
 
+    /// Nudge the tab bar's horizontal scroll by `delta` pixels (positive
+    /// scrolls right, negative scrolls left). Returns `true` if the
+    /// offset actually moved -- used by the arrow buttons to decide
+    /// whether to call `cx.notify()`.
+    pub(super) fn scroll_tab_bar_by(&mut self, delta: f32) -> bool {
+        let max_scroll = f32::from(self.tab_bar_scroll_handle.max_offset().width).max(0.0);
+        if max_scroll <= 0.0 {
+            return false;
+        }
+
+        // The scroll handle stores offset.x as a non-positive value:
+        // 0 == fully scrolled left, -max == fully scrolled right.
+        // Convert to a positive "scrolled distance", clamp, then
+        // store back as the negated value the handle expects.
+        let current = (-f32::from(self.tab_bar_scroll_handle.offset().x)).clamp(0.0, max_scroll);
+        let next = (current + delta).clamp(0.0, max_scroll);
+        if (next - current).abs() < 0.5 {
+            return false;
+        }
+        self.tab_bar_scroll_handle
+            .set_offset(point(px(-next), self.tab_bar_scroll_handle.offset().y));
+        true
+    }
+
+    /// Ensure the active tab is visible in the horizontally-scrollable
+    /// tab strip. Called once per render from `Render::render` when
+    /// `active_tab` changes (Ctrl+Tab, sidebar click, drag-open,
+    /// reopen-closed-tab, etc.). The actual scroll math lives in
+    /// gpui's `ScrollHandle::scroll_to_active_item`, applied during
+    /// the next prepaint of the tracked scroll wrapper.
+    pub(super) fn auto_scroll_active_tab_into_view(&mut self) {
+        if self.active_tab == self.last_scrolled_active_tab {
+            return;
+        }
+        self.last_scrolled_active_tab = self.active_tab;
+        self.tab_bar_scroll_handle.scroll_to_item(self.active_tab);
+    }
+
     fn artist_by_id(&self, artist_id: i64) -> Option<&Artist> {
         self.artists
             .iter()
@@ -2258,6 +2960,10 @@ impl TempoApp {
 
     fn album_by_id(&self, album_id: i64) -> Option<&Album> {
         self.albums.iter().find(|album| album.album_id == album_id)
+    }
+
+    fn genre_by_key(&self, genre_key: &str) -> Option<&Genre> {
+        self.genres.iter().find(|genre| genre.key == genre_key)
     }
 
     fn albums_for_artist(&self, artist_id: i64) -> Vec<&Album> {
@@ -2342,7 +3048,11 @@ impl TempoApp {
             return;
         }
 
-        self.tabs.remove(tab_ix);
+        let removed = self.tabs.remove(tab_ix);
+        self.push_closed_tab(ClosedTab {
+            source: removed.source,
+            search_query: removed.search_query,
+        });
         if self.active_tab > tab_ix {
             self.active_tab -= 1;
         } else if self.active_tab >= self.tabs.len() {
@@ -2357,10 +3067,84 @@ impl TempoApp {
             return;
         }
 
-        self.tabs.truncate(1);
+        // Drain in left-to-right order so the rightmost tab ends up
+        // on top of the reopen stack -- matches the order the user
+        // would have closed them one-by-one and is what
+        // browser-style Ctrl+Shift+T users expect.
+        for closed in self.tabs.drain(1..) {
+            self.closed_tabs.push(ClosedTab {
+                source: closed.source,
+                search_query: closed.search_query,
+            });
+        }
+        if self.closed_tabs.len() > CLOSED_TABS_MAX {
+            let overflow = self.closed_tabs.len() - CLOSED_TABS_MAX;
+            self.closed_tabs.drain(..overflow);
+        }
         self.active_tab = 0;
         self.sync_search_input_to_active_tab();
         self.context_menu_track = None;
+    }
+
+    /// Record a closed tab on the reopen stack, evicting the oldest
+    /// entry if we're already at the cap.
+    fn push_closed_tab(&mut self, closed: ClosedTab) {
+        if self.closed_tabs.len() >= CLOSED_TABS_MAX {
+            self.closed_tabs.remove(0);
+        }
+        self.closed_tabs.push(closed);
+    }
+
+    /// Pop the most recently closed tab off the reopen stack and
+    /// reinstate it as a new tab. No-ops when the stack is empty.
+    /// Stale entries (e.g. a playlist that was deleted while the tab
+    /// was closed) are skipped over so the user keeps walking back
+    /// through history rather than seeing the action silently fail.
+    fn reopen_closed_tab(&mut self) {
+        while let Some(closed) = self.closed_tabs.pop() {
+            if self.try_open_closed_tab(closed) {
+                return;
+            }
+        }
+    }
+
+    /// Returns `true` if `closed` was successfully reinstated as a
+    /// tab. Returns `false` when the underlying entity no longer
+    /// exists (e.g. a deleted playlist or a genre no longer in the
+    /// catalog), signalling the caller should try the next entry.
+    fn try_open_closed_tab(&mut self, closed: ClosedTab) -> bool {
+        match closed.source {
+            TabSource::Library => {
+                if closed.search_query.trim().is_empty() {
+                    self.new_library_tab();
+                } else {
+                    self.new_search_tab(closed.search_query);
+                }
+                true
+            }
+            TabSource::Playlist(ix) => {
+                if ix >= self.playlists.len() {
+                    return false;
+                }
+                self.open_playlist_tab(ix);
+                true
+            }
+            TabSource::Artist(id) => {
+                self.open_artist_tab(id);
+                true
+            }
+            TabSource::Album(id) => {
+                self.open_album_tab(id);
+                true
+            }
+            TabSource::Genre(key) => {
+                if !self.genres.iter().any(|genre| genre.key == key) {
+                    return false;
+                }
+                self.open_genre_tab(key);
+                true
+            }
+        }
     }
 
     fn can_close_tab(&self, tab_ix: usize) -> bool {
@@ -2593,6 +3377,17 @@ fn format_duration(duration: Duration) -> String {
     format!("{minutes}:{seconds:02}")
 }
 
+fn format_duration_compact(duration: Duration) -> String {
+    let total_minutes = duration.as_secs() / 60;
+    let hours = total_minutes / 60;
+    let minutes = total_minutes % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
 /// Open the OS file manager focused on `path`, ideally with `path`
 /// selected. Falls back to opening the parent directory if a
 /// "select-and-reveal" call isn't available.
@@ -2704,6 +3499,9 @@ impl Render for TempoApp {
                 self.table_is_scrolling
             ),
         );
+        // Keep the active tab visible in the horizontal tab strip.
+        // No-op when active_tab hasn't changed since the last frame.
+        self.auto_scroll_active_tab_into_view();
         let colors = self.colors();
 
         div()
@@ -2716,6 +3514,7 @@ impl Render for TempoApp {
             .on_action(cx.listener(Self::new_tab))
             .on_action(cx.listener(Self::close_active_tab))
             .on_action(cx.listener(Self::close_all_tabs_action))
+            .on_action(cx.listener(Self::reopen_closed_tab_action))
             .on_action(cx.listener(Self::next_tab_action))
             .on_action(cx.listener(Self::previous_tab_action))
             .on_action(cx.listener(Self::select_tab_1_action))
@@ -2812,6 +3611,7 @@ impl TempoApp {
             Page::Library => "library",
             Page::Artists => "artists",
             Page::Albums => "albums",
+            Page::Genres => "genres",
             Page::Liked => "liked",
             Page::PlaybackHistory => "playback_history",
             Page::ScanErrors => "scan_errors",
@@ -2820,11 +3620,12 @@ impl TempoApp {
     }
 
     fn tab_kind_label(tab: Option<&BrowseTab>) -> &'static str {
-        match tab.map(|tab| tab.source) {
+        match tab.map(|tab| &tab.source) {
             Some(TabSource::Library) => "library",
             Some(TabSource::Playlist(_)) => "playlist",
             Some(TabSource::Artist(_)) => "artist",
             Some(TabSource::Album(_)) => "album",
+            Some(TabSource::Genre(_)) => "genre",
             None => "none",
         }
     }
@@ -2900,6 +3701,16 @@ impl TempoApp {
 
     fn close_all_tabs_action(&mut self, _: &CloseAllTabs, _: &mut Window, cx: &mut Context<Self>) {
         self.close_all_tabs();
+        cx.notify();
+    }
+
+    fn reopen_closed_tab_action(
+        &mut self,
+        _: &ReopenClosedTab,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.reopen_closed_tab();
         cx.notify();
     }
 
@@ -2981,7 +3792,10 @@ impl TempoApp {
     }
 
     fn focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.page, Page::Library | Page::Artists | Page::Albums) {
+        if !matches!(
+            self.page,
+            Page::Library | Page::Artists | Page::Albums | Page::Genres
+        ) {
             self.open_page(Page::Library);
             self.sync_search_input_to_active_tab();
         }
