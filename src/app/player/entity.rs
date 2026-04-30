@@ -361,6 +361,13 @@ pub(crate) struct PlayerEntity {
     /// (not borrowed) because `ThemeColors: Copy` and the parent's
     /// theme list shouldn't outlive theme reloads.
     pub(super) theme_colors: ThemeColors,
+    /// Shared 10-band equalizer state. Cloned into every
+    /// [`PlaybackController`] so the audio thread reads UI changes
+    /// lock-free. The authoritative source of truth is `TempoApp`,
+    /// which mutates this directly when the user adjusts a slider;
+    /// the player merely holds a clone so the audio backend it
+    /// constructs picks up the same handle.
+    pub(super) eq_state: tempo::equalizer::EqState,
 }
 
 impl gpui::EventEmitter<PlayerEvent> for PlayerEntity {}
@@ -454,6 +461,7 @@ impl PlayerEntity {
         initial_visualizer: VisualizerKind,
         catalog: Option<CatalogStore>,
         theme_colors: ThemeColors,
+        eq_state: tempo::equalizer::EqState,
         _cx: &mut Context<Self>,
     ) -> Self {
         let volume = initial_volume.clamp(0.0, 1.0);
@@ -494,6 +502,7 @@ impl PlayerEntity {
             catalog,
             playing_track: None,
             theme_colors,
+            eq_state,
         }
     }
 
@@ -524,12 +533,13 @@ impl PlayerEntity {
     pub(crate) fn start_deferred_init(&self, cx: &mut Context<Self>) {
         let preferred_output = self.output_device.clone();
         let volume = self.volume;
+        let eq_state = self.eq_state.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     perf::time_result("startup.playback_init_deferred", "", || {
-                        PlaybackController::new(preferred_output.as_deref(), volume)
+                        PlaybackController::new(preferred_output.as_deref(), volume, eq_state)
                     })
                 })
                 .await;
@@ -1097,7 +1107,7 @@ impl PlayerEntity {
         let result = if let Some(playback) = &mut self.playback {
             playback.set_output(&output_name, self.volume)
         } else {
-            match PlaybackController::new(Some(&output_name), self.volume) {
+            match PlaybackController::new(Some(&output_name), self.volume, self.eq_state.clone()) {
                 Ok(playback) => {
                     self.playback = Some(playback);
                     Ok(())

@@ -618,6 +618,12 @@ impl TempoApp {
                     cx,
                 ),
             )
+            .child(self.with_tooltip(
+                self.render_eq_header_button("library-open-eq", cx),
+                "library-open-eq-tooltip",
+                "Equalizer (right-click to toggle)",
+                cx,
+            ))
             .child(
                 self.with_tooltip(
                     self.sidebar_button("⚙", "open-settings")

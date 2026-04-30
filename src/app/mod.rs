@@ -34,6 +34,7 @@ use tempo::{
 
 mod artwork;
 mod browse_grids;
+mod equalizer_panel;
 mod history;
 mod library_state;
 mod library_view;
@@ -799,6 +800,27 @@ struct PlaylistRename {
     input: TextInputState,
 }
 
+/// Mid-drag state for an equalizer slider. While `Some` on
+/// `TempoApp::eq_slider_drag`, mouse-move events update the band's
+/// gain based on vertical pointer travel from `start_y`.
+#[derive(Clone, Copy)]
+struct EqSliderDrag {
+    band: usize,
+    /// Y coordinate (in window space) where the drag started.
+    start_y: f32,
+    /// Gain in dB at the moment the drag started.
+    start_gain_db: f32,
+    /// Pixel height of the slider track at the moment the drag
+    /// started. Used to convert vertical travel into a dB delta.
+    track_height_px: f32,
+}
+
+/// Inline "Save as new" state. While `Some`, the panel shows a text
+/// input bound to `input` instead of the standard footer buttons.
+struct EqProfileSaveAs {
+    input: TextInputState,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct PlaybackHistoryEntry {
     played_at_unix_secs: u64,
@@ -1116,6 +1138,35 @@ struct AppState {
     /// in their saved state.
     #[serde(default)]
     seekbar_visualizer: VisualizerKind,
+    /// Whether the equalizer is engaged. `false` (i.e. bypass on)
+    /// means the EQ source passes audio through unmodified — the
+    /// safe default for users who haven't opened the panel yet.
+    #[serde(default)]
+    eq_enabled: bool,
+    /// Preamp gain in dB applied before the EQ band cascade.
+    /// Range: [-12, +12].
+    #[serde(default)]
+    eq_preamp_db: f32,
+    /// Per-band gains in dB. 10 entries; ISO octaves at
+    /// [`tempo::equalizer::BAND_FREQS_HZ`]. Range per band:
+    /// [-12, +12].
+    #[serde(default = "default_eq_gains")]
+    eq_gains_db: [f32; tempo::equalizer::BAND_COUNT],
+    /// Reference to the profile (built-in or user) the live EQ
+    /// values were last loaded from. `None` means the user is in
+    /// "ad-hoc" mode (sliders changed without loading a profile).
+    /// The UI uses this to render the "active profile" label and
+    /// the dirty `*` indicator.
+    #[serde(default)]
+    eq_active_profile: Option<tempo::equalizer::EqProfileRef>,
+    /// User-saved EQ profiles. Built-in profiles are not stored
+    /// here — they're embedded in code and referenced by name.
+    #[serde(default)]
+    eq_profiles: Vec<tempo::equalizer::EqProfile>,
+}
+
+fn default_eq_gains() -> [f32; tempo::equalizer::BAND_COUNT] {
+    [0.0; tempo::equalizer::BAND_COUNT]
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1176,6 +1227,11 @@ impl Default for AppState {
             liked_column_migrated: true,
             right_sidebar_view: RightSidebarView::default(),
             seekbar_visualizer: VisualizerKind::default(),
+            eq_enabled: false,
+            eq_preamp_db: 0.0,
+            eq_gains_db: default_eq_gains(),
+            eq_active_profile: None,
+            eq_profiles: Vec::new(),
         }
     }
 }
@@ -1724,6 +1780,39 @@ pub(crate) struct TempoApp {
     /// after the user picks one; this field is read by `app_state`
     /// (the serializer) without needing `cx`.
     seekbar_visualizer_snapshot: VisualizerKind,
+
+    // === Equalizer ===
+    /// Shared EQ state — same `Arc` the audio thread reads. UI
+    /// mutations go through [`tempo::equalizer::EqState`]'s atomic
+    /// setters which both update the value and bump the version
+    /// counter the audio thread polls.
+    eq_state: tempo::equalizer::EqState,
+    /// User-saved EQ profiles. Built-ins are referenced by name
+    /// from [`tempo::equalizer::BUILTIN_PRESETS`].
+    eq_profiles: Vec<tempo::equalizer::EqProfile>,
+    /// Reference to the profile (built-in or user) currently loaded
+    /// into the live sliders. `None` = ad-hoc edits. When `Some`,
+    /// the panel header shows the profile's name plus a `*` marker
+    /// when the live values diverge from the stored profile values.
+    eq_active_profile: Option<tempo::equalizer::EqProfileRef>,
+    /// Whether the EQ panel is open. The trigger button toggles
+    /// this; click-away closes it. Anchored at [`Self::eq_panel_anchor`].
+    eq_panel_open: bool,
+    eq_panel_anchor: Point<Pixels>,
+    /// Whether the profile-picker dropdown inside the EQ panel is
+    /// open. Closed automatically on profile selection.
+    eq_profile_menu_open: bool,
+    /// Mid-drag slider state. While `Some`, mouse-move events on
+    /// the panel update the dragged band's gain.
+    eq_slider_drag: Option<EqSliderDrag>,
+    /// Pending profile-deletion confirmation. Holds the user
+    /// profile's id; built-ins can't be deleted.
+    eq_profile_delete_confirm: Option<String>,
+    /// Inline "Save as new" input state. While `Some`, the panel
+    /// shows a text input where the user types a name for a new
+    /// user profile to be created from the live values.
+    eq_profile_save_as: Option<EqProfileSaveAs>,
+    eq_profile_save_as_focus_handle: Option<FocusHandle>,
     /// Held subscription that forwards [`player::PlayerEvent`]s into
     /// `TempoApp::handle_player_event`. Dropping this subscription
     /// would silently break cross-region updates (e.g. table active
@@ -1821,6 +1910,11 @@ impl TempoApp {
         // deferred to `start_deferred_playback_init` (called below
         // after the entity is in the entity map) so the 25–50ms cpal
         // device-enumeration cost doesn't block the first frame.
+        // Build the shared EQ state up front, seeded from saved
+        // settings so the engine starts with the user's last EQ
+        // applied (no first-buffer "wrong EQ" pop on startup).
+        let eq_state = tempo::equalizer::EqState::new();
+        eq_state.load_profile(&state.eq_gains_db, state.eq_preamp_db, !state.eq_enabled);
         let player = cx.new(|player_cx| {
             player::PlayerEntity::new(
                 volume,
@@ -1828,6 +1922,7 @@ impl TempoApp {
                 state.seekbar_visualizer,
                 catalog.clone(),
                 initial_theme_colors,
+                eq_state.clone(),
                 player_cx,
             )
         });
@@ -2033,6 +2128,16 @@ impl TempoApp {
             volume_snapshot: volume,
             output_device_snapshot: state.output_device.clone(),
             seekbar_visualizer_snapshot: state.seekbar_visualizer,
+            eq_state,
+            eq_profiles: state.eq_profiles,
+            eq_active_profile: state.eq_active_profile,
+            eq_panel_open: false,
+            eq_panel_anchor: Point::default(),
+            eq_profile_menu_open: false,
+            eq_slider_drag: None,
+            eq_profile_delete_confirm: None,
+            eq_profile_save_as: None,
+            eq_profile_save_as_focus_handle: None,
             _player_subscription: player_subscription,
             _save_on_quit: Some(save_on_quit),
         };
@@ -3822,11 +3927,18 @@ impl Render for TempoApp {
                 if this.drag_volume(event, cx) {
                     cx.stop_propagation();
                 }
+                if this.eq_slider_drag.is_some() {
+                    this.drag_eq_slider(f32::from(event.position.y));
+                    cx.stop_propagation();
+                }
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
                     if this.finish_volume_drag(cx) {
+                        cx.stop_propagation();
+                    }
+                    if this.end_eq_slider_drag() {
                         cx.stop_propagation();
                     }
                 }),
@@ -3886,6 +3998,12 @@ impl Render for TempoApp {
             .when(self.player.read(cx).settings_output_menu_open(), |this| {
                 this.child(self.settings_output_device_menu(cx))
             })
+            .when(self.eq_panel_open, |this| {
+                this.child(self.render_eq_panel(cx))
+            })
+            .when(self.eq_panel_open && self.eq_profile_menu_open, |this| {
+                this.child(self.render_eq_profile_menu_overlay(cx))
+            })
             .when_some(self.tooltip.clone(), |this, tooltip| {
                 this.child(self.render_tooltip(&tooltip))
             })
@@ -3913,6 +4031,9 @@ impl TempoApp {
         }
         if self.right_sidebar_view_menu_open {
             self.right_sidebar_view_menu_open = false;
+            closed = true;
+        }
+        if self.close_eq_panel() {
             closed = true;
         }
         if self.player.update(cx, |player, player_cx| {

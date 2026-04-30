@@ -200,6 +200,11 @@ impl TempoApp {
             liked_column_migrated: true,
             right_sidebar_view: self.right_sidebar_view,
             seekbar_visualizer: self.seekbar_visualizer_snapshot,
+            eq_enabled: !self.eq_state.bypass(),
+            eq_preamp_db: self.eq_state.preamp_db(),
+            eq_gains_db: self.eq_state.gains_db(),
+            eq_active_profile: self.eq_active_profile.clone(),
+            eq_profiles: self.eq_profiles.clone(),
         }
     }
 

@@ -473,6 +473,12 @@ impl TempoApp {
             })
             .child(div().flex_1())
             .child(self.render_search_box(window, "Search", cx))
+            .child(self.with_tooltip(
+                self.render_eq_header_button("genres-open-eq", cx),
+                "genres-open-eq-tooltip",
+                "Equalizer (right-click to toggle)",
+                cx,
+            ))
             .child(
                 self.with_tooltip(
                     self.sidebar_button("⚙", "genres-open-settings")
@@ -1410,6 +1416,12 @@ impl TempoApp {
             })
             .child(div().flex_1())
             .child(self.render_search_box(window, "Search", cx))
+            .child(self.with_tooltip(
+                self.render_eq_header_button("browse-open-eq", cx),
+                "browse-open-eq-tooltip",
+                "Equalizer (right-click to toggle)",
+                cx,
+            ))
             .child(
                 self.with_tooltip(
                     self.sidebar_button("⚙", "open-settings")

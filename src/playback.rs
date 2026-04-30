@@ -5,6 +5,7 @@ use cpal::{Device, traits::DeviceTrait as _, traits::HostTrait as _};
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player};
 
 use crate::audio_analyzer::AudioAnalyzer;
+use crate::equalizer::{EqSource, EqState};
 use crate::perf;
 
 #[derive(Clone, Debug)]
@@ -26,10 +27,16 @@ pub struct PlaybackController {
     /// the renderer's handle stays valid; only the *contents* of the
     /// ring buffer are reset on track change.
     analyzer: AudioAnalyzer,
+    /// Shared 10-band EQ state. Cloned into the [`EqSource`] inserted
+    /// in front of the rodio sink so the audio thread reads UI
+    /// changes lock-free. Survives `set_output` and `play_path` so
+    /// the equalizer settings persist across device switches and
+    /// track changes.
+    eq_state: EqState,
 }
 
 impl PlaybackController {
-    pub fn new(preferred_output: Option<&str>, volume: f32) -> Result<Self> {
+    pub fn new(preferred_output: Option<&str>, volume: f32, eq_state: EqState) -> Result<Self> {
         let _span = perf::span(
             "playback.new",
             format!("preferred_output={}", preferred_output.unwrap_or("default")),
@@ -43,6 +50,7 @@ impl PlaybackController {
             player,
             output_name,
             analyzer: AudioAnalyzer::new(),
+            eq_state,
         })
     }
 
@@ -51,6 +59,13 @@ impl PlaybackController {
     /// each repaint when a frequency-reactive visualizer is active.
     pub fn analyzer(&self) -> AudioAnalyzer {
         self.analyzer.clone()
+    }
+
+    /// Handle to the shared EQ state. Cheap to clone (`Arc`); the UI
+    /// uses this to mutate band gains, preamp, and bypass without
+    /// blocking the audio thread.
+    pub fn eq_state(&self) -> EqState {
+        self.eq_state.clone()
     }
 
     pub fn output_devices() -> Vec<PlaybackOutputDevice> {
@@ -154,6 +169,7 @@ impl PlaybackController {
 
         let player = Arc::clone(&self.player);
         let analyzer = self.analyzer.clone();
+        let eq_state = self.eq_state.clone();
         let path: PathBuf = path.to_path_buf();
         thread::Builder::new()
             .name("tempo-decode".into())
@@ -179,10 +195,18 @@ impl PlaybackController {
                         return;
                     }
                 };
-                // `tap` wraps the decoder in a transparent `Source`
-                // that copies samples into the analyzer's ring buffer
-                // before they reach the mixer. No audio path change.
-                player.append(analyzer.tap(source));
+                // Source pipeline:
+                //
+                //   Decoder -> TapSource (analyzer) -> EqSource -> Player
+                //
+                // The analyzer taps *before* EQ so visualizers reflect
+                // the original signal (visualizers "watch the song",
+                // not the user's EQ adjustments). EQ is the last
+                // step before the mixer so adjustments take effect
+                // immediately and uniformly.
+                let tapped = analyzer.tap(source);
+                let eq = EqSource::new(tapped, eq_state);
+                player.append(eq);
                 player.play();
             })
             .context("failed to spawn audio decode thread")?;
