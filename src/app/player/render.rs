@@ -1157,6 +1157,12 @@ fn seekbar_menu_panel(
                 cx.stop_propagation();
             }),
         )
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(|_, _: &MouseDownEvent, _window, cx| {
+                cx.stop_propagation();
+            }),
+        )
         .child(menu_header("Visualizer", colors));
     // Radio-style list of all four visualizers. Selected variant is
     // highlighted in `accent_soft` and shown with a check; clicking
@@ -1177,11 +1183,16 @@ fn seekbar_menu_panel(
                 } else {
                     colors.text
                 }))
-                .on_click(cx.listener(move |player, event: &ClickEvent, _window, cx| {
-                    if event.standard_click() {
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |player, _: &MouseDownEvent, _window, cx| {
                         player.set_seekbar_visualizer(kind, cx);
+                        player.seekbar_menu_open = false;
                         cx.stop_propagation();
-                    }
+                    }),
+                )
+                .on_click(cx.listener(|_, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
                 }))
                 .child(kind.label())
                 .child(if is_selected { "✓" } else { "" }),
@@ -1196,12 +1207,16 @@ fn seekbar_menu_panel(
             } else {
                 colors.text
             }))
-            .on_click(cx.listener(|player, event: &ClickEvent, _window, cx| {
-                if event.standard_click() {
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|player, _: &MouseDownEvent, _window, cx| {
                     player.toggle_seekbar_fps();
                     cx.stop_propagation();
                     cx.notify();
-                }
+                }),
+            )
+            .on_click(cx.listener(|_, _event: &ClickEvent, _window, cx| {
+                cx.stop_propagation();
             }))
             .child("FPS Counter")
             .child(if fps_enabled { "✓" } else { "" }),
