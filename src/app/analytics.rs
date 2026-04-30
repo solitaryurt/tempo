@@ -231,7 +231,7 @@ impl TempoApp {
 
         // Calendar heatmap. Cells are arranged column-major: each
         // column is a week, rows are weekdays (Mon..Sun).
-        let weeks = (ANALYTICS_HEATMAP_DAYS + 6) / 7;
+        let weeks = ANALYTICS_HEATMAP_DAYS.div_ceil(7);
         let total_cells = weeks * 7;
         let mut cells = vec![HeatmapCell::empty(); total_cells];
         let max_day = summary
@@ -373,7 +373,7 @@ impl TempoApp {
             .copied()
             .fold(0_u64, u64::max);
         for col in 0..24 {
-            for row in 0..7 {
+            for (row, weekday_name) in WEEKDAY_NAMES.iter().enumerate() {
                 let val = summary.weekday_hour_grid[row * 24 + col];
                 let intensity = if max > 0 {
                     (val as f32) / (max as f32)
@@ -383,14 +383,14 @@ impl TempoApp {
                 let tooltip = if val > 0 {
                     Some(SharedString::from(format!(
                         "{} · {:02}:00 · {}",
-                        WEEKDAY_NAMES[row],
+                        weekday_name,
                         col,
                         format_hours_long(val),
                     )))
                 } else {
                     Some(SharedString::from(format!(
                         "{} · {:02}:00 · no listening",
-                        WEEKDAY_NAMES[row], col,
+                        weekday_name, col,
                     )))
                 };
                 cells.push(HeatmapCell {
@@ -1738,7 +1738,7 @@ fn compute_summary(
         .into_iter()
         .map(|(label, (count, secs))| (label, count, secs))
         .collect();
-    sorted_genres.sort_by(|a, b| b.2.cmp(&a.2));
+    sorted_genres.sort_by_key(|g| std::cmp::Reverse(g.2));
     let max_genre_secs = sorted_genres
         .iter()
         .map(|(_, _, secs)| *secs)
@@ -1766,7 +1766,7 @@ fn compute_summary(
         .into_iter()
         .map(|(label, (count, bytes))| (label, count, bytes))
         .collect();
-    format_entries.sort_by(|a, b| b.1.cmp(&a.1));
+    format_entries.sort_by_key(|f| std::cmp::Reverse(f.1));
     let total_format_count: usize = format_entries.iter().map(|(_, count, _)| *count).sum();
     let file_formats: Vec<FormatEntry> = format_entries
         .into_iter()
@@ -1807,7 +1807,7 @@ fn compute_summary(
     // Sample rate buckets -> color-coded slices.
     let sr_palette: [u32; 6] = [0xa8d39e, 0x6f9dff, 0xeeb17d, 0xd9a3df, 0x7adfd1, 0xc7c7c7];
     let mut sr_entries: Vec<(u32, usize)> = sample_rate_counts.into_iter().collect();
-    sr_entries.sort_by(|a, b| b.1.cmp(&a.1));
+    sr_entries.sort_by_key(|s| std::cmp::Reverse(s.1));
     let sample_rate_buckets: Vec<SizeBucketEntry> = sr_entries
         .into_iter()
         .enumerate()
@@ -1831,8 +1831,8 @@ fn compute_summary(
     cumulative = cumulative.saturating_add(baseline);
     for offset in 0..36 {
         let month_offset = 35 - offset;
-        let mut target_year = now.year() - (month_offset / 12) as i32;
-        let mut target_month = now.month() as i32 - (month_offset % 12) as i32;
+        let mut target_year = now.year() - (month_offset / 12);
+        let mut target_month = now.month() as i32 - (month_offset % 12);
         if target_month <= 0 {
             target_month += 12;
             target_year -= 1;
@@ -1889,10 +1889,10 @@ fn compute_summary(
         all_stat.1 = all_stat.1.saturating_add(dur_secs);
 
         // Time-filtered stats.
-        if let Some(cutoff) = cutoff_secs {
-            if entry.played_at_unix_secs < cutoff {
-                continue;
-            }
+        if let Some(cutoff) = cutoff_secs
+            && entry.played_at_unix_secs < cutoff
+        {
+            continue;
         }
 
         unique_tracks.insert(entry.track_path.clone());
@@ -1901,7 +1901,7 @@ fn compute_summary(
         let dt: DateTime<Local> = Local
             .timestamp_opt(entry.played_at_unix_secs as i64, 0)
             .single()
-            .unwrap_or_else(|| Local::now());
+            .unwrap_or_else(Local::now);
 
         hours_of_day[dt.hour() as usize] += dur_secs as f64 / 3600.0;
         let weekday = dt.weekday().num_days_from_monday() as usize;
@@ -1938,7 +1938,7 @@ fn compute_summary(
     };
 
     let weeks_to_show: usize = match range.window_days() {
-        Some(days) => ((days + 6) / 7).max(1) as usize,
+        Some(days) => (days.div_ceil(7)).max(1) as usize,
         None => 26, // ~6 months
     };
     let listening_per_week = build_per_week_secs(now, &listening_by_day, weeks_to_show);

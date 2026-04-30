@@ -307,12 +307,13 @@ impl TempoApp {
                 cx.notify();
             }
             _ => {
-                if let Some(text) = event.keystroke.key_char.as_ref() {
-                    if !text.is_empty() && !command {
-                        state.input.insert(text);
-                        cx.stop_propagation();
-                        cx.notify();
-                    }
+                if let Some(text) = event.keystroke.key_char.as_ref()
+                    && !text.is_empty()
+                    && !command
+                {
+                    state.input.insert(text);
+                    cx.stop_propagation();
+                    cx.notify();
                 }
             }
         }
@@ -710,8 +711,8 @@ impl TempoApp {
             .items_end()
             .justify_between()
             .gap_2();
-        for band in 0..BAND_COUNT {
-            row = row.child(self.render_eq_slider(band, gains[band], cx));
+        for (band, gain) in gains.iter().enumerate().take(BAND_COUNT) {
+            row = row.child(self.render_eq_slider(band, *gain, cx));
         }
 
         // Add the dB-axis tick labels on the left side as a sibling

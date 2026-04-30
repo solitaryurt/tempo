@@ -145,7 +145,7 @@ pub(super) fn render(ctx: VisualizerContext<'_>, _cx: &mut Context<PlayerEntity>
         // Raise the curve so a positive band magnitude pushes the
         // line *up* (visually intuitive: more energy = bigger spike).
         // Floor it so silent bands don't disappear into the centre.
-        let height_norm = (height_norm.max(QUIET_FLOOR)).min(1.0);
+        let height_norm = height_norm.clamp(QUIET_FLOOR, 1.0);
         let offset_px = -height_norm * max_amplitude;
         let stroke_top = (center_y + offset_px - STROKE_HEIGHT_PX * 0.5).max(0.0);
 

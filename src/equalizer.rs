@@ -334,9 +334,9 @@ impl<S: Source> EqSource<S> {
         if rate_changed || version_changed {
             // Recompute coefficients.
             let rate_f = sample_rate.max(1) as f32;
-            for band in 0..BAND_COUNT {
+            for (band, &freq) in BAND_FREQS_HZ.iter().enumerate().take(BAND_COUNT) {
                 let gain_db = self.state.band_gain_db(band);
-                self.biquads[band] = Biquad::peaking(rate_f, BAND_FREQS_HZ[band], gain_db, BAND_Q);
+                self.biquads[band] = Biquad::peaking(rate_f, freq, gain_db, BAND_Q);
             }
             self.cached_preamp = 10f32.powf(self.state.preamp_db() / 20.0);
 
@@ -678,9 +678,9 @@ mod tests {
             n: 0,
             remaining: 8_192,
         };
-        let mut eq = EqSource::new(src, state);
+        let eq = EqSource::new(src, state);
         let mut out = Vec::with_capacity(8_192);
-        while let Some(s) = eq.next() {
+        for s in eq {
             out.push(s);
         }
         // Skip the bypass-fade preamble (256 samples at the start).
@@ -707,9 +707,9 @@ mod tests {
             sample_rate: rate(44_100),
             channels: channels(2),
         };
-        let mut eq = EqSource::new(src, state);
+        let eq = EqSource::new(src, state);
         let mut out = Vec::with_capacity(4_096);
-        while let Some(s) = eq.next() {
+        for s in eq {
             out.push(s);
         }
         // After any initial fade, samples are exactly the input.
@@ -733,9 +733,9 @@ mod tests {
                 n: 0,
                 remaining: 16_384,
             };
-            let mut eq = EqSource::new(src, state);
+            let eq = EqSource::new(src, state);
             let mut out = Vec::with_capacity(16_384);
-            while let Some(s) = eq.next() {
+            for s in eq {
                 out.push(s);
             }
             // Skip the bypass-fade preamble + filter warmup.
@@ -793,7 +793,7 @@ mod tests {
                 }
                 self.remaining -= 1;
                 self.n += 1;
-                Some(if self.n % 2 == 0 { 0.9 } else { -0.9 })
+                Some(if self.n.is_multiple_of(2) { 0.9 } else { -0.9 })
             }
         }
         impl Source for Alt {
@@ -816,8 +816,8 @@ mod tests {
             rate: rate(44_100),
             chans: channels(2),
         };
-        let mut eq = EqSource::new(src, state);
-        while let Some(s) = eq.next() {
+        let eq = EqSource::new(src, state);
+        for s in eq {
             assert!(s.is_finite(), "EQ produced non-finite sample");
             assert!((-1.0..=1.0).contains(&s));
         }

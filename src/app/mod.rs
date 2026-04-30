@@ -97,19 +97,14 @@ enum BrowseViewMode {
 /// the playback-history aggregations to a rolling window. Library
 /// stats (genre, codec, decades, etc.) are unaffected by the filter
 /// because they describe the whole indexed library.
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
 enum AnalyticsTimeRange {
     SevenDays,
     ThirtyDays,
+    #[default]
     NinetyDays,
     OneYear,
     All,
-}
-
-impl Default for AnalyticsTimeRange {
-    fn default() -> Self {
-        Self::NinetyDays
-    }
 }
 
 impl AnalyticsTimeRange {

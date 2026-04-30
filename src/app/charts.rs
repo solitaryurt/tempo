@@ -526,6 +526,7 @@ impl HeatmapCell {
 /// `HeatmapCell::tooltip` becomes a stateful, hover-tooltip element.
 /// `id_suffix` namespaces the per-cell IDs so multiple heatmaps in
 /// the same panel can share `ctx.id_prefix` without colliding.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn heatmap(
     cells: &[HeatmapCell],
     rows: usize,
@@ -728,7 +729,7 @@ pub(super) fn radial_hours(values: &[f64; 24], diameter: f32, colors: ThemeColor
 
     for (hour, value) in values.iter().enumerate() {
         let portion = if max > 0.0 {
-            (value / max).max(0.0).min(1.0) as f32
+            (value / max).clamp(0.0, 1.0) as f32
         } else {
             0.0
         };
