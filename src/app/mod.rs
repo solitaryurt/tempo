@@ -3862,6 +3862,9 @@ impl Render for TempoApp {
             .when(self.player.read(cx).settings_output_menu_open(), |this| {
                 this.child(self.settings_output_device_menu(cx))
             })
+            .when(self.player.read(cx).seekbar_menu_open(), |this| {
+                this.child(self.render_seekbar_menu_dismiss_layer(cx))
+            })
             .when_some(self.tooltip.clone(), |this, tooltip| {
                 this.child(self.render_tooltip(&tooltip))
             })
@@ -3869,6 +3872,40 @@ impl Render for TempoApp {
 }
 
 impl TempoApp {
+    fn render_seekbar_menu_dismiss_layer(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        div()
+            .id("seekbar-menu-app-dismiss-layer")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.player.update(cx, |player, player_cx| {
+                        player.close_seekbar_menu();
+                        player_cx.notify();
+                    });
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.player.update(cx, |player, player_cx| {
+                        player.close_seekbar_menu();
+                        player_cx.notify();
+                    });
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+    }
+
     fn page_label(page: Page) -> &'static str {
         match page {
             Page::Library => "library",

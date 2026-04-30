@@ -1136,34 +1136,12 @@ fn seekbar_menu(
 ) -> impl IntoElement + use<> {
     // BottomRight anchor with a small upward offset places the panel
     // just above the ✦ button rather than overlapping it.
-    div()
-        .id("seekbar-menu-backdrop")
-        .absolute()
-        .top_0()
-        .left_0()
-        .size_full()
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|player, _: &MouseDownEvent, _window, cx| {
-                player.seekbar_menu_open = false;
-                cx.stop_propagation();
-                cx.notify();
-            }),
-        )
-        .on_mouse_down(
-            MouseButton::Right,
-            cx.listener(|player, _: &MouseDownEvent, _window, cx| {
-                player.seekbar_menu_open = false;
-                cx.stop_propagation();
-                cx.notify();
-            }),
-        )
-        .child(menu_at(
-            position,
-            Corner::BottomRight,
-            point(px(8.0), px(-12.0)),
-            seekbar_menu_panel(fps_enabled, current_visualizer, colors, cx),
-        ))
+    menu_at(
+        position,
+        Corner::BottomRight,
+        point(px(8.0), px(-12.0)),
+        seekbar_menu_panel(fps_enabled, current_visualizer, colors, cx),
+    )
 }
 
 fn seekbar_menu_panel(

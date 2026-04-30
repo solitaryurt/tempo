@@ -727,6 +727,21 @@ impl PlayerEntity {
         self.output_menu_source == Some(OutputMenuSource::Settings)
     }
 
+    /// Whether the seekbar visualizer menu is open. The parent app
+    /// renders a full-window dismiss layer for it because this entity's
+    /// own render bounds only cover the footer/player bar.
+    pub(crate) fn seekbar_menu_open(&self) -> bool {
+        self.seekbar_menu_open
+    }
+
+    pub(crate) fn close_seekbar_menu(&mut self) -> bool {
+        if !self.seekbar_menu_open {
+            return false;
+        }
+        self.seekbar_menu_open = false;
+        true
+    }
+
     /// `Some` if the audio backend has been initialized successfully.
     /// Render code uses this to decide whether to render transport
     /// controls vs the "Initializing..." placeholder.
