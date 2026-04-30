@@ -51,7 +51,7 @@ const MAGIC: &[u8; 8] = b"TEMPO_S1";
 // Bumped to invalidate snapshots written by builds that used the
 // feat-only splitter, so upgraded users see the corrected Artists view
 // without waiting for a rescan.
-const SNAPSHOT_VERSION: u32 = 3;
+const SNAPSHOT_VERSION: u32 = 4;
 const SNAPSHOT_FILE: &str = "startup_snapshot.v3.bin";
 
 pub struct StartupSnapshot {
@@ -250,6 +250,7 @@ fn write_track(buffer: &mut Vec<u8>, track: &CatalogTrack) {
     write_opt_u32(buffer, track.bitrate);
     write_u64(buffer, track.file_size);
     write_u32(buffer, track.play_count);
+    buffer.push(if track.liked { 1 } else { 0 });
     write_opt_path(buffer, track.artwork_path.as_deref());
 }
 
@@ -272,6 +273,7 @@ fn read_track(cursor: &mut Cursor<'_>) -> Result<CatalogTrack> {
         bitrate: cursor.read_opt_u32()?,
         file_size: cursor.read_u64()?,
         play_count: cursor.read_u32()?,
+        liked: cursor.read_bool()?,
         artwork_path: cursor.read_opt_path()?,
     })
 }
@@ -392,6 +394,12 @@ impl<'a> Cursor<'a> {
         Ok(self.read_opt_string()?.map(PathBuf::from))
     }
 
+    fn read_bool(&mut self) -> Result<bool> {
+        let mut tag = [0u8; 1];
+        self.read_exact(&mut tag)?;
+        Ok(tag[0] != 0)
+    }
+
     fn read_opt_u32(&mut self) -> Result<Option<u32>> {
         let mut tag = [0u8; 1];
         self.read_exact(&mut tag)?;
@@ -494,6 +502,7 @@ mod tests {
             bitrate: Some(900),
             file_size: 12345,
             play_count: 0,
+            liked: false,
             artwork_path: None,
         }
     }

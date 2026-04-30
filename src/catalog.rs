@@ -21,7 +21,16 @@ const TRACK_METADATA_VERSION: i64 = 2;
 /// changes. Startup short-circuits when the SQLite `user_version` already
 /// matches, so this is the only knob that controls whether DDL re-runs on
 /// app launch.
-const SCHEMA_VERSION: i64 = 2;
+// v4 bump rationale: an earlier v3 build advertised SCHEMA_VERSION=3 but
+// could leave the `liked` column unadded on a subset of upgraded
+// databases (the fast path at `migrate()` short-circuits on
+// `user_version >= SCHEMA_VERSION`, so the column-add never re-ran on
+// machines that landed at user_version=3 without the ALTER). Bumping to
+// 4 forces the migration body -- entirely composed of idempotent
+// `CREATE ... IF NOT EXISTS` and `add_column_if_missing` calls -- to
+// re-execute exactly once and repair the schema without disturbing
+// existing data.
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Clone, Debug)]
 pub struct CatalogStore {
@@ -53,6 +62,7 @@ pub struct CatalogTrack {
     pub bitrate: Option<u32>,
     pub file_size: u64,
     pub play_count: u32,
+    pub liked: bool,
     pub artwork_path: Option<PathBuf>,
 }
 
@@ -360,6 +370,7 @@ impl CatalogStore {
                 artwork_path TEXT,
                 metadata_version INTEGER NOT NULL DEFAULT 0,
                 play_count INTEGER NOT NULL DEFAULT 0,
+                liked INTEGER NOT NULL DEFAULT 0,
                 first_played_at INTEGER,
                 last_played_at INTEGER,
                 search_blob TEXT NOT NULL,
@@ -441,6 +452,7 @@ impl CatalogStore {
         )?;
         add_column_if_missing(&connection, "tracks", "first_played_at", "INTEGER")?;
         add_column_if_missing(&connection, "tracks", "last_played_at", "INTEGER")?;
+        add_column_if_missing(&connection, "tracks", "liked", "INTEGER NOT NULL DEFAULT 0")?;
         connection.execute(
             "UPDATE tracks SET date_added = created_at WHERE date_added IS NULL",
             [],
@@ -758,9 +770,11 @@ impl CatalogStore {
                 now,
             ])?;
         let track_id = select_id_by_i64(transaction, "tracks", "file_id", file_id)?;
-        let (date_added_ms, play_count): (i64, i64) = transaction
-            .prepare_cached("SELECT date_added, play_count FROM tracks WHERE id = ?1")?
-            .query_row(params![track_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let (date_added_ms, play_count, liked): (i64, i64, i64) = transaction
+            .prepare_cached("SELECT date_added, play_count, liked FROM tracks WHERE id = ?1")?
+            .query_row(params![track_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
 
         Ok(CatalogTrack {
             track_id,
@@ -780,6 +794,7 @@ impl CatalogStore {
             bitrate: track.bitrate,
             file_size: size_bytes,
             play_count: play_count.max(0) as u32,
+            liked: liked != 0,
             artwork_path,
         })
     }
@@ -1023,7 +1038,7 @@ impl CatalogStore {
                 tracks.id, files.id, tracks.artist_id, tracks.album_id, files.path, tracks.title,
                 tracks.artist_name, tracks.album_name, tracks.genre, tracks.track_number, tracks.year,
                 tracks.date_added, tracks.duration_ms, tracks.codec, tracks.bitrate,
-                tracks.file_size, tracks.play_count, tracks.artwork_path
+                tracks.file_size, tracks.play_count, tracks.liked, tracks.artwork_path
              FROM tracks
              JOIN files ON files.id = tracks.file_id
              WHERE files.status = 'present' AND ({root_filter})
@@ -1037,7 +1052,8 @@ impl CatalogStore {
             let bitrate: Option<i64> = row.get(14)?;
             let file_size: i64 = row.get(15)?;
             let play_count: i64 = row.get(16)?;
-            let artwork_path: Option<String> = row.get(17)?;
+            let liked: i64 = row.get(17)?;
+            let artwork_path: Option<String> = row.get(18)?;
             Ok(CatalogTrack {
                 track_id: row.get(0)?,
                 file_id: row.get(1)?,
@@ -1056,6 +1072,7 @@ impl CatalogStore {
                 bitrate: bitrate.map(|bitrate| bitrate as u32),
                 file_size: file_size.max(0) as u64,
                 play_count: play_count.max(0) as u32,
+                liked: liked != 0,
                 artwork_path: artwork_path.map(PathBuf::from),
             })
         })?;
@@ -1087,7 +1104,7 @@ impl CatalogStore {
                 tracks.id, files.id, tracks.artist_id, tracks.album_id, files.path, tracks.title,
                 tracks.artist_name, tracks.album_name, tracks.genre, tracks.track_number, tracks.year,
                 tracks.date_added, tracks.duration_ms, tracks.codec, tracks.bitrate,
-                tracks.file_size, tracks.play_count, tracks.artwork_path,
+                tracks.file_size, tracks.play_count, tracks.liked, tracks.artwork_path,
                 files.size_bytes, files.modified_at, files.device_id, files.inode
              FROM tracks
              JOIN files ON files.id = tracks.file_id
@@ -1106,15 +1123,16 @@ impl CatalogStore {
             let bitrate: Option<i64> = row.get(14)?;
             let file_size: i64 = row.get(15)?;
             let play_count: i64 = row.get(16)?;
-            let artwork_path: Option<String> = row.get(17)?;
+            let liked: i64 = row.get(17)?;
+            let artwork_path: Option<String> = row.get(18)?;
             let path = PathBuf::from(path);
             Ok((
                 path.clone(),
                 CatalogFileFingerprint {
-                    size_bytes: row.get::<_, i64>(18)?.max(0) as u64,
-                    modified_at: row.get(19)?,
-                    device_id: row.get(20)?,
-                    inode: row.get(21)?,
+                    size_bytes: row.get::<_, i64>(19)?.max(0) as u64,
+                    modified_at: row.get(20)?,
+                    device_id: row.get(21)?,
+                    inode: row.get(22)?,
                 },
                 CatalogTrack {
                     track_id: row.get(0)?,
@@ -1134,6 +1152,7 @@ impl CatalogStore {
                     bitrate: bitrate.map(|bitrate| bitrate as u32),
                     file_size: file_size.max(0) as u64,
                     play_count: play_count.max(0) as u32,
+                    liked: liked != 0,
                     artwork_path: artwork_path.map(PathBuf::from),
                 },
             ))
@@ -1149,6 +1168,28 @@ impl CatalogStore {
             format!("tracks={}", tracks.len()),
         );
         Ok(tracks)
+    }
+
+    /// Persist the `liked` flag for the given track. The Liked column /
+    /// Liked page in the UI both flow through here so the in-memory
+    /// `Track::liked` field and the on-disk `tracks.liked` column stay
+    /// in sync. Returns Ok(()) even if no rows match (the in-memory
+    /// state is the source of truth for the UI; this is just durability).
+    pub fn set_liked(&self, path: &Path, liked: bool) -> Result<()> {
+        let _span = perf::span(
+            "catalog.set_liked",
+            format!("path={} liked={liked}", path.display()),
+        );
+        let connection = self.lock_connection()?;
+        let now = now_millis();
+        connection.execute(
+            "UPDATE tracks
+             SET liked = ?1,
+                 updated_at = ?2
+             WHERE file_id = (SELECT id FROM files WHERE path = ?3)",
+            params![if liked { 1 } else { 0 }, now, path.display().to_string()],
+        )?;
+        Ok(())
     }
 
     pub fn increment_play_count(&self, path: &Path) -> Result<u32> {
@@ -1947,7 +1988,7 @@ impl CatalogStore {
                     tracks.id, files.id, tracks.artist_id, tracks.album_id, files.path, tracks.title,
                     tracks.artist_name, tracks.album_name, tracks.genre, tracks.track_number, tracks.year,
                     tracks.date_added, tracks.duration_ms, tracks.codec, tracks.bitrate,
-                    tracks.file_size, tracks.play_count, tracks.artwork_path
+                    tracks.file_size, tracks.play_count, tracks.liked, tracks.artwork_path
                  FROM tracks
                  JOIN files ON files.id = tracks.file_id
                  WHERE files.path = ?1 AND files.status = 'present'",
@@ -1960,7 +2001,8 @@ impl CatalogStore {
                     let bitrate: Option<i64> = row.get(14)?;
                     let file_size: i64 = row.get(15)?;
                     let play_count: i64 = row.get(16)?;
-                    let artwork_path: Option<String> = row.get(17)?;
+                    let liked: i64 = row.get(17)?;
+                    let artwork_path: Option<String> = row.get(18)?;
                     Ok(CatalogTrack {
                         track_id: row.get(0)?,
                         file_id: row.get(1)?,
@@ -1979,6 +2021,7 @@ impl CatalogStore {
                         bitrate: bitrate.map(|bitrate| bitrate as u32),
                         file_size: file_size.max(0) as u64,
                         play_count: play_count.max(0) as u32,
+                        liked: liked != 0,
                         artwork_path: artwork_path.map(PathBuf::from),
                     })
                 },

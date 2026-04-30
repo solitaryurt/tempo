@@ -1113,7 +1113,7 @@ impl PlayingTrackSnapshot {
             bitrate: self.bitrate,
             file_size: 0,
             plays: 0,
-            loved: false,
+            liked: false,
             artwork: self.artwork.clone(),
             album_initials: self.album_initials.clone(),
             album_color: self.album_color,

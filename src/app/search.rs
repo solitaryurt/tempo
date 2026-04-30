@@ -387,6 +387,12 @@ impl TempoApp {
                 // still sees which day/time they are scrubbing toward.
                 Vec::new()
             }
+            BrowseScrollbarTarget::Liked => {
+                // Liked is a flat filtered list with no canonical sort
+                // for the rail. Drop the markers and let the user rely
+                // on the thumb position alone.
+                Vec::new()
+            }
         }
     }
 
@@ -530,6 +536,7 @@ impl TempoApp {
                         .map(|entry| Self::history_played_at_label(entry.played_at_unix_secs))
                 })
                 .collect(),
+            BrowseScrollbarTarget::Liked => Vec::new(),
         }
     }
 
@@ -753,7 +760,7 @@ impl TempoApp {
                             cx.notify();
                         }
                     }
-                    Page::PlaybackHistory | Page::ScanErrors | Page::Settings => {}
+                    Page::Liked | Page::PlaybackHistory | Page::ScanErrors | Page::Settings => {}
                 }
             }) else {
                 return;

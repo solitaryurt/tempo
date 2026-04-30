@@ -684,6 +684,7 @@ impl TempoApp {
             BrowseScrollbarTarget::AlbumsGrid => self.album_grid_scroll_handle.clone(),
             BrowseScrollbarTarget::AlbumsTable => self.album_table_scroll_handle.clone(),
             BrowseScrollbarTarget::PlaybackHistory => self.playback_history_scroll_handle.clone(),
+            BrowseScrollbarTarget::Liked => self.liked_scroll_handle.clone(),
         }
     }
 
@@ -919,6 +920,7 @@ impl TempoApp {
             BrowseScrollbarTarget::AlbumsGrid => "albums-grid",
             BrowseScrollbarTarget::AlbumsTable => "albums-table",
             BrowseScrollbarTarget::PlaybackHistory => "playback-history",
+            BrowseScrollbarTarget::Liked => "liked",
         }
     }
 

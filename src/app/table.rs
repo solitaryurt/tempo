@@ -1,5 +1,26 @@
 use super::*;
+use std::sync::OnceLock;
 use std::time::Instant;
+
+/// Identifies which heart-icon SVG variant we want from the cache. The
+/// liked column renders the outline variant on hover (in the theme
+/// accent color) and the filled variant when a track is liked (in
+/// `colors.liked`). Idle unliked cells skip both and render nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum LikedIconState {
+    Outline,
+    Filled,
+}
+
+/// Process-wide cache of rasterized heart icons keyed by `(state, color)`
+/// so every (state, theme) combination is encoded once and re-used by
+/// every table row that wants the same SVG bytes. Mirrors the sidebar
+/// nav-icon cache pattern.
+type LikedIconCacheKey = (LikedIconState, u32);
+fn liked_icon_cache() -> &'static Mutex<HashMap<LikedIconCacheKey, Arc<Image>>> {
+    static CACHE: OnceLock<Mutex<HashMap<LikedIconCacheKey, Arc<Image>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 const AUTOSIZE_TEXT_PADDING: f32 = 20.0;
 const AUTOSIZE_TEXT_CHAR_W: f32 = 7.2;
@@ -40,7 +61,7 @@ impl TempoApp {
             TableColumn::DateAdded => self.column_widths.date_added,
             TableColumn::Plays => self.column_widths.plays,
             TableColumn::Duration => self.column_widths.duration,
-            TableColumn::Loved => self.column_widths.loved,
+            TableColumn::Liked => self.column_widths.liked,
         }
     }
 
@@ -115,7 +136,7 @@ impl TempoApp {
             TableColumn::DateAdded => self.column_widths.date_added = width,
             TableColumn::Plays => self.column_widths.plays = width,
             TableColumn::Duration => self.column_widths.duration = width,
-            TableColumn::Loved => self.column_widths.loved = width,
+            TableColumn::Liked => self.column_widths.liked = width,
         }
 
         self.clamp_table_horizontal_scroll();
@@ -251,7 +272,7 @@ impl TempoApp {
 
     fn min_track_column_width(column: TableColumn) -> f32 {
         match column {
-            TableColumn::Index | TableColumn::Artwork | TableColumn::Loved => 24.0,
+            TableColumn::Index | TableColumn::Artwork | TableColumn::Liked => 24.0,
             TableColumn::Format => 44.0,
             TableColumn::TrackNumber | TableColumn::Plays | TableColumn::Duration => 52.0,
             TableColumn::Bitrate | TableColumn::FileSize | TableColumn::Year => 60.0,
@@ -366,7 +387,7 @@ impl TempoApp {
     pub(super) fn autosize_table_column_width(&self, column: TableColumn) -> f32 {
         let start = Instant::now();
         match column {
-            TableColumn::Artwork | TableColumn::Loved => return AUTOSIZE_ICON_COL_W,
+            TableColumn::Artwork | TableColumn::Liked => return AUTOSIZE_ICON_COL_W,
             _ => {}
         }
 
@@ -406,7 +427,7 @@ impl TempoApp {
         // of a column resizer.
         match column {
             TableColumn::Index => format!("{:02}", track_ix + 1),
-            TableColumn::Artwork | TableColumn::Loved => String::new(),
+            TableColumn::Artwork | TableColumn::Liked => String::new(),
             TableColumn::Title => track.title.to_string(),
             TableColumn::Artist => track.artist.to_string(),
             TableColumn::Album => track.album.to_string(),
@@ -514,11 +535,38 @@ impl TempoApp {
         if sanitized == old_default_visible_table_columns() {
             sanitized.insert(5, TableColumn::Genre);
         }
+        // Users on the previous default layout (post-Genre, pre-Liked)
+        // get the new Liked column auto-inserted right after `#`. This
+        // keeps the new default in sync without overriding any layout
+        // that was customised in a non-default way.
+        if sanitized == previous_default_visible_table_columns() {
+            sanitized.insert(1, TableColumn::Liked);
+        }
         if sanitized.is_empty() {
             default_visible_table_columns()
         } else {
             sanitized
         }
+    }
+
+    /// One-shot startup migration: any saved layout that had the
+    /// (formerly inert) `Liked` / `Loved` column appended at the end
+    /// gets it relocated to the new default slot right after `#`. We
+    /// only run this on the layout loaded from disk, NOT inside
+    /// `sanitize_visible_columns`, because sanitization runs on every
+    /// toggle and we don't want to clobber a deliberate
+    /// drag-to-end placement.
+    pub(super) fn migrate_legacy_liked_position(columns: &mut Vec<TableColumn>) {
+        if columns.last() != Some(&TableColumn::Liked) || columns.len() < 2 {
+            return;
+        }
+        columns.pop();
+        let insert_ix = columns
+            .iter()
+            .position(|column| *column == TableColumn::Index)
+            .map(|ix| ix + 1)
+            .unwrap_or(0);
+        columns.insert(insert_ix, TableColumn::Liked);
     }
 
     pub(super) fn show_column_menu(&mut self, event: &MouseDownEvent) {
@@ -1158,7 +1206,7 @@ impl TempoApp {
                     .min_h_0()
                     .relative()
                     .when(self.table_scrollbar_drag.is_some(), |this| {
-                        this.child(self.render_fast_scroll_rows(is_playing))
+                        this.child(self.render_fast_scroll_rows(is_playing, cx))
                     })
                     .when(self.table_scrollbar_drag.is_none(), |this| {
                         this.child(
@@ -1271,7 +1319,11 @@ impl TempoApp {
             })
     }
 
-    pub(super) fn render_fast_scroll_rows(&self, is_playing: bool) -> AnyElement {
+    pub(super) fn render_fast_scroll_rows(
+        &self,
+        is_playing: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(metrics) = self.table_scrollbar_metrics() else {
             return div().size_full().into_any_element();
         };
@@ -1292,7 +1344,13 @@ impl TempoApp {
                 let row_ix = start_row + visible_ix;
                 let track_ix = *indices.get(row_ix)?;
                 let top = first_row_top + visible_ix as f32 * TABLE_ROW_H;
-                Some(self.render_fast_track_row(top, track_ix, &self.tracks[track_ix], is_playing))
+                Some(self.render_fast_track_row(
+                    top,
+                    track_ix,
+                    &self.tracks[track_ix],
+                    is_playing,
+                    cx,
+                ))
             })
             .collect::<Vec<_>>();
 
@@ -1314,6 +1372,7 @@ impl TempoApp {
         track_ix: usize,
         track: &Track,
         is_playing: bool,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let active = track_ix == self.playing_track;
         let selected = track_ix == self.active_selected_track();
@@ -1345,7 +1404,7 @@ impl TempoApp {
                     .ml(px(-self.current_table_horizontal_scroll()))
                     .w(px(self.table_render_width()))
                     .children(self.visible_columns.iter().copied().map(|column| {
-                        self.track_cell(column, track_ix, track, active, is_playing, true)
+                        self.track_cell(column, track_ix, track, active, is_playing, true, cx)
                     })),
             )
             .into_any_element()
@@ -1684,6 +1743,23 @@ impl TempoApp {
         let icon = Self::header_sort_icon(column, tab.sort_column, tab.sort_direction);
         let id = SharedString::from(format!("column-{}", Self::column_key(column)));
 
+        // The Liked column has no text label (the column itself is a
+        // 24px gutter, too narrow for "LIKED"), so we render a small
+        // outlined heart icon instead. This also gives the drag handle
+        // something visible to grab onto in the header.
+        let label_child: AnyElement = if column == TableColumn::Liked {
+            img(Self::liked_icon_image(
+                LikedIconState::Outline,
+                colors.text_faint,
+            ))
+            .w(px(11.0))
+            .h(px(11.0))
+            .flex_none()
+            .into_any_element()
+        } else {
+            div().child(label).into_any_element()
+        };
+
         div()
             .id(id)
             .relative()
@@ -1697,11 +1773,14 @@ impl TempoApp {
             } else {
                 colors.text_faint
             }))
+            // Center the heart icon in the narrow Liked-column header
+            // so it lines up with the cells below.
+            .when(column == TableColumn::Liked, |this| this.justify_center())
             .when(sort_column.is_some(), |this| {
                 this.cursor_pointer()
                     .hover(move |this| this.text_color(rgb(colors.text)))
             })
-            .child(label)
+            .child(label_child)
             .when(active, |this| this.child(icon))
             .when_some(sort_column, |this, sort_column| {
                 this.on_click(cx.listener(move |this, _, _, cx| {
@@ -1908,7 +1987,15 @@ impl TempoApp {
                     .ml(px(-self.current_table_horizontal_scroll()))
                     .w(px(self.table_render_width()))
                     .children(self.visible_columns.iter().copied().map(|column| {
-                        self.track_cell(column, track_ix, track, active, is_playing, lightweight)
+                        self.track_cell(
+                            column,
+                            track_ix,
+                            track,
+                            active,
+                            is_playing,
+                            lightweight,
+                            cx,
+                        )
                     })),
             )
     }
@@ -1930,6 +2017,7 @@ impl TempoApp {
         active: bool,
         is_playing: bool,
         lightweight: bool,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
         let width = self.table_column_render_width(column);
@@ -1992,12 +2080,144 @@ impl TempoApp {
                 .into_any_element(),
             TableColumn::Plays => self.cell(track.plays.to_string(), width).into_any_element(),
             TableColumn::Duration => self.cell(track.duration.clone(), width).into_any_element(),
-            TableColumn::Loved => div()
-                .w(px(width))
-                .text_color(rgb(colors.love))
-                .child(if track.loved { "♥" } else { "" })
+            TableColumn::Liked => self
+                .liked_cell(track_ix, track, width, lightweight, cx)
                 .into_any_element(),
         }
+    }
+
+    /// Heart cell for the Liked column. Renders one of three states:
+    ///
+    /// - **Liked**: a filled red (`colors.liked`) heart, always visible.
+    /// - **Unliked, idle**: nothing visible (the cell is a thin gutter
+    ///   so the column doesn't visually compete with the title beside
+    ///   it).
+    /// - **Unliked, hovered**: an outlined heart in the theme accent
+    ///   color. The hover affordance is what makes the column
+    ///   discoverable.
+    ///
+    /// Clicking toggles the liked state and persists to the catalog.
+    /// Click handlers stop propagation so the row underneath does not
+    /// also re-select / play the track.
+    ///
+    /// `lightweight=true` (used by the queue overlay etc) renders a
+    /// static, non-interactive heart so we don't allocate listeners
+    /// for rows that aren't part of the main table.
+    pub(super) fn liked_cell(
+        &self,
+        track_ix: usize,
+        track: &Track,
+        width: f32,
+        lightweight: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let liked = track.liked;
+        let hovered = self.hovered_liked_track == Some(track_ix);
+        let id = SharedString::from(format!("liked-cell-{track_ix}"));
+
+        // Pick the SVG variant up front so we don't pay the rasterize
+        // cost more than once per (state, color) pair across the whole
+        // table. The cache is keyed on these two values so theme
+        // switches and state toggles share rasterized bytes.
+        let icon: Option<Arc<Image>> = if liked {
+            // Liked rows always render the filled red heart, even on
+            // hover, so clicking again to unlike doesn't flicker the
+            // glyph mid-click.
+            Some(Self::liked_icon_image(LikedIconState::Filled, colors.liked))
+        } else if hovered {
+            Some(Self::liked_icon_image(
+                LikedIconState::Outline,
+                colors.accent,
+            ))
+        } else {
+            // Unliked + not hovered: keep the cell empty (just a hit
+            // target). Avoiding the `img(...)` element keeps cold table
+            // builds cheap.
+            None
+        };
+
+        let cell = div()
+            .id(id)
+            .w(px(width))
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .when_some(icon, |this, image| {
+                this.child(img(image).w(px(14.0)).h(px(14.0)).flex_none())
+            });
+
+        if lightweight {
+            return cell.into_any_element();
+        }
+
+        // Hover toggles `hovered_liked_track`, which causes a single
+        // re-render of the table; the previously hovered row reverts
+        // to its idle state on the same frame the new row picks up
+        // the accent stroke.
+        cell.cursor_pointer()
+            .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                if *hovered {
+                    if this.hovered_liked_track != Some(track_ix) {
+                        this.hovered_liked_track = Some(track_ix);
+                        cx.notify();
+                    }
+                } else if this.hovered_liked_track == Some(track_ix) {
+                    this.hovered_liked_track = None;
+                    cx.notify();
+                }
+            }))
+            // We use `on_mouse_down` (not `on_click`) so the row's own
+            // `on_click` (select / play) doesn't also fire when the
+            // user clicks the heart. `cx.stop_propagation()` keeps the
+            // mouse-down from bubbling, and we toggle on the press
+            // edge -- matching the snappier feel of native heart
+            // toggles in iOS Music / Spotify.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
+                    this.toggle_liked(track_ix);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// Build (or look up) the rasterized heart icon SVG for the given
+    /// state + color. The cache lives for the process lifetime; theme
+    /// switches just add a few extra entries (one per theme accent +
+    /// liked color), and the cache itself is a `Mutex<HashMap>` so
+    /// multiple table rows sharing the same key all return the same
+    /// `Arc<Image>`.
+    fn liked_icon_image(state: LikedIconState, color: u32) -> Arc<Image> {
+        let cache_key = (state, color);
+        if let Ok(cache) = liked_icon_cache().lock()
+            && let Some(image) = cache.get(&cache_key)
+        {
+            return Arc::clone(image);
+        }
+
+        let hex = format!("#{:06x}", color);
+        let svg = match state {
+            // Outline heart: 1.7px stroke, no fill, `linejoin=round`
+            // matches the visual weight of the sidebar nav icons.
+            LikedIconState::Outline => format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path d="M12 19.3L4.9 12.4C3 10.5 3 7.5 4.9 5.6C6.8 3.7 9.8 3.7 11.7 5.6L12 5.9L12.3 5.6C14.2 3.7 17.2 3.7 19.1 5.6C21 7.5 21 10.5 19.1 12.4L12 19.3Z" fill="none" stroke="{hex}" stroke-width="1.7" stroke-linejoin="round"/></svg>"#
+            ),
+            // Filled heart: same path, fill in the liked color, plus a
+            // matching-color stroke to keep edges crisp at small sizes.
+            LikedIconState::Filled => format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path d="M12 19.3L4.9 12.4C3 10.5 3 7.5 4.9 5.6C6.8 3.7 9.8 3.7 11.7 5.6L12 5.9L12.3 5.6C14.2 3.7 17.2 3.7 19.1 5.6C21 7.5 21 10.5 19.1 12.4L12 19.3Z" fill="{hex}" stroke="{hex}" stroke-width="1.2" stroke-linejoin="round"/></svg>"#
+            ),
+        };
+
+        let image = Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes()));
+        if let Ok(mut cache) = liked_icon_cache().lock() {
+            cache.insert(cache_key, Arc::clone(&image));
+        }
+        image
     }
 
     pub(super) fn render_column_menu(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -2079,14 +2299,14 @@ impl TempoApp {
             TableColumn::DateAdded => "ADDED",
             TableColumn::Plays => "PLAYS",
             TableColumn::Duration => "TIME",
-            TableColumn::Loved => "",
+            TableColumn::Liked => "",
         }
     }
 
     pub(super) fn column_menu_label(column: TableColumn) -> &'static str {
         match column {
             TableColumn::Artwork => "Artwork",
-            TableColumn::Loved => "Loved",
+            TableColumn::Liked => "Liked",
             _ => Self::column_label(column),
         }
     }
@@ -2107,7 +2327,7 @@ impl TempoApp {
             TableColumn::DateAdded => "date-added",
             TableColumn::Plays => "plays",
             TableColumn::Duration => "duration",
-            TableColumn::Loved => "loved",
+            TableColumn::Liked => "liked",
         }
     }
 
@@ -2145,7 +2365,7 @@ impl TempoApp {
             TableColumn::DateAdded => Some(SortColumn::DateAdded),
             TableColumn::Plays => Some(SortColumn::Plays),
             TableColumn::Duration => Some(SortColumn::Duration),
-            TableColumn::Artwork | TableColumn::Loved => None,
+            TableColumn::Artwork | TableColumn::Liked => None,
         }
     }
 

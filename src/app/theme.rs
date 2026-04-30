@@ -47,7 +47,10 @@ pub(super) struct ThemeColors {
     pub(super) transport_primary_bg: u32,
     pub(super) transport_primary_fg: u32,
     pub(super) album_tile_text: u32,
-    pub(super) love: u32,
+    /// Filled-heart accent for the Liked column / Liked page. Always
+    /// reads as a "liked" red regardless of the theme accent so the
+    /// affordance stays unambiguous across light/dark themes.
+    pub(super) liked: u32,
 }
 
 #[derive(Deserialize)]
@@ -95,7 +98,10 @@ struct RawThemeColors {
     transport_primary_bg: String,
     transport_primary_fg: String,
     album_tile_text: String,
-    love: String,
+    // Renamed from `love` -> `liked`. Old theme YAMLs that still ship
+    // `love:` keep working via the serde alias.
+    #[serde(alias = "love")]
+    liked: String,
 }
 
 impl Theme {
@@ -151,7 +157,7 @@ impl Theme {
                 transport_primary_bg: 0xe7e7ea,
                 transport_primary_fg: 0x111216,
                 album_tile_text: 0xf4f0ea,
-                love: 0xf0b282,
+                liked: 0xe25563,
             },
         }
     }
@@ -197,7 +203,7 @@ impl TryFrom<RawThemeColors> for ThemeColors {
             transport_primary_bg: parse_color(&colors.transport_primary_bg)?,
             transport_primary_fg: parse_color(&colors.transport_primary_fg)?,
             album_tile_text: parse_color(&colors.album_tile_text)?,
-            love: parse_color(&colors.love)?,
+            liked: parse_color(&colors.liked)?,
         })
     }
 }

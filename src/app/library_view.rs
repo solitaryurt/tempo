@@ -16,6 +16,7 @@ impl TempoApp {
                 .into_any_element(),
             Page::Artists => self.render_artists_page(window, cx).into_any_element(),
             Page::Albums => self.render_albums_page(window, cx).into_any_element(),
+            Page::Liked => self.render_liked_page(cx).into_any_element(),
             Page::PlaybackHistory => self.render_playback_history_page(cx).into_any_element(),
             Page::ScanErrors => self.render_scan_errors_page(cx).into_any_element(),
             Page::Settings => self.render_settings(cx).into_any_element(),
@@ -762,6 +763,33 @@ impl TempoApp {
             format!("{:.1} MB", bytes as f64 / 1_000_000.0)
         } else {
             format!("{} KB", bytes / 1_000)
+        }
+    }
+
+    /// Compact integer formatter for sidebar counts and similar UI
+    /// labels: `1234` -> `1.2K`, `1_500_000` -> `1.5M`, `2_000_000_000`
+    /// -> `2.0B`. Counts under 1000 are printed as-is so small
+    /// libraries don't get the "1K" treatment.
+    ///
+    /// The split between 4-digit and 5+digit thousands keeps "1.2K"
+    /// for 1234 but `12K` for 12345 -- one decimal place buys you
+    /// resolution where it matters and reads as noise once the
+    /// integer part has two digits.
+    pub(super) fn format_count_short(count: usize) -> String {
+        const K: f64 = 1_000.0;
+        const M: f64 = 1_000_000.0;
+        const B: f64 = 1_000_000_000.0;
+        let count_f = count as f64;
+        if count_f >= B {
+            format!("{:.1}B", count_f / B)
+        } else if count_f >= M {
+            format!("{:.1}M", count_f / M)
+        } else if count >= 10_000 {
+            format!("{:.0}K", count_f / K)
+        } else if count >= 1_000 {
+            format!("{:.1}K", count_f / K)
+        } else {
+            count.to_string()
         }
     }
 }

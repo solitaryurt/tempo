@@ -307,7 +307,7 @@ impl TempoApp {
                     .into_any_element(),
             )
             .children(self.visible_columns.iter().copied().map(|column| {
-                self.history_column_cell(column, track_ix, entry, active, is_playing)
+                self.history_column_cell(column, track_ix, entry, active, is_playing, cx)
             }))
     }
 
@@ -344,11 +344,12 @@ impl TempoApp {
         entry: &PlaybackHistoryEntry,
         active: bool,
         is_playing: bool,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         if let Some((track_ix, track)) =
             track_ix.and_then(|track_ix| self.tracks.get(track_ix).map(|track| (track_ix, track)))
         {
-            return self.track_cell(column, track_ix, track, active, is_playing, false);
+            return self.track_cell(column, track_ix, track, active, is_playing, false, cx);
         }
 
         self.history_snapshot_cell(column, entry, active)
@@ -409,7 +410,7 @@ impl TempoApp {
             | TableColumn::Year
             | TableColumn::DateAdded
             | TableColumn::Plays
-            | TableColumn::Loved => self.cell("", width).into_any_element(),
+            | TableColumn::Liked => self.cell("", width).into_any_element(),
         }
     }
 

@@ -50,7 +50,10 @@ impl TempoApp {
                             .text_color(rgb(colors.text_faint))
                             .flex()
                             .justify_between()
-                            .child(format!("{} tracks", self.tracks.len()))
+                            .child(format!(
+                                "{} tracks",
+                                Self::format_count_short(self.tracks.len())
+                            ))
                             .child(Self::format_library_size_bytes(self.library_size_bytes)),
                     ),
             )
@@ -122,28 +125,35 @@ impl TempoApp {
             .child(self.nav_group_title("LIBRARY"))
             .child(self.render_nav_item(
                 "All Music",
-                self.tracks.len().to_string(),
+                Self::format_count_short(self.tracks.len()),
                 self.page == Page::Library && self.active_tab().source == TabSource::Library,
                 Page::Library,
                 cx,
             ))
             .child(self.render_nav_item(
                 "Artists",
-                self.artists.len().to_string(),
+                Self::format_count_short(self.artists.len()),
                 self.page == Page::Artists,
                 Page::Artists,
                 cx,
             ))
             .child(self.render_nav_item(
                 "Albums",
-                self.albums.len().to_string(),
+                Self::format_count_short(self.albums.len()),
                 self.page == Page::Albums,
                 Page::Albums,
                 cx,
             ))
             .child(self.render_nav_item(
+                "Liked",
+                Self::format_count_short(self.liked_track_count()),
+                self.page == Page::Liked,
+                Page::Liked,
+                cx,
+            ))
+            .child(self.render_nav_item(
                 "History",
-                self.playback_history.len().to_string(),
+                Self::format_count_short(self.playback_history.len()),
                 self.page == Page::PlaybackHistory,
                 Page::PlaybackHistory,
                 cx,
@@ -151,7 +161,7 @@ impl TempoApp {
             .when(self.scan_progress.errors > 0, |this| {
                 this.child(self.render_nav_item(
                     "Scan Errors",
-                    self.scan_progress.errors.to_string(),
+                    Self::format_count_short(self.scan_progress.errors),
                     self.page == Page::ScanErrors,
                     Page::ScanErrors,
                     cx,
@@ -260,7 +270,7 @@ impl TempoApp {
         let count_child: AnyElement = div()
             .text_xs()
             .text_color(rgb(colors.text_faint))
-            .child(playlist.track_paths.len().to_string())
+            .child(Self::format_count_short(playlist.track_paths.len()))
             .into_any_element();
 
         let row = row.child(label_child).child(count_child);
@@ -493,6 +503,9 @@ impl TempoApp {
 <circle cx="12" cy="12" r="4.1" fill="none" stroke="{color}" stroke-width="1.6"/>
 <circle cx="12" cy="12" r="1.1" fill="{accent_stroke}"/>
 <path d="M15.1 8.9L17.1 6.9" fill="none" stroke="{accent_stroke}" stroke-width="1.5" stroke-linecap="round"/>"#
+            ),
+            Page::Liked => format!(
+                r#"<path d="M12 19.3L4.9 12.4C3 10.5 3 7.5 4.9 5.6C6.8 3.7 9.8 3.7 11.7 5.6L12 5.9L12.3 5.6C14.2 3.7 17.2 3.7 19.1 5.6C21 7.5 21 10.5 19.1 12.4L12 19.3Z" fill="none" stroke="{accent_stroke}" stroke-width="1.7" stroke-linejoin="round"/>"#
             ),
             Page::PlaybackHistory => format!(
                 r#"<circle cx="12" cy="12" r="7.6" fill="none" stroke="{color}" stroke-width="1.6"/>

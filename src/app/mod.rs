@@ -37,6 +37,7 @@ mod browse_grids;
 mod history;
 mod library_state;
 mod library_view;
+mod liked;
 mod menu;
 mod player;
 mod search;
@@ -73,6 +74,7 @@ enum Page {
     Library,
     Artists,
     Albums,
+    Liked,
     PlaybackHistory,
     ScanErrors,
     Settings,
@@ -118,7 +120,11 @@ enum TableColumn {
     DateAdded,
     Plays,
     Duration,
-    Loved,
+    // Renamed from `Loved` -> `Liked` (terminology + behavior). Old saved
+    // state from before the rename still deserializes via the serde
+    // alias so users don't lose their column layout.
+    #[serde(alias = "Loved")]
+    Liked,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,7 +184,7 @@ struct ColumnWidths {
     date_added: f32,
     plays: f32,
     duration: f32,
-    loved: f32,
+    liked: f32,
 }
 
 impl Default for ColumnWidths {
@@ -198,7 +204,7 @@ impl Default for ColumnWidths {
             date_added: DATE_ADDED_COL_W,
             plays: PLAYS_COL_W,
             duration: TIME_COL_W,
-            loved: LOVE_COL_W,
+            liked: LIKED_COL_W,
         }
     }
 }
@@ -323,7 +329,7 @@ struct Track {
     bitrate: Option<u32>,
     file_size: u64,
     plays: u32,
-    loved: bool,
+    liked: bool,
     artwork: Option<TrackArtwork>,
     album_initials: String,
     album_color: u32,
@@ -597,6 +603,7 @@ enum BrowseScrollbarTarget {
     AlbumsGrid,
     AlbumsTable,
     PlaybackHistory,
+    Liked,
 }
 
 #[derive(Clone, Copy)]
@@ -736,6 +743,15 @@ struct AppState {
     playing_track_path: Option<PathBuf>,
     #[serde(default = "default_online_metadata_mode")]
     online_metadata_mode: OnlineMetadataMode,
+    /// One-shot flag tracking whether the Liked-column position
+    /// migration has run on this saved state. The migration moves a
+    /// legacy trailing `Liked` (formerly inert `Loved`) column to the
+    /// new default slot right after `#`. Once we've done it on a
+    /// given state file, we leave the user's layout alone forever
+    /// after -- so dragging Liked back to the end sticks across
+    /// restarts.
+    #[serde(default)]
+    liked_column_migrated: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -777,6 +793,10 @@ impl Default for AppState {
             playback_history: Vec::new(),
             playing_track_path: None,
             online_metadata_mode: default_online_metadata_mode(),
+            // Fresh app state already builds the right default layout,
+            // so the migration is a no-op. Mark it done so we don't
+            // re-run it spuriously on the second launch.
+            liked_column_migrated: true,
         }
     }
 }
@@ -808,6 +828,7 @@ fn default_volume() -> f32 {
 fn default_visible_table_columns() -> Vec<TableColumn> {
     vec![
         TableColumn::Index,
+        TableColumn::Liked,
         TableColumn::Artwork,
         TableColumn::Title,
         TableColumn::Artist,
@@ -869,6 +890,27 @@ fn old_default_visible_table_columns() -> Vec<TableColumn> {
     ]
 }
 
+/// Default visible columns for the layout that shipped between the
+/// Genre addition and the Liked column. Used by `sanitize_visible_columns`
+/// to detect users on that exact default and migrate them forward
+/// without disturbing customised layouts.
+fn previous_default_visible_table_columns() -> Vec<TableColumn> {
+    vec![
+        TableColumn::Index,
+        TableColumn::Artwork,
+        TableColumn::Title,
+        TableColumn::Artist,
+        TableColumn::Album,
+        TableColumn::Genre,
+        TableColumn::TrackNumber,
+        TableColumn::Bitrate,
+        TableColumn::FileSize,
+        TableColumn::Year,
+        TableColumn::DateAdded,
+        TableColumn::Duration,
+    ]
+}
+
 const ALL_TABLE_COLUMNS: &[TableColumn] = &[
     TableColumn::Index,
     TableColumn::Artwork,
@@ -884,7 +926,7 @@ const ALL_TABLE_COLUMNS: &[TableColumn] = &[
     TableColumn::DateAdded,
     TableColumn::Plays,
     TableColumn::Duration,
-    TableColumn::Loved,
+    TableColumn::Liked,
 ];
 
 const INDEX_COL_W: f32 = 34.0;
@@ -901,7 +943,7 @@ const YEAR_COL_W: f32 = 72.0;
 const DATE_ADDED_COL_W: f32 = 96.0;
 const PLAYS_COL_W: f32 = 82.0;
 const TIME_COL_W: f32 = 64.0;
-const LOVE_COL_W: f32 = 24.0;
+const LIKED_COL_W: f32 = 24.0;
 const TABLE_ROW_H: f32 = 32.0;
 const LEFT_SIDEBAR_W: f32 = 220.0;
 const RIGHT_SIDEBAR_W: f32 = 300.0;
@@ -966,6 +1008,13 @@ pub(crate) struct TempoApp {
     playing_track: usize,
     context_menu_track: Option<usize>,
     context_menu_position: Point<Pixels>,
+    /// Index of the track whose Liked-column heart cell is currently
+    /// hovered. Stored on the app so the cell renderer can swap the
+    /// outline-heart icon for the accent-stroke variant on hover. Kept
+    /// outside the per-track state because only one cell is hovered at
+    /// a time and we want the previously hovered cell to repaint
+    /// without iterating the table.
+    hovered_liked_track: Option<usize>,
     /// Right-click context menu state for sidebar playlist nav items.
     /// `None` means no menu is open. The position is the mouse-down
     /// location at the moment of the right-click; the menu anchors there.
@@ -1036,6 +1085,7 @@ pub(crate) struct TempoApp {
     album_table_scroll_handle: UniformListScrollHandle,
     scan_errors_scroll_handle: UniformListScrollHandle,
     playback_history_scroll_handle: UniformListScrollHandle,
+    liked_scroll_handle: UniformListScrollHandle,
     table_is_scrolling: bool,
     table_scroll_generation: u64,
     catalog: Option<CatalogStore>,
@@ -1136,7 +1186,16 @@ impl TempoApp {
         }
         let playlists = state.playlists;
         let volume = state.volume.clamp(0.0, 1.0);
-        let visible_columns = Self::sanitize_visible_columns(state.visible_table_columns);
+        let mut visible_columns = Self::sanitize_visible_columns(state.visible_table_columns);
+        // One-shot migration: relocate the formerly inert `Liked`
+        // column from the trailing position into the new default slot
+        // right after `#`. Gated on a saved-state flag so subsequent
+        // user-driven drags-to-end persist across restarts; once the
+        // migration has run on a state file we never touch the
+        // ordering again.
+        if !state.liked_column_migrated {
+            Self::migrate_legacy_liked_position(&mut visible_columns);
+        }
         // Resolve the active theme's colors once up front so we can
         // hand them to `PlayerEntity::new` (which renders entirely
         // from its own state, including theme colors).
@@ -1276,6 +1335,7 @@ impl TempoApp {
             playing_track: initial_playing_track,
             context_menu_track: None,
             context_menu_position: Point::default(),
+            hovered_liked_track: None,
             playlist_context_menu: None,
             playlist_rename: None,
             playlist_rename_focus_handle: None,
@@ -1314,6 +1374,7 @@ impl TempoApp {
             album_table_scroll_handle: UniformListScrollHandle::new(),
             scan_errors_scroll_handle: UniformListScrollHandle::new(),
             playback_history_scroll_handle: UniformListScrollHandle::new(),
+            liked_scroll_handle: UniformListScrollHandle::new(),
             table_is_scrolling: false,
             table_scroll_generation: 0,
             catalog,
@@ -1492,6 +1553,40 @@ impl TempoApp {
         });
         self.invalidate_track_indices();
         self.save_app_state();
+    }
+
+    /// Number of tracks currently flagged as liked. Powers the count
+    /// shown next to the "Liked" sidebar entry. O(N) over the in-memory
+    /// track list -- fine because the sidebar re-renders only on state
+    /// changes, not per frame.
+    pub(super) fn liked_track_count(&self) -> usize {
+        self.tracks.iter().filter(|track| track.liked).count()
+    }
+
+    /// Toggle the liked flag for the track at `track_ix`. Updates the
+    /// in-memory `Track::liked` immediately for snappy UI feedback,
+    /// then persists to the catalog so the state survives restarts.
+    /// Catalog persistence failures are swallowed -- the in-memory
+    /// state is still authoritative for this session, and the catalog
+    /// will reconverge the next time `set_liked` succeeds.
+    pub(super) fn toggle_liked(&mut self, track_ix: usize) {
+        let Some(track) = self.tracks.get_mut(track_ix) else {
+            return;
+        };
+        let new_value = !track.liked;
+        track.liked = new_value;
+        let path = track.path.clone();
+
+        if let Some(catalog) = self.catalog.as_ref()
+            && let Err(error) = catalog.set_liked(&path, new_value)
+        {
+            // Best-effort persistence; log via perf event so the
+            // failure is observable without hard-failing the UI.
+            perf::event(
+                "tempo.toggle_liked.persist_failed",
+                format!("path={} error={error}", path.display()),
+            );
+        }
     }
 
     fn add_track_to_playlist(&mut self, track_ix: usize, playlist_ix: usize) {
@@ -1803,7 +1898,7 @@ impl TempoApp {
 
     fn resolved_page_for_roots(page: Page, library_roots: &[PathBuf]) -> Page {
         match page {
-            Page::Library | Page::Artists | Page::Albums | Page::ScanErrors
+            Page::Library | Page::Artists | Page::Albums | Page::Liked | Page::ScanErrors
                 if library_roots.is_empty() =>
             {
                 Page::Settings
@@ -2368,7 +2463,7 @@ impl From<tempo::library::Track> for Track {
             bitrate: track.bitrate,
             file_size: track.file_size,
             plays: 0,
-            loved: false,
+            liked: false,
             artwork: track.artwork.and_then(TrackArtwork::from_library),
             album_initials,
             album_color,
@@ -2410,7 +2505,7 @@ impl From<CatalogTrack> for Track {
             bitrate: track.bitrate,
             file_size: track.file_size,
             plays: track.play_count,
-            loved: false,
+            liked: track.liked,
             artwork: track.artwork_path.map(TrackArtwork::File),
             album_initials,
             album_color,
@@ -2717,6 +2812,7 @@ impl TempoApp {
             Page::Library => "library",
             Page::Artists => "artists",
             Page::Albums => "albums",
+            Page::Liked => "liked",
             Page::PlaybackHistory => "playback_history",
             Page::ScanErrors => "scan_errors",
             Page::Settings => "settings",

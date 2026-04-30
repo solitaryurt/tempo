@@ -180,6 +180,11 @@ impl TempoApp {
                 .tracks
                 .get(self.playing_track)
                 .map(|track| track.path.clone()),
+            // Always serialize as `true` after the app has booted -- the
+            // startup path runs the migration before constructing
+            // `TempoApp`, so by the time we're saving, the layout is
+            // already in its post-migration form.
+            liked_column_migrated: true,
         }
     }
 
@@ -639,39 +644,55 @@ impl TempoApp {
             return (Vec::new(), Vec::new(), Vec::new());
         };
 
+        // Helper that runs each catalog query, logs any error loudly,
+        // and falls back to an empty Vec. Logging here is the only
+        // breadcrumb the user has when a SQL-side breakage (e.g. a
+        // missing column from a half-applied migration) silently
+        // empties the browse pages and triggers a full rescan -- before
+        // this, every catalog error was swallowed by `unwrap_or_default`
+        // with no surface signal at all.
+        fn run_load<T>(
+            label: &'static str,
+            roots: &[PathBuf],
+            f: impl FnOnce() -> anyhow::Result<Vec<T>>,
+        ) -> Vec<T> {
+            perf::time(label, format!("roots={}", roots.len()), || match f() {
+                Ok(values) => values,
+                Err(error) => {
+                    perf::event(&format!("{label}.failed"), format!("error={error:#}"));
+                    eprintln!("[tempo] {label} failed: {error:#}");
+                    Vec::new()
+                }
+            })
+        }
+
         let parallel_span = perf::span("startup.cached_parallel", format!("roots={}", roots.len()));
         std::thread::scope(|scope| {
             let tracks_handle = {
                 let catalog = catalog.clone();
                 let roots = roots.to_vec();
                 scope.spawn(move || {
-                    perf::time(
-                        "startup.cached_tracks",
-                        format!("roots={}", roots.len()),
-                        || Self::load_cached_tracks(Some(&catalog), &roots).unwrap_or_default(),
-                    )
+                    run_load("startup.cached_tracks", &roots, || {
+                        Self::load_cached_tracks(Some(&catalog), &roots)
+                    })
                 })
             };
             let artists_handle = {
                 let catalog = catalog.clone();
                 let roots = roots.to_vec();
                 scope.spawn(move || {
-                    perf::time(
-                        "startup.cached_artists",
-                        format!("roots={}", roots.len()),
-                        || Self::load_cached_artists(Some(&catalog), &roots).unwrap_or_default(),
-                    )
+                    run_load("startup.cached_artists", &roots, || {
+                        Self::load_cached_artists(Some(&catalog), &roots)
+                    })
                 })
             };
             let albums_handle = {
                 let catalog = catalog.clone();
                 let roots = roots.to_vec();
                 scope.spawn(move || {
-                    perf::time(
-                        "startup.cached_albums",
-                        format!("roots={}", roots.len()),
-                        || Self::load_cached_albums(Some(&catalog), &roots).unwrap_or_default(),
-                    )
+                    run_load("startup.cached_albums", &roots, || {
+                        Self::load_cached_albums(Some(&catalog), &roots)
+                    })
                 })
             };
 
