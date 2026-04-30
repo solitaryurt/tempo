@@ -2336,6 +2336,7 @@ impl TempoApp {
                             this.context_menu_track = Some(track_ix);
                             this.column_menu_open = false;
                             this.context_menu_position = event.position;
+                            cx.stop_propagation();
                             cx.notify();
                         }),
                     )

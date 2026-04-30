@@ -27,8 +27,9 @@ pub(in crate::app) fn menu_at(
         .child(panel)
 }
 
-pub(in crate::app) fn menu_panel(width: f32, colors: ThemeColors) -> gpui::Div {
+pub(in crate::app) fn menu_panel(width: f32, colors: ThemeColors) -> gpui::Stateful<gpui::Div> {
     div()
+        .id("menu-panel")
         .w(px(width))
         .rounded_md()
         .border_1()
@@ -36,6 +37,14 @@ pub(in crate::app) fn menu_panel(width: f32, colors: ThemeColors) -> gpui::Div {
         .bg(rgb(colors.elevated))
         .shadow_lg()
         .overflow_hidden()
+        // Swallow mouse-down inside the panel so app-level dismiss
+        // handlers don't close the menu before its items receive the
+        // click, and so clicks don't leak through to elements behind
+        // the floating panel (e.g. the seekbar).
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+        .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_up(MouseButton::Right, |_, _, cx| cx.stop_propagation())
 }
 
 pub(in crate::app) fn menu_header(

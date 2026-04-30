@@ -273,6 +273,12 @@ impl TempoApp {
 
         if !renaming {
             row = row.cursor_pointer().active(|this| this.opacity(0.82));
+            if !active {
+                row = row.hover(move |this| {
+                    this.bg(rgb(colors.button_hover))
+                        .text_color(rgb(colors.text_strong))
+                });
+            }
         }
 
         let label_child: AnyElement = if renaming {
@@ -459,6 +465,12 @@ impl TempoApp {
             .justify_between()
             .bg(rgb(bg))
             .text_color(rgb(fg))
+            .when(!active, |this| {
+                this.hover(move |this| {
+                    this.bg(rgb(colors.button_hover))
+                        .text_color(rgb(colors.text_strong))
+                })
+            })
             .active(|this| this.opacity(0.82))
             .child(
                 div()
