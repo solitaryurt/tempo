@@ -168,6 +168,8 @@ impl TempoApp {
             visible_album_table_columns: self.visible_album_columns.clone(),
             visible_genre_table_columns: self.visible_genre_columns.clone(),
             page: self.page,
+            left_sidebar_collapsed: self.left_sidebar_collapsed,
+            right_sidebar_collapsed: self.right_sidebar_collapsed,
             tabs: self.saved_tabs(),
             active_tab_id: self.tabs.get(self.active_tab).map(|tab| tab.id),
             artist_view_mode: self.browse_view_mode(),

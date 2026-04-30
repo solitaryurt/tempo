@@ -1053,6 +1053,10 @@ struct AppState {
     #[serde(default = "default_page")]
     page: Page,
     #[serde(default)]
+    left_sidebar_collapsed: bool,
+    #[serde(default)]
+    right_sidebar_collapsed: bool,
+    #[serde(default)]
     tabs: Vec<SavedBrowseTab>,
     #[serde(default)]
     active_tab_id: Option<u64>,
@@ -1145,6 +1149,8 @@ impl Default for AppState {
             visible_album_table_columns: default_visible_album_table_columns(),
             visible_genre_table_columns: default_visible_genre_table_columns(),
             page: default_page(),
+            left_sidebar_collapsed: false,
+            right_sidebar_collapsed: false,
             tabs: Vec::new(),
             active_tab_id: None,
             artist_view_mode: default_browse_view_mode(),
@@ -1920,8 +1926,8 @@ impl TempoApp {
             browse_search_query: String::new(),
             search_debounce_generation: 0,
             page: Self::resolved_page_for_roots(initial_page, &roots),
-            left_sidebar_collapsed: false,
-            right_sidebar_collapsed: false,
+            left_sidebar_collapsed: state.left_sidebar_collapsed,
+            right_sidebar_collapsed: state.right_sidebar_collapsed,
             column_widths: ColumnWidths::default(),
             artist_table_column_widths: ArtistTableColumnWidths::default(),
             album_table_column_widths: AlbumTableColumnWidths::default(),
@@ -2541,7 +2547,9 @@ impl TempoApp {
             return;
         };
 
-        match event.keystroke.key.as_str() {
+        let key = event.keystroke.key.as_str().to_lowercase();
+
+        match key.as_str() {
             "enter" => {
                 self.commit_playlist_rename();
                 cx.stop_propagation();
@@ -2592,7 +2600,7 @@ impl TempoApp {
             }
             _ => {
                 if command && !modifiers.alt && !modifiers.function {
-                    match event.keystroke.key.as_str() {
+                    match key.as_str() {
                         "a" => {
                             rename.input.select_all();
                             cx.stop_propagation();
@@ -3948,6 +3956,16 @@ impl TempoApp {
             return;
         }
 
+        if self
+            .playlist_rename_focus_handle
+            .as_ref()
+            .is_some_and(|focus_handle| focus_handle.is_focused(window))
+        {
+            self.commit_playlist_rename();
+            cx.notify();
+            return;
+        }
+
         if self.tracks.is_empty() {
             return;
         }
@@ -3958,6 +3976,21 @@ impl TempoApp {
 
     fn toggle_pause(&mut self, _: &TogglePause, window: &mut Window, cx: &mut Context<Self>) {
         if self.search_focus_handle.is_focused(window) {
+            self.search_input.insert(" ");
+            self.schedule_current_search_input(cx);
+            cx.notify();
+            return;
+        }
+
+        if self
+            .playlist_rename_focus_handle
+            .as_ref()
+            .is_some_and(|focus_handle| focus_handle.is_focused(window))
+        {
+            if let Some(rename) = self.playlist_rename.as_mut() {
+                rename.input.insert(" ");
+                cx.notify();
+            }
             return;
         }
 

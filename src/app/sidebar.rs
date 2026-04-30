@@ -79,11 +79,17 @@ impl TempoApp {
                     .child("Tempo"),
             )
             .child(
-                self.sidebar_button("‹", "toggle-left-sidebar")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.left_sidebar_collapsed = !this.left_sidebar_collapsed;
-                        cx.notify();
-                    })),
+                self.with_tooltip(
+                    self.sidebar_button("‹", "toggle-left-sidebar")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.left_sidebar_collapsed = !this.left_sidebar_collapsed;
+                            this.save_app_state();
+                            cx.notify();
+                        })),
+                    "toggle-left-sidebar-tooltip",
+                    "Collapse sidebar",
+                    cx,
+                ),
             )
     }
 
@@ -193,11 +199,16 @@ impl TempoApp {
                     .justify_between()
                     .child(self.nav_group_title("PLAYLISTS"))
                     .child(
-                        self.sidebar_button("+", "new-playlist")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.create_playlist();
-                                cx.notify();
-                            })),
+                        self.with_tooltip(
+                            self.sidebar_button("+", "new-playlist")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.create_playlist();
+                                    cx.notify();
+                                })),
+                            "new-playlist-tooltip",
+                            "New playlist",
+                            cx,
+                        ),
                     ),
             )
             .when(self.playlists.is_empty(), |this| {
@@ -675,14 +686,26 @@ impl TempoApp {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(self.sidebar_button("›", "toggle-right-sidebar").on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.right_sidebar_collapsed = !this.right_sidebar_collapsed;
-                                    this.right_sidebar_view_menu_open = false;
-                                    cx.notify();
-                                }),
+                            .child(self.with_tooltip(
+                                self.sidebar_button("›", "toggle-right-sidebar").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.right_sidebar_collapsed =
+                                            !this.right_sidebar_collapsed;
+                                        this.right_sidebar_view_menu_open = false;
+                                        this.save_app_state();
+                                        cx.notify();
+                                    }),
+                                ),
+                                "toggle-right-sidebar-tooltip",
+                                "Collapse queue sidebar",
+                                cx,
                             ))
-                            .child(self.render_right_sidebar_view_trigger(cx)),
+                            .child(self.with_tooltip(
+                                self.render_right_sidebar_view_trigger(cx),
+                                "right-sidebar-view-picker-tooltip",
+                                "Switch sidebar view",
+                                cx,
+                            )),
                     )
                     .child(
                         div()
@@ -698,13 +721,21 @@ impl TempoApp {
                             // Clear-queue button only makes sense in
                             // the Queue view; History has no
                             // user-visible clear action yet.
-                            .when(matches!(view, RightSidebarView::Queue), |this| {
-                                this.child(self.sidebar_button("✕", "clear-queue").on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        this.clear_queue(cx);
-                                    }),
-                                ))
-                            }),
+                            .when(
+                                matches!(view, RightSidebarView::Queue) && !queue_empty,
+                                |this| {
+                                    this.child(self.with_tooltip(
+                                        self.sidebar_button("✕", "clear-queue").on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.clear_queue(cx);
+                                            }),
+                                        ),
+                                        "clear-queue-tooltip",
+                                        "Clear Up Next",
+                                        cx,
+                                    ))
+                                },
+                            ),
                     ),
             )
             .child(body)
@@ -869,7 +900,7 @@ impl TempoApp {
     fn render_right_sidebar_view_trigger(
         &self,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
+    ) -> gpui::Stateful<gpui::Div> {
         let colors = *self.colors();
         let label: SharedString = match self.sanitized_right_sidebar_view() {
             RightSidebarView::Queue => "Up Next".into(),

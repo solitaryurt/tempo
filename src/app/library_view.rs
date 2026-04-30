@@ -546,12 +546,20 @@ impl TempoApp {
                     .items_center()
                     .gap_2()
                     .when(self.left_sidebar_collapsed, |this| {
-                        this.child(self.sidebar_button("›", "open-left-sidebar").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.left_sidebar_collapsed = false;
-                                cx.notify();
-                            }),
-                        ))
+                        this.child(
+                            self.with_tooltip(
+                                self.sidebar_button("›", "open-left-sidebar").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.left_sidebar_collapsed = false;
+                                        this.save_app_state();
+                                        cx.notify();
+                                    }),
+                                ),
+                                "open-left-sidebar-tooltip",
+                                "Show sidebar",
+                                cx,
+                            ),
+                        )
                     })
                     .child(
                         div()
@@ -567,28 +575,48 @@ impl TempoApp {
             .child(div().flex_1())
             .child(self.render_search_box(window, "Search library", cx))
             .child(
-                self.sidebar_button("←", "navigate-back")
-                    .opacity(if self.back_history.is_empty() {
-                        0.4
-                    } else {
-                        1.0
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.navigate_back();
-                        cx.notify();
-                    })),
+                self.with_tooltip(
+                    self.sidebar_button("←", "navigate-back")
+                        .opacity(if self.back_history.is_empty() {
+                            0.4
+                        } else {
+                            1.0
+                        })
+                        .cursor(if self.back_history.is_empty() {
+                            CursorStyle::Arrow
+                        } else {
+                            CursorStyle::PointingHand
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.navigate_back();
+                            cx.notify();
+                        })),
+                    "navigate-back-tooltip",
+                    "Back",
+                    cx,
+                ),
             )
             .child(
-                self.sidebar_button("→", "navigate-forward")
-                    .opacity(if self.forward_history.is_empty() {
-                        0.4
-                    } else {
-                        1.0
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.navigate_forward();
-                        cx.notify();
-                    })),
+                self.with_tooltip(
+                    self.sidebar_button("→", "navigate-forward")
+                        .opacity(if self.forward_history.is_empty() {
+                            0.4
+                        } else {
+                            1.0
+                        })
+                        .cursor(if self.forward_history.is_empty() {
+                            CursorStyle::Arrow
+                        } else {
+                            CursorStyle::PointingHand
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.navigate_forward();
+                            cx.notify();
+                        })),
+                    "navigate-forward-tooltip",
+                    "Forward",
+                    cx,
+                ),
             )
             .child(
                 self.with_tooltip(
@@ -611,12 +639,19 @@ impl TempoApp {
                 // toggle silently disappearing.
                 self.right_sidebar_collapsed,
                 |this| {
-                    this.child(self.sidebar_button("‹", "open-right-sidebar").on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.right_sidebar_collapsed = false;
-                            cx.notify();
-                        }),
-                    ))
+                    this.child(
+                        self.with_tooltip(
+                            self.sidebar_button("‹", "open-right-sidebar")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.right_sidebar_collapsed = false;
+                                    this.save_app_state();
+                                    cx.notify();
+                                })),
+                            "open-right-sidebar-tooltip",
+                            "Show queue sidebar",
+                            cx,
+                        ),
+                    )
                 },
             )
     }

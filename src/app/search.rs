@@ -766,7 +766,7 @@ impl TempoApp {
                 || !self.active_search_query().trim().is_empty())
     }
 
-    fn schedule_current_search_input(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn schedule_current_search_input(&mut self, cx: &mut Context<Self>) {
         let query = self.search_input.text().to_string();
         if self.should_live_filter_active_tab()
             || matches!(self.page, Page::Artists | Page::Albums | Page::Genres)
@@ -845,7 +845,9 @@ impl TempoApp {
         let modifiers = event.keystroke.modifiers;
         let command = modifiers.control || modifiers.platform;
 
-        match event.keystroke.key.as_str() {
+        let key = event.keystroke.key.as_str().to_lowercase();
+
+        match key.as_str() {
             "enter" => {
                 if modifiers.alt || modifiers.function {
                     return;
@@ -920,7 +922,7 @@ impl TempoApp {
             }
             _ => {
                 if command && !modifiers.alt && !modifiers.function {
-                    match event.keystroke.key.as_str() {
+                    match key.as_str() {
                         "a" => {
                             self.search_input.select_all();
                             cx.stop_propagation();
