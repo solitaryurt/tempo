@@ -23,6 +23,7 @@
 //! 3. **No state change, just notify** — modifier-key changes for the
 //!    alt overlay use `cx.notify()` directly on the player.
 
+use super::visualizers::{self, VisualizerContext};
 use super::*;
 use entity::PlayingTrackSnapshot;
 
@@ -77,6 +78,53 @@ impl Render for PlayerEntity {
         } else {
             (playback_position.as_secs_f32() / snapshot.duration_value.as_secs_f32())
                 .clamp(0.0, 1.0)
+        };
+        if self.seekbar_fps_enabled {
+            window.request_animation_frame();
+        }
+        let seekbar_fps = if self.seekbar_fps_enabled {
+            Some(self.sample_seekbar_fps())
+        } else {
+            None
+        };
+
+        // Frequency-reactive visualizers (every variant except
+        // Waveform) need a fresh analyzer frame each repaint. Pull
+        // it once here so the seekbar render path doesn't have to
+        // touch `self.playback`. We always request an animation
+        // frame for these so the visualizer stays smooth between
+        // the 4 Hz playback heartbeat ticks; the precomputed-peaks
+        // waveform already handles its own animation via the
+        // `with_animation` blocks inside `waveform_seekbar`.
+        let visualizer_kind = self.seekbar_visualizer;
+        let analysis_frame = if matches!(visualizer_kind, VisualizerKind::Waveform) {
+            None
+        } else {
+            window.request_animation_frame();
+            Some(
+                self.audio_analyzer()
+                    .map(|a| a.latest_frame())
+                    .unwrap_or_else(|| tempo::audio_analyzer::AnalysisFrame::silent(44_100)),
+            )
+        };
+
+        // Hover-fade for the precomputed-peaks waveform that overlays
+        // a frequency visualizer when the user mouses over the
+        // seekbar. The overlay is invisible at intensity 0 and fully
+        // visible at intensity 1; in between we drive an animation
+        // frame each tick so the fade actually progresses (gpui's
+        // hover listener doesn't request frames on its own).
+        let seekbar_hover_intensity = if matches!(visualizer_kind, VisualizerKind::Waveform) {
+            0.0
+        } else {
+            let intensity = self.sample_seekbar_hover_intensity();
+            // Mid-transition: keep frames flowing so we actually
+            // reach the target. Steady state (0.0 or 1.0): stop.
+            let target: f32 = if self.seekbar_hovered { 1.0 } else { 0.0 };
+            if (intensity - target).abs() > f32::EPSILON {
+                window.request_animation_frame();
+            }
+            intensity
         };
         let now_playing_active_color = colors.accent;
         let show_alternate_now_playing_info = now_playing_info_hovered && window.modifiers().alt;
@@ -352,6 +400,17 @@ impl Render for PlayerEntity {
                 waveform_loading,
                 morph_active,
                 is_playing,
+                seekbar_fps,
+                visualizer_kind,
+                analysis_frame,
+                seekbar_hover_intensity,
+                // Borrowed mutably from `&mut self` here -- visualizers
+                // ease per-band magnitudes toward the latest analyzer
+                // frame across `Render` calls. Passing the borrow down
+                // (rather than re-entering `update` on the player
+                // entity inside the render path, which double-leases
+                // and panics) keeps the dispatch re-entrancy-safe.
+                &mut self.band_smoothed,
                 colors,
                 self.waveform_seekbar_scroll_handle.clone(),
                 cx,
@@ -451,6 +510,22 @@ impl Render for PlayerEntity {
                 this.child(player_output_device_menu(
                     self.output_menu_position,
                     self.current_output_label(),
+                    colors,
+                    cx,
+                ))
+            })
+            // ✦ seekbar menu. Anchored at the click position via
+            // `menu_at` so it renders into gpui's overlay layer above
+            // the player bar -- in particular above whatever page
+            // (table / grid / settings) is occupying the rest of the
+            // window. Rendering it inline as a child of the seekbar
+            // surface (the previous shape) put it in the same z-order
+            // as the page content, which clipped it behind table rows.
+            .when(self.seekbar_menu_open, |this| {
+                this.child(seekbar_menu(
+                    self.seekbar_menu_position,
+                    self.seekbar_fps_enabled,
+                    self.seekbar_visualizer,
                     colors,
                     cx,
                 ))
@@ -611,6 +686,15 @@ fn waveform_seekbar(
     loading: bool,
     morph_active: bool,
     is_playing: bool,
+    fps: Option<f32>,
+    visualizer_kind: VisualizerKind,
+    analysis_frame: Option<tempo::audio_analyzer::AnalysisFrame>,
+    // Eased opacity for the waveform overlay shown when the user
+    // hovers the seekbar with a frequency visualizer active. Always 0
+    // in `Waveform` mode (the waveform IS the body, so there's
+    // nothing to fade in over it).
+    hover_overlay_intensity: f32,
+    band_smoothed: &mut [f32; tempo::audio_analyzer::BAND_COUNT],
     colors: ThemeColors,
     waveform_handle: gpui::ScrollHandle,
     cx: &mut Context<PlayerEntity>,
@@ -644,28 +728,38 @@ fn waveform_seekbar(
     // (rather than rounding to `usize`) is what eliminates the
     // one-bar-at-a-time stepping the user sees as choppiness.
     let progress_bars = bars.len() as f32 * progress;
-    let bars_for_iter = Arc::clone(&bars);
 
-    let bars_row = div()
-        .absolute()
-        .top_0()
-        .right_0()
-        .bottom_0()
-        .left_0()
-        .px_2()
-        .flex()
-        .items_center()
-        .gap(px(1.0))
-        // `Arc<[f32]>::iter()` borrows the slice — no clone of the
-        // underlying buffer per frame, unlike the prior `Vec<f32>`
-        // which was cloned per render.
-        .children(
-            bars_for_iter
-                .iter()
-                .copied()
-                .enumerate()
-                .map(move |(ix, height)| waveform_bar(ix, height, progress_bars, loading, colors)),
-        );
+    // Build a fresh bars-row element. Used twice when a frequency
+    // visualizer is active and the hover-overlay is mid-fade: once
+    // as the visualizer body fallback, once as the layered hover
+    // ghost. `Arc<[f32]>` clones are refcount bumps, so calling
+    // this per frame is cheap.
+    let make_bars_row = || {
+        let bars_for_iter = Arc::clone(&bars);
+        div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .left_0()
+            .px_2()
+            .flex()
+            .items_center()
+            .gap(px(1.0))
+            // `Arc<[f32]>::iter()` borrows the slice — no clone of the
+            // underlying buffer per frame, unlike the prior `Vec<f32>`
+            // which was cloned per render.
+            .children(
+                bars_for_iter
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(move |(ix, height)| {
+                        waveform_bar(ix, height, progress_bars, loading, colors)
+                    }),
+            )
+    };
+    let bars_row = make_bars_row();
 
     // Wrap the bars row in `with_animation` whenever something is
     // moving — either the loading shimmer (heights regenerated each
@@ -801,6 +895,84 @@ fn waveform_seekbar(
             )
     };
 
+    // Pre-compute the waveform-related sub-elements so we can attach
+    // them as direct siblings of the click-receiving seekbar div
+    // below. Earlier this nested everything under a single
+    // `waveform_overlay` wrapper; that extra absolutely-positioned
+    // layer was enough to break gpui's click hit-testing on the
+    // seekbar (clicks would route through the wrapper and never
+    // reach the parent's `on_click`). Returning a flat list of
+    // siblings keeps the original click semantics intact.
+    let center_line = div()
+        .absolute()
+        .top(px(42.0))
+        .left_0()
+        .right_0()
+        .h(px(1.0))
+        .bg(rgb(colors.waveform_line));
+
+    let visualizer_body: Option<AnyElement> = match (visualizer_kind, analysis_frame) {
+        (VisualizerKind::Waveform, _) | (_, None) => None,
+        (kind, Some(frame)) => {
+            let bounds = waveform_handle.bounds();
+            let width = f32::from(bounds.size.width);
+            let height = f32::from(bounds.size.height);
+            // `band_smoothed` is borrowed mutably from the outer
+            // `&mut self` and threaded down -- never re-enter
+            // `cx.entity().update` here: that would double-lease
+            // `PlayerEntity` (we're already inside its `Render`
+            // call) and panic at runtime.
+            let ctx = VisualizerContext {
+                frame,
+                colors,
+                width,
+                height,
+                is_playing,
+                band_smoothed,
+            };
+            visualizers::render(kind, ctx, cx)
+        }
+    };
+
+    // When a frequency visualizer is active and the user is hovering,
+    // overlay the precomputed-peaks waveform on top at the eased
+    // `hover_overlay_intensity` so they can see where a click will
+    // seek. Skipped when the body itself *is* the waveform.
+    let hover_overlay = if visualizer_body.is_some() && hover_overlay_intensity > 0.001 {
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .left_0()
+                .opacity(hover_overlay_intensity)
+                .child(make_bars_row())
+                .into_any_element(),
+        )
+    } else {
+        None
+    };
+
+    // The bars row is only rendered as an inline child when the
+    // active visualizer is `Waveform`; otherwise the visualizer body
+    // takes its place and the bars only appear via the hover overlay.
+    let waveform_bars = if visualizer_body.is_none() {
+        Some(bars_row)
+    } else {
+        None
+    };
+    let seekbar_hit_target = seekbar_hit_target(waveform_handle, cx);
+    let seekbar_control = seekbar_control(colors, cx);
+    let fps_label = fps.map(|fps| seekbar_fps_label(fps, colors));
+
+    // Single click-receiving root. Children are flat siblings -- no
+    // intermediate `.absolute()` wrappers around the visualizer body
+    // / bars / playhead, because that extra layer broke gpui's
+    // click hit-testing on the parent (clicks routed through the
+    // wrapper and never reached `.on_click`). Mirrors the original
+    // pre-visualizer structure: line + bars + playhead + chrome,
+    // all direct children of the seekbar div.
     div()
         .id("waveform-seekbar")
         .absolute()
@@ -808,42 +980,17 @@ fn waveform_seekbar(
         .right_0()
         .bottom_0()
         .left_0()
-        .cursor_pointer()
         .rounded_lg()
         .overflow_hidden()
         .bg(rgb(colors.waveform_bg))
         .border_1()
         .border_color(rgb(colors.waveform_border))
-        // `track_scroll` records the seekbar's painted bounds on
-        // every paint, so the click handler below can compute a
-        // ratio against the *actual* rendered width. Earlier code
-        // derived the seekbar's left/right from `viewport_size()`
-        // and the fixed player-bar layout constants, which gave
-        // stale results between a window resize and the next paint.
-        .track_scroll(&waveform_handle)
-        .on_click(cx.listener(|player, event: &ClickEvent, _window, cx| {
-            if event.standard_click() {
-                let bounds = player.waveform_seekbar_scroll_handle.bounds();
-                let width = f32::from(bounds.size.width);
-                if width <= 0.0 {
-                    return;
-                }
-                let click_x = f32::from(event.position().x);
-                let ratio = ((click_x - f32::from(bounds.origin.x)) / width).clamp(0.0, 1.0);
-                cx.emit(PlayerEvent::RequestSeekFromWaveformClick { ratio });
-            }
-        }))
-        .child(
-            div()
-                .absolute()
-                .top(px(42.0))
-                .left_0()
-                .right_0()
-                .h(px(1.0))
-                .bg(rgb(colors.waveform_line)),
-        )
-        .child(bars_row)
+        .child(center_line)
+        .children(visualizer_body)
+        .children(waveform_bars)
+        .children(hover_overlay)
         .child(playhead_overlay)
+        .children(fps_label)
         .when(loading, |this| {
             this.child(
                 div()
@@ -883,6 +1030,198 @@ fn waveform_seekbar(
                 .text_color(rgb(colors.text_faint))
                 .child(duration),
         )
+        .child(seekbar_hit_target)
+        .child(seekbar_control)
+}
+
+fn seekbar_hit_target(
+    waveform_handle: gpui::ScrollHandle,
+    cx: &mut Context<PlayerEntity>,
+) -> impl IntoElement + use<> {
+    div()
+        .id("waveform-seekbar-hit-target")
+        .absolute()
+        .top_0()
+        .right_0()
+        .bottom_0()
+        .left_0()
+        .cursor_pointer()
+        // `track_scroll` records the seekbar's painted bounds on
+        // every paint, so the click handler below can compute a
+        // ratio against the *actual* rendered width. Keeping this on
+        // the top hit layer means the visualizer/waveform paint
+        // layers can remain decorative and effectively pass through.
+        .track_scroll(&waveform_handle)
+        // Hover state powers the hover-overlay fade for frequency
+        // visualizers. We notify only on the rising/falling edge so a
+        // pointer parked inside the bounds doesn't spam invalidations
+        // each frame.
+        .on_hover(cx.listener(|player, hovered: &bool, _window, cx| {
+            if player.set_seekbar_hovered(*hovered) {
+                cx.notify();
+            }
+        }))
+        .on_click(cx.listener(|player, event: &ClickEvent, _window, cx| {
+            if event.standard_click() {
+                let bounds = player.waveform_seekbar_scroll_handle.bounds();
+                let width = f32::from(bounds.size.width);
+                if width <= 0.0 {
+                    return;
+                }
+                let click_x = f32::from(event.position().x);
+                let ratio = ((click_x - f32::from(bounds.origin.x)) / width).clamp(0.0, 1.0);
+                player.seekbar_menu_open = false;
+                cx.emit(PlayerEvent::RequestSeekFromWaveformClick { ratio });
+            }
+        }))
+}
+
+fn seekbar_control(
+    colors: ThemeColors,
+    cx: &mut Context<PlayerEntity>,
+) -> impl IntoElement + use<> {
+    div()
+        .absolute()
+        .top_2()
+        .right_2()
+        .w(px(24.0))
+        .h(px(24.0))
+        .child(
+            div()
+                .id("seekbar-controls-trigger")
+                .w(px(24.0))
+                .h(px(24.0))
+                .rounded_full()
+                .border_1()
+                .border_color(rgb(colors.waveform_border))
+                .bg(rgb(colors.waveform_bg))
+                .text_color(rgb(colors.text_muted))
+                .text_xs()
+                .font_weight(gpui::FontWeight::BOLD)
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(move |this| {
+                    this.bg(rgb(colors.button_hover))
+                        .text_color(rgb(colors.accent))
+                })
+                .on_click(cx.listener(|player, event: &ClickEvent, _window, cx| {
+                    if event.standard_click() {
+                        // Record the click position so the floating
+                        // menu (rendered at the player-bar root via
+                        // `menu_at`) can anchor here. Stacking the
+                        // menu inline as a child of the seekbar
+                        // surface would clip it behind the table /
+                        // grid pages above.
+                        player.toggle_seekbar_menu(event.position());
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }))
+                .child("✦"),
+        )
+}
+
+/// Anchored ✦ menu rendered at the player render's root so it floats
+/// above the rest of the window (table, grids, etc.). Mirrors the
+/// `player_output_device_menu` shape: `menu_at` produces an
+/// `Anchored` element which gpui draws on its overlay layer.
+fn seekbar_menu(
+    position: Point<Pixels>,
+    fps_enabled: bool,
+    current_visualizer: VisualizerKind,
+    colors: ThemeColors,
+    cx: &mut Context<PlayerEntity>,
+) -> impl IntoElement + use<> {
+    // BottomRight anchor with a small upward offset places the panel
+    // just above the ✦ button rather than overlapping it.
+    menu_at(
+        position,
+        Corner::BottomRight,
+        point(px(8.0), px(-12.0)),
+        seekbar_menu_panel(fps_enabled, current_visualizer, colors, cx),
+    )
+}
+
+fn seekbar_menu_panel(
+    fps_enabled: bool,
+    current_visualizer: VisualizerKind,
+    colors: ThemeColors,
+    cx: &mut Context<PlayerEntity>,
+) -> impl IntoElement + use<> {
+    let mut panel = menu_panel(200.0, colors).child(menu_header("Visualizer", colors));
+    // Radio-style list of all four visualizers. Selected variant is
+    // highlighted in `accent_soft` and shown with a check; clicking
+    // any other variant flips the selection and persists it.
+    for kind in VisualizerKind::ALL {
+        let is_selected = kind == current_visualizer;
+        let item_id = match kind {
+            VisualizerKind::Waveform => "seekbar-visualizer-waveform",
+            VisualizerKind::DancingLine => "seekbar-visualizer-dancing-line",
+            VisualizerKind::FrequencyBars => "seekbar-visualizer-frequency-bars",
+        };
+        panel = panel.child(
+            menu_item_base(item_id, colors)
+                .h(px(28.0))
+                .justify_between()
+                .text_color(rgb(if is_selected {
+                    colors.accent_soft
+                } else {
+                    colors.text
+                }))
+                .on_click(cx.listener(move |player, event: &ClickEvent, _window, cx| {
+                    if event.standard_click() {
+                        player.set_seekbar_visualizer(kind, cx);
+                        cx.stop_propagation();
+                    }
+                }))
+                .child(kind.label())
+                .child(if is_selected { "✓" } else { "" }),
+        );
+    }
+    panel.child(menu_header("Debug", colors)).child(
+        menu_item_base("seekbar-fps-toggle", colors)
+            .h(px(28.0))
+            .justify_between()
+            .text_color(rgb(if fps_enabled {
+                colors.accent_soft
+            } else {
+                colors.text
+            }))
+            .on_click(cx.listener(|player, event: &ClickEvent, _window, cx| {
+                if event.standard_click() {
+                    player.toggle_seekbar_fps();
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .child("FPS Counter")
+            .child(if fps_enabled { "✓" } else { "" }),
+    )
+}
+
+fn seekbar_fps_label(fps: f32, colors: ThemeColors) -> AnyElement {
+    div()
+        .absolute()
+        .top_2()
+        .left_3()
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .bg(rgb(colors.waveform_bg))
+        .border_1()
+        .border_color(rgb(colors.waveform_border))
+        .text_xs()
+        .text_color(rgb(colors.accent_soft))
+        .font_weight(gpui::FontWeight::BOLD)
+        .child(format!("{:>3.0} FPS", fps))
+        .with_animation(
+            "seekbar-fps-counter",
+            Animation::new(Duration::from_millis(1000)).repeat(),
+            |this, _delta| this,
+        )
+        .into_any_element()
 }
 
 /// Return the maximum number of bars that fit in a seekbar of the
