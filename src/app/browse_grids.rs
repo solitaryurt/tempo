@@ -27,6 +27,8 @@ impl TempoApp {
         }
         let colors = *self.colors();
         let albums = self.albums_for_artist(artist.artist_id);
+        let play_source = TabSource::Artist(artist.artist_id);
+        let shuffle_source = play_source.clone();
 
         Some(
             div()
@@ -75,6 +77,35 @@ impl TempoApp {
                                     "{} albums  ·  {} tracks",
                                     artist.album_count, artist.track_count
                                 )))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .child(
+                                            self.detail_action_button("Play all", true).on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.play_source(
+                                                        play_source.clone(),
+                                                        false,
+                                                        cx,
+                                                    );
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            self.detail_action_button("Shuffle", false).on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.play_source(
+                                                        shuffle_source.clone(),
+                                                        true,
+                                                        cx,
+                                                    );
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                        ),
+                                )
                                 .child(div().text_color(rgb(colors.text)).child(
                                     artist.bio.clone().unwrap_or_else(|| {
                                         format!(
@@ -108,7 +139,7 @@ impl TempoApp {
     fn render_album_detail_hero(
         &self,
         album_id: i64,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let album = self.album_by_id(album_id)?;
         if album.artwork_path.is_none() {
@@ -151,6 +182,8 @@ impl TempoApp {
                     )
                 }),
         };
+        let play_source = TabSource::Album(album.album_id);
+        let shuffle_source = play_source.clone();
 
         Some(
             div()
@@ -196,6 +229,23 @@ impl TempoApp {
                                 album.year.clone().unwrap_or_else(|| "Unknown year".to_string()),
                                 album.track_count
                             )))
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(self.detail_action_button("Play all", true).on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.play_source(play_source.clone(), false, cx);
+                                        cx.notify();
+                                    }),
+                                ))
+                                .child(self.detail_action_button("Shuffle", false).on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.play_source(shuffle_source.clone(), true, cx);
+                                        cx.notify();
+                                    }),
+                                )),
+                        )
                         .child(div().text_color(rgb(colors.text)).child(description)),
                 )
                 .into_any_element(),
@@ -286,14 +336,16 @@ impl TempoApp {
                                     div()
                                         .flex()
                                         .gap_2()
-                                        .child(self.genre_action_button("Play all", true).on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.play_genre(&play_key, false, cx);
-                                                cx.notify();
-                                            }),
-                                        ))
                                         .child(
-                                            self.genre_action_button("Shuffle", false).on_click(
+                                            self.detail_action_button("Play all", true).on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.play_genre(&play_key, false, cx);
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            self.detail_action_button("Shuffle", false).on_click(
                                                 cx.listener(move |this, _, _, cx| {
                                                     this.play_genre(&shuffle_key, true, cx);
                                                     cx.notify();
@@ -2240,7 +2292,11 @@ impl TempoApp {
             .into_any_element()
     }
 
-    fn genre_action_button(&self, label: &'static str, primary: bool) -> gpui::Stateful<gpui::Div> {
+    fn detail_action_button(
+        &self,
+        label: &'static str,
+        primary: bool,
+    ) -> gpui::Stateful<gpui::Div> {
         let colors = *self.colors();
         let bg = if primary {
             colors.accent
@@ -2250,7 +2306,7 @@ impl TempoApp {
         let fg = if primary { colors.surface } else { colors.text };
 
         div()
-            .id(SharedString::from(format!("genre-action-{}", label)))
+            .id(SharedString::from(format!("detail-action-{}", label)))
             .h(px(30.0))
             .px_3()
             .rounded_md()

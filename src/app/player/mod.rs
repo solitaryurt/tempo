@@ -478,8 +478,13 @@ impl TempoApp {
         self.context_menu_track = None;
     }
 
-    pub(super) fn play_genre(&mut self, genre_key: &str, shuffled: bool, cx: &mut Context<Self>) {
-        let mut tracks = self.source_track_indices(TabSource::Genre(genre_key.to_string()));
+    pub(super) fn play_source(
+        &mut self,
+        source: TabSource,
+        shuffled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mut tracks = self.source_track_indices(source);
         if tracks.is_empty() {
             return;
         }
@@ -495,6 +500,10 @@ impl TempoApp {
         self.queue = tracks.into_iter().skip(1).collect();
         self.right_sidebar_collapsed = self.queue.is_empty();
         self.play_track(first, cx);
+    }
+
+    pub(super) fn play_genre(&mut self, genre_key: &str, shuffled: bool, cx: &mut Context<Self>) {
+        self.play_source(TabSource::Genre(genre_key.to_string()), shuffled, cx);
     }
 
     pub(super) fn shuffle_seed() -> u64 {
