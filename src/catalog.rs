@@ -30,7 +30,40 @@ const TRACK_METADATA_VERSION: i64 = 2;
 // `CREATE ... IF NOT EXISTS` and `add_column_if_missing` calls -- to
 // re-execute exactly once and repair the schema without disturbing
 // existing data.
-const SCHEMA_VERSION: i64 = 4;
+//
+// v5 bump rationale: extends the metadata-enrichment surface in
+// preparation for multi-source fallbacks (TheAudioDB search, Wikipedia,
+// Discogs) and for unified error categorization on the new Errors page.
+// New nullable columns:
+//   - `albums.description` + `albums.description_source`
+//   - `albums.discogs_master_id` (unique index)
+//   - `artists.discogs_id`
+//   - `metadata_jobs.error_kind` + `metadata_jobs.tried_sources`
+//   - `discography_items.discogs_master_id` (unique index)
+//   - `discography_items.source` (default 'musicbrainz')
+//   - `discography_items.role` (default 'Main')
+//   - `discography_items.format`
+// Plus the `discography_items` UNIQUE constraint expands from
+// `(artist_id, normalized_title, release_type)` to
+// `(artist_id, normalized_title, release_type, role)` so that Discogs
+// can contribute Main + Appearance rows for the same album without
+// colliding with each other. The migration replaces the old unique
+// index with the new compound one in place; existing rows default to
+// `role = 'Main'` so the new key remains satisfied.
+//
+// v6 bump rationale: the v5 schema kept a column-level
+// `UNIQUE(musicbrainz_release_group_id)` from the original schema,
+// which collides with the v5 multi-row design. With `role` now part of
+// the natural key, the same release-group MBID can legitimately appear
+// in more than one row per artist (Main + Appearance). The column
+// constraint forced a global one-row-per-MBID rule that broke the
+// MusicBrainz discography job whenever an MBID was already known on
+// another artist. The v6 rebuild drops that column-level UNIQUE and
+// replaces it with a partial unique index keyed on
+// `(artist_id, musicbrainz_release_group_id)` so each artist may have
+// at most one row per MBID, and across artists the MBID can repeat
+// freely. The same change applies to `discogs_master_id`.
+const SCHEMA_VERSION: i64 = 6;
 
 #[derive(Clone, Debug)]
 pub struct CatalogStore {
@@ -85,6 +118,52 @@ pub struct CatalogAlbum {
     pub year: Option<String>,
     pub artwork_path: Option<PathBuf>,
     pub track_count: usize,
+    pub description: Option<String>,
+    /// Tri-state description state for the UI: when the description is
+    /// `None` we still need to know whether enrichment is "pending"
+    /// (no terminal answer yet) versus "unavailable" (every fallback
+    /// source has been exhausted). Populated from the underlying
+    /// `metadata_status` + `error_kind` columns.
+    pub description_state: AlbumDescriptionState,
+}
+
+/// Snapshot of the `(metadata_status, error_kind)` pair on an album row,
+/// reduced to a tri-state the album hero can render directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AlbumDescriptionState {
+    /// Either online metadata is disabled, or no terminal status has
+    /// been reached yet. Consumers should optimistically render a
+    /// placeholder + queue an on-demand enrichment job.
+    #[default]
+    Pending,
+    /// A description is on hand (`description` is `Some`) and the row
+    /// status is `resolved`.
+    Available,
+    /// Every fallback source was tried and produced no description.
+    /// Render the "no online description available" copy.
+    Unavailable,
+}
+
+impl AlbumDescriptionState {
+    /// Stable wire encoding for the binary startup snapshot. Keep these
+    /// values stable across snapshot version bumps; the snapshot loader
+    /// invalidates the file on `from_u8` mismatch via the `Pending`
+    /// fallback rather than refusing the whole snapshot.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Pending => 0,
+            Self::Available => 1,
+            Self::Unavailable => 2,
+        }
+    }
+
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Available,
+            2 => Self::Unavailable,
+            _ => Self::Pending,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -109,12 +188,49 @@ pub struct CatalogMetadataJob {
     pub attempts: u32,
 }
 
+/// One failed metadata-job row joined with the underlying entity for
+/// display on the unified Errors page. Cheaply
+/// produced by [`CatalogStore::load_metadata_errors`]; the UI groups
+/// rows by category and renders them inline with scan errors.
+#[derive(Clone, Debug)]
+pub struct CatalogMetadataError {
+    pub job_id: i64,
+    pub entity_type: String,
+    pub entity_id: i64,
+    pub job_type: String,
+    /// "musicbrainz" / "theaudiodb" / "discogs" / "wikipedia" /
+    /// "coverartarchive". `None` when the failure happened before any
+    /// HTTP call (e.g. the worker bailed because an MBID was missing
+    /// before we tried any source). Populated from
+    /// `metadata_jobs.tried_sources`'s last entry.
+    pub source: Option<String>,
+    /// Stable classifier produced by the worker's HTTP helpers:
+    /// `network` / `http_4xx` / `http_5xx` / `parse` / `no_match`.
+    /// `None` for jobs that failed without going through the helpers.
+    pub error_kind: Option<String>,
+    /// Most recent `last_error` value -- the persisted message text
+    /// that produced the failure. Includes status + URL excerpts for
+    /// HTTP errors.
+    pub message: String,
+    /// Human-readable description of the entity, like "Brian Eno" or
+    /// "Kid A — Radiohead". Used in the row's PATH column.
+    pub entity_label: String,
+    /// Last-update timestamp from the metadata_jobs row, milliseconds
+    /// since the unix epoch.
+    pub updated_at_ms: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct CatalogMetadataArtist {
     pub artist_id: i64,
     pub name: String,
     pub normalized_name: String,
     pub musicbrainz_id: Option<String>,
+    /// Discogs artist id, populated by
+    /// `resolve_artist_discogs_search`. Independent of
+    /// `musicbrainz_id`; the worker chains may resolve either or both
+    /// over the lifetime of an artist row.
+    pub discogs_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -123,8 +239,15 @@ pub struct CatalogMetadataAlbum {
     pub artist_id: i64,
     pub title: String,
     pub normalized_title: String,
+    /// Display name of the album's primary artist. Surfaced for
+    /// metadata-source lookups (e.g. TheAudioDB album search) that
+    /// need both the artist name and the album title.
+    pub artist_name: String,
     pub artist_musicbrainz_id: Option<String>,
     pub musicbrainz_release_group_id: Option<String>,
+    /// Discogs master id resolved by `resolve_album_discogs_search`.
+    /// Independent of `musicbrainz_release_group_id`.
+    pub discogs_master_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -137,12 +260,47 @@ pub struct CatalogMetadataActivity {
     pub pending_artist_discography: usize,
     pub pending_album_resolve: usize,
     pub pending_album_cover: usize,
+    pub pending_album_profile: usize,
+    /// Pending `fetch_artist_discogs_releases` jobs. Counted separately
+    /// from `pending_artist_discography` (the MusicBrainz release-group
+    /// crawl) so the activity panel can surface Discogs progress
+    /// alongside MB progress without conflating them.
+    pub pending_artist_discogs_releases: usize,
+    /// Pending `fetch_discogs_thumb` jobs. These are per-row thumbnail
+    /// downloads enqueued lazily by `fetch_artist_discogs_releases`,
+    /// and tend to dominate the queue volume for an artist with a
+    /// large discography. Surfaced as its own counter so the UI can
+    /// distinguish "thumbnails downloading" from "still resolving
+    /// metadata".
+    pub pending_thumb_fetch: usize,
+    // ---- Phase 2 / Phase 3 fallback chain counters ------------------
+    pub pending_artist_audiodb_search: usize,
+    pub pending_album_audiodb_search: usize,
+    pub pending_artist_wikipedia_summary: usize,
+    pub pending_album_wikipedia_summary: usize,
+    pub pending_artist_discogs_search: usize,
+    pub pending_album_discogs_search: usize,
+    pub pending_artist_discogs_profile: usize,
+    pub pending_album_discogs_image: usize,
+    // ---- Lidarr (tier 0) primary fetch counters ---------------------
+    pub pending_artist_lidarr: usize,
+    pub pending_album_lidarr: usize,
 }
 
 impl CatalogMetadataActivity {
     pub fn is_active(&self) -> bool {
         self.pending > 0 || self.running > 0
     }
+}
+
+/// Result of [`CatalogStore::load_discogs_thumb_target`]. Carries the
+/// `discography_items.id` to update + the URL to download. Returned
+/// only when the row has a non-empty `thumb_url` and no cover asset
+/// yet; the thumb-fetch worker treats `None` as a no-op success.
+#[derive(Clone, Debug)]
+pub struct DiscogsThumbTarget {
+    pub item_id: i64,
+    pub source_url: String,
 }
 
 #[derive(Clone, Debug)]
@@ -414,14 +572,19 @@ impl CatalogStore {
                 normalized_title TEXT NOT NULL,
                 year TEXT,
                 release_type TEXT NOT NULL,
-                musicbrainz_release_group_id TEXT UNIQUE,
+                musicbrainz_release_group_id TEXT,
+                discogs_master_id TEXT,
                 cover_asset_id INTEGER REFERENCES assets(id),
                 local_album_id INTEGER REFERENCES albums(id),
                 is_local INTEGER NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT 'musicbrainz',
+                role TEXT NOT NULL DEFAULT 'Main',
+                format TEXT,
                 sort_key TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
-                UNIQUE(artist_id, normalized_title, release_type)
+                UNIQUE(artist_id, normalized_title, release_type, role),
+                UNIQUE(artist_id, musicbrainz_release_group_id)
               );
 
               CREATE INDEX IF NOT EXISTS files_root_seen_idx ON files(root_id, last_seen_scan_id);
@@ -457,6 +620,94 @@ impl CatalogStore {
             "UPDATE tracks SET date_added = created_at WHERE date_added IS NULL",
             [],
         )?;
+
+        // ---- v5 additions (idempotent) -------------------------------
+        // Albums: description + provenance + Discogs identity.
+        add_column_if_missing(&connection, "albums", "description", "TEXT")?;
+        add_column_if_missing(&connection, "albums", "description_source", "TEXT")?;
+        add_column_if_missing(&connection, "albums", "discogs_master_id", "TEXT")?;
+        connection.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS albums_discogs_master_idx
+             ON albums(discogs_master_id) WHERE discogs_master_id IS NOT NULL;",
+        )?;
+
+        // Artists: Discogs identity.
+        add_column_if_missing(&connection, "artists", "discogs_id", "TEXT")?;
+
+        // Metadata jobs: error classification + tried-sources audit log.
+        add_column_if_missing(&connection, "metadata_jobs", "error_kind", "TEXT")?;
+        add_column_if_missing(&connection, "metadata_jobs", "tried_sources", "TEXT")?;
+
+        // Discography items: Discogs identity, source + role + format.
+        add_column_if_missing(
+            &connection,
+            "discography_items",
+            "discogs_master_id",
+            "TEXT",
+        )?;
+        add_column_if_missing(
+            &connection,
+            "discography_items",
+            "source",
+            "TEXT NOT NULL DEFAULT 'musicbrainz'",
+        )?;
+        add_column_if_missing(
+            &connection,
+            "discography_items",
+            "role",
+            "TEXT NOT NULL DEFAULT 'Main'",
+        )?;
+        add_column_if_missing(&connection, "discography_items", "format", "TEXT")?;
+        // `thumb_url` stores the per-row Discogs thumb so the
+        // `fetch_discogs_thumb` worker can re-derive the source URL
+        // without a second `/artists/{id}/releases` round trip.
+        add_column_if_missing(&connection, "discography_items", "thumb_url", "TEXT")?;
+        connection.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS discography_items_discogs_master_idx
+             ON discography_items(discogs_master_id) WHERE discogs_master_id IS NOT NULL;",
+        )?;
+
+        // Replace the old `(artist_id, normalized_title, release_type)`
+        // UNIQUE on `discography_items` with the new compound key
+        // including `role`. Existing rows default to `role = 'Main'` so
+        // nothing collides on the new index. We can't drop an inline
+        // table-level UNIQUE without rebuilding the table, but we can
+        // rebuild it once on upgrade and leave the new schema clean for
+        // fresh installs (the CREATE TABLE above already has the new
+        // 4-column UNIQUE).
+        rebuild_discography_items_unique(&connection)?;
+
+        // Recover metadata-jobs that were poisoned by the pre-v6
+        // `UNIQUE constraint failed: discography_items.musicbrainz_release_group_id`
+        // bug. The constraint no longer exists; clear those rows back
+        // to a fresh `pending` so the worker retries them on the next
+        // tick. Also clears the entity-side `metadata_status='error'`
+        // markers that the failure path wrote.
+        connection.execute(
+            "UPDATE metadata_jobs
+             SET status = 'pending',
+                 next_attempt_at = 0,
+                 attempts = 0,
+                 last_error = NULL,
+                 error_kind = NULL,
+                 updated_at = ?1
+             WHERE last_error LIKE '%UNIQUE constraint failed: discography_items.musicbrainz_release_group_id%'",
+            params![now_millis()],
+        )?;
+        connection.execute(
+            "UPDATE artists
+             SET metadata_status = CASE
+                    WHEN musicbrainz_id IS NULL THEN 'missing'
+                    ELSE 'resolved'
+                 END,
+                 metadata_error = NULL,
+                 updated_at = ?1
+             WHERE metadata_status = 'error'
+               AND (metadata_error IS NULL
+                    OR metadata_error LIKE '%UNIQUE constraint failed: discography_items.musicbrainz_release_group_id%')",
+            params![now_millis()],
+        )?;
+
         connection.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         perf::event(
             "catalog.migrate.applied",
@@ -1290,6 +1541,446 @@ impl CatalogStore {
         Ok(reset)
     }
 
+    /// Aggressive one-shot resync of every artist/album that is short
+    /// of a bio, photo, description, or cover. Used by the
+    /// "Resync metadata" Settings button and once on first launch
+    /// after the v6 schema migration to pull existing libraries
+    /// forward through the multi-source fallback chain.
+    ///
+    /// Concretely, for each artist still missing a bio:
+    ///
+    /// - if `fetch_artist_profile` is `complete` but bio is empty,
+    ///   enqueue `fetch_artist_wikipedia_summary`.
+    /// - if Wikipedia already ran complete and bio is still empty,
+    ///   enqueue `resolve_artist_discogs_search` (Discogs profile
+    ///   chains automatically on resolution).
+    ///
+    /// Mirror logic applies to albums (description, cover).
+    ///
+    /// Also clears exponential backoff on every `pending` job so the
+    /// worker tackles them immediately, and recovers any artist row
+    /// stuck at `metadata_status = 'error'`.
+    ///
+    /// Returns the number of jobs (re-)enqueued.
+    pub fn resync_metadata_enrichment(&self) -> Result<usize> {
+        let _span = perf::span("catalog.resync_metadata_enrichment", "");
+        let mut connection = self.lock_connection()?;
+        let transaction = connection.transaction()?;
+        let now = now_millis();
+        let mut enqueued = 0usize;
+
+        // 1. Clear exponential backoff on every pending job + reset
+        //    attempts. The worker will re-pick them up on the next
+        //    tick. We don't touch `complete` rows here -- those are
+        //    re-armed selectively below.
+        transaction.execute(
+            "UPDATE metadata_jobs
+             SET next_attempt_at = 0,
+                 attempts = 0,
+                 last_error = NULL,
+                 error_kind = NULL,
+                 updated_at = ?1
+             WHERE status = 'pending'",
+            params![now],
+        )?;
+
+        // 2. Recover artist rows that landed in `error` (or were
+        //    marked `missing` by a bygone failure) so the activity
+        //    panel reads cleanly.
+        transaction.execute(
+            "UPDATE artists
+             SET metadata_status = CASE
+                    WHEN musicbrainz_id IS NULL THEN 'missing'
+                    ELSE 'resolved'
+                 END,
+                 metadata_error = NULL,
+                 updated_at = ?1
+             WHERE metadata_status IN ('error', 'missing')",
+            params![now],
+        )?;
+        transaction.execute(
+            "UPDATE albums
+             SET metadata_status = CASE
+                    WHEN musicbrainz_release_group_id IS NULL THEN 'missing'
+                    ELSE 'resolved'
+                 END,
+                 metadata_error = NULL,
+                 updated_at = ?1
+             WHERE metadata_status IN ('error', 'missing')",
+            params![now],
+        )?;
+
+        // 3. Walk artists and enqueue the *next* link in the chain.
+        //    The query surfaces, per artist, whether each step in the
+        //    chain has previously completed so we can skip ahead.
+        let artist_rows = {
+            let mut statement = transaction.prepare(
+                "SELECT
+                    artists.id,
+                    artists.musicbrainz_id,
+                    artists.discogs_id,
+                    artists.bio,
+                    artists.photo_asset_id,
+                    EXISTS (SELECT 1 FROM metadata_jobs j
+                            WHERE j.entity_type='artist' AND j.entity_id=artists.id
+                              AND j.job_type='resolve_artist_musicbrainz' AND j.status='complete'),
+                    EXISTS (SELECT 1 FROM metadata_jobs j
+                            WHERE j.entity_type='artist' AND j.entity_id=artists.id
+                              AND j.job_type='fetch_artist_lidarr' AND j.status='complete'),
+                    EXISTS (SELECT 1 FROM metadata_jobs j
+                            WHERE j.entity_type='artist' AND j.entity_id=artists.id
+                              AND j.job_type='fetch_artist_profile' AND j.status='complete'),
+                    EXISTS (SELECT 1 FROM metadata_jobs j
+                            WHERE j.entity_type='artist' AND j.entity_id=artists.id
+                              AND j.job_type='fetch_artist_wikipedia_summary' AND j.status='complete'),
+                    EXISTS (SELECT 1 FROM metadata_jobs j
+                            WHERE j.entity_type='artist' AND j.entity_id=artists.id
+                              AND j.job_type='resolve_artist_audiodb_search' AND j.status='complete'),
+                    EXISTS (SELECT 1 FROM metadata_jobs j
+                            WHERE j.entity_type='artist' AND j.entity_id=artists.id
+                              AND j.job_type='resolve_artist_discogs_search' AND j.status='complete'),
+                    EXISTS (SELECT 1 FROM metadata_jobs j
+                            WHERE j.entity_type='artist' AND j.entity_id=artists.id
+                              AND j.job_type='fetch_artist_discogs_profile' AND j.status='complete')
+                 FROM artists",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, i64>(5)? != 0,
+                    row.get::<_, i64>(6)? != 0,
+                    row.get::<_, i64>(7)? != 0,
+                    row.get::<_, i64>(8)? != 0,
+                    row.get::<_, i64>(9)? != 0,
+                    row.get::<_, i64>(10)? != 0,
+                    row.get::<_, i64>(11)? != 0,
+                ))
+            })?;
+            rows.filter_map(|row| row.ok()).collect::<Vec<_>>()
+        };
+
+        for (
+            artist_id,
+            musicbrainz_id,
+            discogs_id,
+            bio,
+            photo_asset_id,
+            mb_resolved,
+            lidarr_done,
+            profile_done,
+            wikipedia_done,
+            audiodb_search_done,
+            discogs_search_done,
+            discogs_profile_done,
+        ) in artist_rows
+        {
+            let bio_present = bio.as_deref().is_some_and(|s| !s.trim().is_empty());
+
+            // Identity gap: no MBID, no Discogs id. Walk the chain in
+            // order: MB search -> TADb search -> Discogs search.
+            if musicbrainz_id.is_none() && discogs_id.is_none() {
+                if !mb_resolved {
+                    enqueue_metadata_job_at(
+                        &transaction,
+                        "artist",
+                        artist_id,
+                        "resolve_artist_musicbrainz",
+                        0,
+                        now,
+                    )?;
+                    enqueued += 1;
+                } else if !audiodb_search_done {
+                    enqueue_metadata_job_at(
+                        &transaction,
+                        "artist",
+                        artist_id,
+                        "resolve_artist_audiodb_search",
+                        0,
+                        now,
+                    )?;
+                    enqueued += 1;
+                } else if !discogs_search_done {
+                    enqueue_metadata_job_at(
+                        &transaction,
+                        "artist",
+                        artist_id,
+                        "resolve_artist_discogs_search",
+                        0,
+                        now,
+                    )?;
+                    enqueued += 1;
+                }
+                continue;
+            }
+
+            // Bio gap: Lidarr first (single round-trip), then walk
+            // TADb profile -> Wikipedia -> Discogs profile.
+            if !bio_present || photo_asset_id.is_none() {
+                if !lidarr_done && musicbrainz_id.is_some() {
+                    enqueue_metadata_job_at(
+                        &transaction,
+                        "artist",
+                        artist_id,
+                        "fetch_artist_lidarr",
+                        0,
+                        now,
+                    )?;
+                    enqueued += 1;
+                } else if !profile_done {
+                    enqueue_metadata_job_at(
+                        &transaction,
+                        "artist",
+                        artist_id,
+                        "fetch_artist_profile",
+                        0,
+                        now,
+                    )?;
+                    enqueued += 1;
+                } else if !wikipedia_done && !bio_present {
+                    enqueue_metadata_job_at(
+                        &transaction,
+                        "artist",
+                        artist_id,
+                        "fetch_artist_wikipedia_summary",
+                        0,
+                        now,
+                    )?;
+                    enqueued += 1;
+                } else if !bio_present {
+                    if discogs_id.is_some() {
+                        if !discogs_profile_done {
+                            enqueue_metadata_job_at(
+                                &transaction,
+                                "artist",
+                                artist_id,
+                                "fetch_artist_discogs_profile",
+                                0,
+                                now,
+                            )?;
+                            enqueued += 1;
+                        }
+                    } else if !discogs_search_done {
+                        enqueue_metadata_job_at(
+                            &transaction,
+                            "artist",
+                            artist_id,
+                            "resolve_artist_discogs_search",
+                            0,
+                            now,
+                        )?;
+                        enqueued += 1;
+                    }
+                }
+            }
+
+            // Always re-arm discography so the artist single view fills
+            // even if the bio chain is exhausted.
+            enqueue_metadata_job_at(
+                &transaction,
+                "artist",
+                artist_id,
+                "fetch_artist_discography",
+                0,
+                now,
+            )?;
+            enqueued += 1;
+        }
+
+        // 4. Walk albums and route around exhausted description jobs
+        //    the same way. Cover follow-up too.
+        let album_rows = {
+            let mut statement = transaction.prepare(
+                "SELECT
+                    albums.id,
+                    albums.musicbrainz_release_group_id,
+                    albums.discogs_master_id,
+                    albums.description,
+                    albums.cover_asset_id,
+                    EXISTS (SELECT 1 FROM metadata_jobs j
+                            WHERE j.entity_type='album' AND j.entity_id=albums.id
+                              AND j.job_type='resolve_album_musicbrainz' AND j.status='complete'),
+                    EXISTS (SELECT 1 FROM metadata_jobs j
+                            WHERE j.entity_type='album' AND j.entity_id=albums.id
+                              AND j.job_type='fetch_album_lidarr' AND j.status='complete'),
+                    EXISTS (SELECT 1 FROM metadata_jobs j
+                            WHERE j.entity_type='album' AND j.entity_id=albums.id
+                              AND j.job_type='fetch_album_profile' AND j.status='complete'),
+                    EXISTS (SELECT 1 FROM metadata_jobs j
+                            WHERE j.entity_type='album' AND j.entity_id=albums.id
+                              AND j.job_type='fetch_album_wikipedia_summary' AND j.status='complete'),
+                    EXISTS (SELECT 1 FROM metadata_jobs j
+                            WHERE j.entity_type='album' AND j.entity_id=albums.id
+                              AND j.job_type='resolve_album_audiodb_search' AND j.status='complete'),
+                    EXISTS (SELECT 1 FROM metadata_jobs j
+                            WHERE j.entity_type='album' AND j.entity_id=albums.id
+                              AND j.job_type='resolve_album_discogs_search' AND j.status='complete'),
+                    EXISTS (SELECT 1 FROM metadata_jobs j
+                            WHERE j.entity_type='album' AND j.entity_id=albums.id
+                              AND j.job_type='fetch_album_cover' AND j.status='complete'),
+                    EXISTS (SELECT 1 FROM metadata_jobs j
+                            WHERE j.entity_type='album' AND j.entity_id=albums.id
+                              AND j.job_type='fetch_album_discogs_image' AND j.status='complete')
+                 FROM albums",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, i64>(5)? != 0,
+                    row.get::<_, i64>(6)? != 0,
+                    row.get::<_, i64>(7)? != 0,
+                    row.get::<_, i64>(8)? != 0,
+                    row.get::<_, i64>(9)? != 0,
+                    row.get::<_, i64>(10)? != 0,
+                    row.get::<_, i64>(11)? != 0,
+                    row.get::<_, i64>(12)? != 0,
+                ))
+            })?;
+            rows.filter_map(|row| row.ok()).collect::<Vec<_>>()
+        };
+
+        for (
+            album_id,
+            release_group_id,
+            discogs_master_id,
+            description,
+            cover_asset_id,
+            mb_resolved,
+            lidarr_done,
+            profile_done,
+            wikipedia_done,
+            audiodb_search_done,
+            discogs_search_done,
+            cover_done,
+            discogs_image_done,
+        ) in album_rows
+        {
+            let description_present = description.as_deref().is_some_and(|s| !s.trim().is_empty());
+
+            // Album identity gap: walk MB -> TADb search -> Discogs.
+            if release_group_id.is_none() && discogs_master_id.is_none() {
+                if !mb_resolved {
+                    enqueue_metadata_job_at(
+                        &transaction,
+                        "album",
+                        album_id,
+                        "resolve_album_musicbrainz",
+                        0,
+                        now,
+                    )?;
+                    enqueued += 1;
+                } else if !audiodb_search_done {
+                    enqueue_metadata_job_at(
+                        &transaction,
+                        "album",
+                        album_id,
+                        "resolve_album_audiodb_search",
+                        0,
+                        now,
+                    )?;
+                    enqueued += 1;
+                } else if !discogs_search_done {
+                    enqueue_metadata_job_at(
+                        &transaction,
+                        "album",
+                        album_id,
+                        "resolve_album_discogs_search",
+                        0,
+                        now,
+                    )?;
+                    enqueued += 1;
+                }
+                continue;
+            }
+
+            // Description gap: Lidarr first, then TADb album-mb -> Wikipedia.
+            if !description_present {
+                if !lidarr_done && release_group_id.is_some() {
+                    enqueue_metadata_job_at(
+                        &transaction,
+                        "album",
+                        album_id,
+                        "fetch_album_lidarr",
+                        0,
+                        now,
+                    )?;
+                    enqueued += 1;
+                } else if !profile_done {
+                    enqueue_metadata_job_at(
+                        &transaction,
+                        "album",
+                        album_id,
+                        "fetch_album_profile",
+                        0,
+                        now,
+                    )?;
+                    enqueued += 1;
+                } else if !wikipedia_done {
+                    enqueue_metadata_job_at(
+                        &transaction,
+                        "album",
+                        album_id,
+                        "fetch_album_wikipedia_summary",
+                        0,
+                        now,
+                    )?;
+                    enqueued += 1;
+                }
+            }
+
+            // Cover gap: Lidarr first (its album payload often
+            // includes the CAA-cached cover URL), then CAA -> Discogs
+            // image.
+            if cover_asset_id.is_none() {
+                if !lidarr_done && release_group_id.is_some() {
+                    enqueue_metadata_job_at(
+                        &transaction,
+                        "album",
+                        album_id,
+                        "fetch_album_lidarr",
+                        0,
+                        now,
+                    )?;
+                    enqueued += 1;
+                } else if !cover_done && release_group_id.is_some() {
+                    enqueue_metadata_job_at(
+                        &transaction,
+                        "album",
+                        album_id,
+                        "fetch_album_cover",
+                        0,
+                        now,
+                    )?;
+                    enqueued += 1;
+                } else if !discogs_image_done && discogs_master_id.is_some() {
+                    enqueue_metadata_job_at(
+                        &transaction,
+                        "album",
+                        album_id,
+                        "fetch_album_discogs_image",
+                        0,
+                        now,
+                    )?;
+                    enqueued += 1;
+                }
+            }
+        }
+
+        transaction.commit()?;
+        perf::event(
+            "catalog.resync_metadata_enrichment.done",
+            format!("enqueued={enqueued}"),
+        );
+        Ok(enqueued)
+    }
+
     pub fn load_metadata_activity(&self) -> Result<CatalogMetadataActivity> {
         let connection = self.lock_connection()?;
         let mut activity = CatalogMetadataActivity::default();
@@ -1332,10 +2023,105 @@ impl CatalogStore {
                 "fetch_artist_discography" => activity.pending_artist_discography = row.1,
                 "resolve_album_musicbrainz" => activity.pending_album_resolve = row.1,
                 "fetch_album_cover" => activity.pending_album_cover = row.1,
+                "fetch_album_profile" => activity.pending_album_profile = row.1,
+                "fetch_artist_discogs_releases" => activity.pending_artist_discogs_releases = row.1,
+                "fetch_discogs_thumb" => activity.pending_thumb_fetch = row.1,
+                "resolve_artist_audiodb_search" => activity.pending_artist_audiodb_search = row.1,
+                "resolve_album_audiodb_search" => activity.pending_album_audiodb_search = row.1,
+                "fetch_artist_wikipedia_summary" => {
+                    activity.pending_artist_wikipedia_summary = row.1;
+                }
+                "fetch_album_wikipedia_summary" => {
+                    activity.pending_album_wikipedia_summary = row.1;
+                }
+                "resolve_artist_discogs_search" => activity.pending_artist_discogs_search = row.1,
+                "resolve_album_discogs_search" => activity.pending_album_discogs_search = row.1,
+                "fetch_artist_discogs_profile" => activity.pending_artist_discogs_profile = row.1,
+                "fetch_album_discogs_image" => activity.pending_album_discogs_image = row.1,
+                "fetch_artist_lidarr" => activity.pending_artist_lidarr = row.1,
+                "fetch_album_lidarr" => activity.pending_album_lidarr = row.1,
                 _ => {}
             }
         }
         Ok(activity)
+    }
+
+    /// Snapshot every metadata-job row whose status is `'failed'` AND
+    /// has a non-null `last_error`, joined with the artist or album it
+    /// belongs to so the UI can render an entity label without a
+    /// follow-up query. Capped at 500 rows; the Errors page is meant
+    /// for triage, not full-history archeology.
+    pub fn load_metadata_errors(&self) -> Result<Vec<CatalogMetadataError>> {
+        let connection = self.lock_connection()?;
+        let mut statement = connection.prepare_cached(
+            "SELECT
+                metadata_jobs.id,
+                metadata_jobs.entity_type,
+                metadata_jobs.entity_id,
+                metadata_jobs.job_type,
+                metadata_jobs.error_kind,
+                metadata_jobs.tried_sources,
+                metadata_jobs.last_error,
+                metadata_jobs.updated_at,
+                COALESCE(artists.name, '') AS artist_name,
+                COALESCE(albums.title, '') AS album_title,
+                COALESCE(albums.artist_name, '') AS album_artist
+             FROM metadata_jobs
+             LEFT JOIN artists
+                ON metadata_jobs.entity_type = 'artist'
+                AND artists.id = metadata_jobs.entity_id
+             LEFT JOIN albums
+                ON metadata_jobs.entity_type = 'album'
+                AND albums.id = metadata_jobs.entity_id
+             WHERE metadata_jobs.last_error IS NOT NULL
+                AND metadata_jobs.last_error <> ''
+             ORDER BY metadata_jobs.updated_at DESC
+             LIMIT 500",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let entity_type: String = row.get(1)?;
+            let artist_name: String = row.get(8)?;
+            let album_title: String = row.get(9)?;
+            let album_artist: String = row.get(10)?;
+            let entity_label = match entity_type.as_str() {
+                "artist" => {
+                    if artist_name.is_empty() {
+                        format!("artist #{}", row.get::<_, i64>(2)?)
+                    } else {
+                        artist_name
+                    }
+                }
+                "album" => {
+                    if album_title.is_empty() {
+                        format!("album #{}", row.get::<_, i64>(2)?)
+                    } else if album_artist.is_empty() {
+                        album_title
+                    } else {
+                        format!("{album_title} — {album_artist}")
+                    }
+                }
+                "discography_item" => format!("discography #{}", row.get::<_, i64>(2)?),
+                other => format!("{other} #{}", row.get::<_, i64>(2)?),
+            };
+            let tried_sources: Option<String> = row.get(5)?;
+            let source = tried_sources
+                .as_deref()
+                .and_then(|sources| sources.rsplit(',').next())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            Ok(CatalogMetadataError {
+                job_id: row.get(0)?,
+                entity_type,
+                entity_id: row.get(2)?,
+                job_type: row.get(3)?,
+                error_kind: row.get(4)?,
+                source,
+                message: row.get::<_, String>(6)?,
+                entity_label,
+                updated_at_ms: row.get(7)?,
+            })
+        })?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
     }
 
     pub fn enqueue_missing_online_metadata_jobs(&self) -> Result<usize> {
@@ -1344,11 +2130,27 @@ impl CatalogStore {
         let now = now_millis();
         let mut enqueued = 0usize;
 
+        // Surface whether `fetch_artist_profile` already ran for each
+        // artist so we can route bio-less artists straight to the
+        // Wikipedia fallback instead of bouncing them through TADb
+        // again (which won't re-run; the upsert leaves `complete` jobs
+        // alone). One-shot subquery built inline.
         let artist_ids = {
             let mut statement = transaction.prepare_cached(
-                "SELECT id, musicbrainz_id, bio, photo_asset_id
+                "SELECT
+                    artists.id,
+                    artists.musicbrainz_id,
+                    artists.bio,
+                    artists.photo_asset_id,
+                    EXISTS (
+                        SELECT 1 FROM metadata_jobs
+                        WHERE metadata_jobs.entity_type = 'artist'
+                          AND metadata_jobs.entity_id = artists.id
+                          AND metadata_jobs.job_type = 'fetch_artist_profile'
+                          AND metadata_jobs.status = 'complete'
+                    )
                  FROM artists
-                 ORDER BY name",
+                 ORDER BY artists.name",
             )?;
             let rows = statement.query_map([], |row| {
                 Ok((
@@ -1356,12 +2158,13 @@ impl CatalogStore {
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, i64>(4)? != 0,
                 ))
             })?;
             rows.filter_map(|row| row.ok()).collect::<Vec<_>>()
         };
 
-        for (artist_id, musicbrainz_id, bio, photo_asset_id) in artist_ids {
+        for (artist_id, musicbrainz_id, bio, photo_asset_id, profile_completed) in artist_ids {
             if musicbrainz_id.is_none() {
                 enqueue_metadata_job(
                     &transaction,
@@ -1375,15 +2178,42 @@ impl CatalogStore {
             }
 
             if bio.is_none() || photo_asset_id.is_none() {
+                // Tier-0: Lidarr's hosted proxy fills bio + photo +
+                // discography in one round-trip. Always enqueue it
+                // first when there's an MBID and we're missing
+                // anything; the dispatcher's priority ordering ensures
+                // it runs before the legacy chain.
                 enqueue_metadata_job_at(
                     &transaction,
                     "artist",
                     artist_id,
-                    "fetch_artist_profile",
+                    "fetch_artist_lidarr",
                     0,
                     now,
                 )?;
                 enqueued += 1;
+
+                if profile_completed && bio.is_none() {
+                    enqueue_metadata_job_at(
+                        &transaction,
+                        "artist",
+                        artist_id,
+                        "fetch_artist_wikipedia_summary",
+                        0,
+                        now,
+                    )?;
+                    enqueued += 1;
+                } else {
+                    enqueue_metadata_job_at(
+                        &transaction,
+                        "artist",
+                        artist_id,
+                        "fetch_artist_profile",
+                        0,
+                        now,
+                    )?;
+                    enqueued += 1;
+                }
             }
             enqueue_metadata_job_at(
                 &transaction,
@@ -1397,6 +2227,7 @@ impl CatalogStore {
         }
 
         enqueued += enqueue_missing_album_art_jobs(&transaction, None, now)?;
+        enqueued += enqueue_missing_album_description_jobs(&transaction, None, now)?;
 
         transaction.commit()?;
         Ok(enqueued)
@@ -1429,6 +2260,24 @@ impl CatalogStore {
             .optional()?;
         let mut enqueued = 0usize;
         if let Some((musicbrainz_id, bio, photo_asset_id)) = artist {
+            // Did `fetch_artist_profile` already run to completion?
+            // If so, enqueueing it again is a no-op (the job stays
+            // `complete` per the upsert's status guard), so we have to
+            // route the on-demand request straight to the next link in
+            // the fallback chain (Wikipedia, then Discogs).
+            let profile_completed = transaction
+                .query_row(
+                    "SELECT status FROM metadata_jobs
+                     WHERE entity_type = 'artist'
+                       AND entity_id = ?1
+                       AND job_type = 'fetch_artist_profile'",
+                    params![artist_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .as_deref()
+                == Some("complete");
+
             if musicbrainz_id.is_none() {
                 enqueue_metadata_job(
                     &transaction,
@@ -1438,15 +2287,46 @@ impl CatalogStore {
                     now,
                 )?;
                 enqueued += 1;
-            } else if bio.is_none() || photo_asset_id.is_none() {
+            } else {
+                // Lidarr-first: when we already have an MBID, the
+                // single-call Lidarr endpoint usually returns the bio
+                // + photo + discography we need. Always re-arm it,
+                // even when bio/photo are already populated, because
+                // Lidarr can also fill in the discography on a row
+                // that has a bio from another source.
                 enqueue_metadata_job(
                     &transaction,
                     "artist",
                     artist_id,
-                    "fetch_artist_profile",
+                    "fetch_artist_lidarr",
                     now,
                 )?;
                 enqueued += 1;
+
+                if bio.is_none() || photo_asset_id.is_none() {
+                    if profile_completed && bio.is_none() {
+                        // TADb already returned -- skip to the Wikipedia
+                        // fallback so a second open of the artist page
+                        // actually advances the chain.
+                        enqueue_metadata_job(
+                            &transaction,
+                            "artist",
+                            artist_id,
+                            "fetch_artist_wikipedia_summary",
+                            now,
+                        )?;
+                        enqueued += 1;
+                    } else {
+                        enqueue_metadata_job(
+                            &transaction,
+                            "artist",
+                            artist_id,
+                            "fetch_artist_profile",
+                            now,
+                        )?;
+                        enqueued += 1;
+                    }
+                }
             }
 
             enqueue_metadata_job(
@@ -1458,6 +2338,7 @@ impl CatalogStore {
             )?;
             enqueued += 1;
             enqueued += enqueue_missing_album_art_jobs(&transaction, Some(artist_id), now)?;
+            enqueued += enqueue_missing_album_description_jobs(&transaction, Some(artist_id), now)?;
         }
         transaction.commit()?;
         Ok(enqueued)
@@ -1498,11 +2379,95 @@ impl CatalogStore {
             && !has_track_artwork
         {
             if release_group_id.is_some() {
+                // Lidarr ships covers in its album payload; try it first.
+                enqueue_metadata_job_at(
+                    &transaction,
+                    "album",
+                    album_id,
+                    "fetch_album_lidarr",
+                    0,
+                    now,
+                )?;
+                enqueued += 1;
                 enqueue_metadata_job_at(
                     &transaction,
                     "album",
                     album_id,
                     "fetch_album_cover",
+                    0,
+                    now,
+                )?;
+                enqueued += 1;
+            } else if artist_musicbrainz_id.is_some() {
+                enqueue_metadata_job_at(
+                    &transaction,
+                    "album",
+                    album_id,
+                    "resolve_album_musicbrainz",
+                    0,
+                    now,
+                )?;
+                enqueued += 1;
+            }
+        }
+
+        transaction.commit()?;
+        Ok(enqueued)
+    }
+
+    /// On-demand companion to [`enqueue_album_cover_demand`]: enqueues
+    /// `fetch_album_profile` (TheAudioDB album description) for the
+    /// specified album when the album has a release-group MBID and no
+    /// description yet. If the release-group MBID is missing, the
+    /// release-group resolver is enqueued first; the worker chains
+    /// `fetch_album_profile` on success. No-op when neither prerequisite
+    /// is reachable (e.g. the album's artist also has no MBID).
+    pub fn enqueue_album_profile_demand(&self, album_id: i64) -> Result<usize> {
+        let mut connection = self.lock_connection()?;
+        let transaction = connection.transaction()?;
+        let now = now_millis();
+        let album = transaction
+            .query_row(
+                "SELECT
+                    albums.description,
+                    albums.musicbrainz_release_group_id,
+                    artists.musicbrainz_id
+                 FROM albums
+                 JOIN artists ON artists.id = albums.artist_id
+                 WHERE albums.id = ?1",
+                params![album_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let mut enqueued = 0usize;
+        if let Some((description, release_group_id, artist_musicbrainz_id)) = album
+            && description.as_deref().is_none_or(|d| d.trim().is_empty())
+        {
+            if release_group_id.is_some() {
+                // Try Lidarr first -- one round-trip returns the
+                // overview directly, no TADb/Wikipedia chaining needed
+                // for cached entries.
+                enqueue_metadata_job_at(
+                    &transaction,
+                    "album",
+                    album_id,
+                    "fetch_album_lidarr",
+                    0,
+                    now,
+                )?;
+                enqueued += 1;
+                enqueue_metadata_job_at(
+                    &transaction,
+                    "album",
+                    album_id,
+                    "fetch_album_profile",
                     0,
                     now,
                 )?;
@@ -1551,12 +2516,39 @@ impl CatalogStore {
                AND next_attempt_at <= ?1
                AND job_type IN ({placeholders})
              ORDER BY CASE job_type
-                WHEN 'fetch_album_cover' THEN 0
-                WHEN 'fetch_artist_profile' THEN 1
-                WHEN 'resolve_album_musicbrainz' THEN 2
-                WHEN 'resolve_artist_musicbrainz' THEN 3
-                WHEN 'fetch_artist_discography' THEN 4
-                ELSE 9
+                -- Tier 0: Lidarr's hosted proxy. Single round-trip
+                -- returns overview/bio + images + discography + genres
+                -- per artist or album. Highest priority so we always
+                -- try it before falling back to per-source enrichment.
+                WHEN 'fetch_artist_lidarr' THEN 0
+                WHEN 'fetch_album_lidarr' THEN 0
+                -- Tier 1: MusicBrainz identity resolution. Required to
+                -- have an MBID before any of the other sources work.
+                WHEN 'resolve_artist_musicbrainz' THEN 1
+                WHEN 'resolve_album_musicbrainz' THEN 1
+                -- Tier 2: legacy primary jobs (cover art archive,
+                -- TheAudioDB profile/album).
+                WHEN 'fetch_album_cover' THEN 2
+                WHEN 'fetch_artist_profile' THEN 2
+                WHEN 'fetch_album_profile' THEN 2
+                -- Tier 3: discography + Wikipedia fallbacks.
+                WHEN 'fetch_artist_discography' THEN 3
+                WHEN 'fetch_artist_wikipedia_summary' THEN 3
+                WHEN 'fetch_album_wikipedia_summary' THEN 3
+                -- Tier 4: TheAudioDB search fallbacks.
+                WHEN 'resolve_artist_audiodb_search' THEN 4
+                WHEN 'resolve_album_audiodb_search' THEN 4
+                -- Tier 5: Discogs identity + profile.
+                WHEN 'resolve_artist_discogs_search' THEN 5
+                WHEN 'resolve_album_discogs_search' THEN 5
+                WHEN 'fetch_artist_discogs_profile' THEN 5
+                WHEN 'fetch_album_discogs_image' THEN 5
+                -- Tier 6: Discogs bulk discography crawl.
+                WHEN 'fetch_artist_discogs_releases' THEN 6
+                -- Tier 9: per-row thumb downloads. Lowest so they
+                -- don't starve other work.
+                WHEN 'fetch_discogs_thumb' THEN 9
+                ELSE 7
              END, next_attempt_at, created_at
              LIMIT 1"
         );
@@ -1607,16 +2599,44 @@ impl CatalogStore {
     }
 
     pub fn fail_metadata_job(&self, job_id: i64, error: &str) -> Result<()> {
+        self.fail_metadata_job_classified(job_id, error, None, None)
+    }
+
+    /// Like [`fail_metadata_job`], but also persists an `error_kind`
+    /// classifier on the job row and appends `tried_source` to the
+    /// comma-separated `tried_sources` audit list (deduplicated).
+    /// `tried_source` is the symbolic source name (e.g. "musicbrainz",
+    /// "theaudiodb", "wikipedia", "discogs", "coverartarchive") and is
+    /// only appended when not already present.
+    pub fn fail_metadata_job_classified(
+        &self,
+        job_id: i64,
+        error: &str,
+        error_kind: Option<&str>,
+        tried_source: Option<&str>,
+    ) -> Result<()> {
         let connection = self.lock_connection()?;
         let now = now_millis();
+        // We use SQL CASE so the COALESCE/append semantics are
+        // expressed in one round-trip. The `tried_sources` column is a
+        // comma-separated string; appending preserves history without a
+        // separate junction table.
         connection.execute(
             "UPDATE metadata_jobs
              SET status = 'pending',
                  next_attempt_at = ?1 + (60000 * (1 << MIN(attempts, 8))),
                  last_error = ?2,
+                 error_kind = COALESCE(?3, error_kind),
+                 tried_sources = CASE
+                    WHEN ?4 IS NULL THEN tried_sources
+                    WHEN tried_sources IS NULL OR tried_sources = '' THEN ?4
+                    WHEN INSTR(',' || tried_sources || ',', ',' || ?4 || ',') > 0
+                        THEN tried_sources
+                    ELSE tried_sources || ',' || ?4
+                 END,
                  updated_at = ?1
-             WHERE id = ?3",
-            params![now, error, job_id],
+             WHERE id = ?5",
+            params![now, error, error_kind, tried_source, job_id],
         )?;
         Ok(())
     }
@@ -1625,7 +2645,7 @@ impl CatalogStore {
         let connection = self.lock_connection()?;
         connection
             .query_row(
-                "SELECT id, name, normalized_name, musicbrainz_id
+                "SELECT id, name, normalized_name, musicbrainz_id, discogs_id
                  FROM artists
                  WHERE id = ?1",
                 params![artist_id],
@@ -1635,6 +2655,7 @@ impl CatalogStore {
                         name: row.get(1)?,
                         normalized_name: row.get(2)?,
                         musicbrainz_id: row.get(3)?,
+                        discogs_id: row.get(4)?,
                     })
                 },
             )
@@ -1651,8 +2672,10 @@ impl CatalogStore {
                     albums.artist_id,
                     albums.title,
                     albums.normalized_title,
+                    artists.name,
                     artists.musicbrainz_id,
-                    albums.musicbrainz_release_group_id
+                    albums.musicbrainz_release_group_id,
+                    albums.discogs_master_id
                  FROM albums
                  JOIN artists ON artists.id = albums.artist_id
                  WHERE albums.id = ?1",
@@ -1663,8 +2686,10 @@ impl CatalogStore {
                         artist_id: row.get(1)?,
                         title: row.get(2)?,
                         normalized_title: row.get(3)?,
-                        artist_musicbrainz_id: row.get(4)?,
-                        musicbrainz_release_group_id: row.get(5)?,
+                        artist_name: row.get(4)?,
+                        artist_musicbrainz_id: row.get(5)?,
+                        musicbrainz_release_group_id: row.get(6)?,
+                        discogs_master_id: row.get(7)?,
                     })
                 },
             )
@@ -1712,12 +2737,19 @@ impl CatalogStore {
         Ok(())
     }
 
+    /// Persist an artist profile update from any external source. The
+    /// `bio_source` argument labels where the bio came from
+    /// (`"theaudiodb"`, `"wikipedia"`, etc.) and is only stored when a
+    /// non-NULL `bio` is supplied alongside it; this preserves the
+    /// previous source label when the caller is only updating
+    /// `audiodb_id` or `photo_asset_id`.
     pub fn save_artist_profile(
         &self,
         artist_id: i64,
         audiodb_id: Option<&str>,
         bio: Option<&str>,
         photo_asset_id: Option<i64>,
+        bio_source: Option<&str>,
     ) -> Result<()> {
         let connection = self.lock_connection()?;
         let now = now_millis();
@@ -1725,14 +2757,18 @@ impl CatalogStore {
             "UPDATE artists
              SET audiodb_id = COALESCE(?1, audiodb_id),
                  bio = COALESCE(?2, bio),
-                 bio_source = CASE WHEN ?2 IS NULL THEN bio_source ELSE 'theaudiodb' END,
+                 bio_source = CASE
+                     WHEN ?2 IS NULL THEN bio_source
+                     WHEN ?5 IS NULL THEN bio_source
+                     ELSE ?5
+                 END,
                  photo_asset_id = COALESCE(?3, photo_asset_id),
                  metadata_status = 'resolved',
                  metadata_checked_at = ?4,
                  metadata_error = NULL,
                  updated_at = ?4
-             WHERE id = ?5",
-            params![audiodb_id, bio, photo_asset_id, now, artist_id],
+             WHERE id = ?6",
+            params![audiodb_id, bio, photo_asset_id, now, bio_source, artist_id],
         )?;
         Ok(())
     }
@@ -1777,6 +2813,92 @@ impl CatalogStore {
         Ok(())
     }
 
+    /// Persist a Discogs artist id on an existing artist row. Mirrors
+    /// [`Self::resolve_artist_musicbrainz_id`] but for the Discogs side;
+    /// does NOT touch `musicbrainz_id`. Sets `metadata_status =
+    /// 'resolved'` so the activity panel reflects forward progress;
+    /// downstream jobs (`fetch_artist_discogs_profile`,
+    /// `fetch_artist_discogs_releases`) can be enqueued safely on top
+    /// of this.
+    pub fn set_artist_discogs_id(&self, artist_id: i64, discogs_id: &str) -> Result<()> {
+        let connection = self.lock_connection()?;
+        let now = now_millis();
+        connection.execute(
+            "UPDATE artists
+             SET discogs_id = ?1,
+                 metadata_status = 'resolved',
+                 metadata_checked_at = ?2,
+                 metadata_error = NULL,
+                 updated_at = ?2
+             WHERE id = ?3",
+            params![discogs_id, now, artist_id],
+        )?;
+        Ok(())
+    }
+
+    /// Persist a Discogs master id on an existing album row. Does NOT
+    /// touch `musicbrainz_release_group_id`.
+    pub fn set_album_discogs_master_id(
+        &self,
+        album_id: i64,
+        discogs_master_id: &str,
+    ) -> Result<()> {
+        let connection = self.lock_connection()?;
+        let now = now_millis();
+        connection.execute(
+            "UPDATE albums
+             SET discogs_master_id = ?1,
+                 metadata_status = 'resolved',
+                 metadata_checked_at = ?2,
+                 metadata_error = NULL,
+                 updated_at = ?2
+             WHERE id = ?3",
+            params![discogs_master_id, now, album_id],
+        )?;
+        Ok(())
+    }
+
+    /// Attach a cover asset to a single `discography_items` row by id.
+    /// Used by `fetch_discogs_thumb` when the per-row thumb has been
+    /// downloaded into an asset.
+    pub fn set_discography_item_cover(&self, item_id: i64, cover_asset_id: i64) -> Result<()> {
+        let connection = self.lock_connection()?;
+        let now = now_millis();
+        connection.execute(
+            "UPDATE discography_items
+             SET cover_asset_id = ?1, updated_at = ?2
+             WHERE id = ?3",
+            params![cover_asset_id, now, item_id],
+        )?;
+        Ok(())
+    }
+
+    /// Returns the source URL to fetch + the destination row id the
+    /// downloaded asset should be written into. The thumb worker uses
+    /// `entity_id = discography_items.id`; if the row already has a
+    /// cover or is missing a thumb URL, this returns `None` and the
+    /// worker treats that as a no-op success.
+    pub fn load_discogs_thumb_target(&self, item_id: i64) -> Result<Option<DiscogsThumbTarget>> {
+        let connection = self.lock_connection()?;
+        connection
+            .query_row(
+                "SELECT id, thumb_url FROM discography_items
+                 WHERE id = ?1
+                   AND thumb_url IS NOT NULL
+                   AND thumb_url <> ''
+                   AND cover_asset_id IS NULL",
+                params![item_id],
+                |row| {
+                    Ok(DiscogsThumbTarget {
+                        item_id: row.get(0)?,
+                        source_url: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .context("failed to load discogs thumb target")
+    }
+
     pub fn save_album_cover(&self, album_id: i64, cover_asset_id: i64) -> Result<()> {
         let connection = self.lock_connection()?;
         let now = now_millis();
@@ -1797,6 +2919,38 @@ impl CatalogStore {
                 SELECT musicbrainz_release_group_id FROM albums WHERE id = ?3
              )",
             params![cover_asset_id, now, album_id],
+        )?;
+        Ok(())
+    }
+
+    /// Mirror of [`save_artist_profile`] for albums: persists the
+    /// optional TheAudioDB album id and description on the row, tags
+    /// `description_source` as `'theaudiodb'`, and clears any prior
+    /// metadata error. Note that this does NOT bump
+    /// `albums.metadata_status`; that column tracks identity (cover /
+    /// release-group resolution) and is independent of description
+    /// availability.
+    pub fn save_album_profile(
+        &self,
+        album_id: i64,
+        audiodb_id: Option<&str>,
+        description: Option<&str>,
+        description_source: Option<&str>,
+    ) -> Result<()> {
+        let connection = self.lock_connection()?;
+        let now = now_millis();
+        connection.execute(
+            "UPDATE albums
+             SET audiodb_id = COALESCE(?1, audiodb_id),
+                 description = COALESCE(?2, description),
+                 description_source = CASE
+                     WHEN ?2 IS NULL THEN description_source
+                     WHEN ?4 IS NULL THEN description_source
+                     ELSE ?4
+                 END,
+                 updated_at = ?3
+             WHERE id = ?5",
+            params![audiodb_id, description, now, description_source, album_id],
         )?;
         Ok(())
     }
@@ -1902,22 +3056,83 @@ impl CatalogStore {
         release_type: &str,
         musicbrainz_release_group_id: Option<&str>,
     ) -> Result<i64> {
+        // Backwards-compatible thin wrapper. The legacy 5-arg call
+        // signature is preserved for the MusicBrainz-based discography
+        // job; new code uses [`upsert_discography_item_full`] to set
+        // `role`, `format`, `source`, `discogs_master_id`, and
+        // `thumb_url`.
+        self.upsert_discography_item_full(
+            artist_id,
+            title,
+            year,
+            release_type,
+            musicbrainz_release_group_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Extended upsert that lets callers populate `role`, `format`,
+    /// `source`, `discogs_master_id`, and `thumb_url`. `role` defaults
+    /// to `"Main"`, `source` defaults to `"musicbrainz"` to preserve
+    /// the prior behaviour. `thumb_url` is preserved on conflict via
+    /// COALESCE so a later MB pass doesn't clobber a Discogs-sourced
+    /// thumb URL.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_discography_item_full(
+        &self,
+        artist_id: i64,
+        title: &str,
+        year: Option<&str>,
+        release_type: &str,
+        musicbrainz_release_group_id: Option<&str>,
+        discogs_master_id: Option<&str>,
+        role: Option<&str>,
+        format: Option<&str>,
+        source: Option<&str>,
+        thumb_url: Option<&str>,
+    ) -> Result<i64> {
         let connection = self.lock_connection()?;
         let now = now_millis();
         let normalized_title = normalize_key(title);
         let sort_key = discography_sort_key(year, title);
+        let role = role.unwrap_or("Main");
+        let source = source.unwrap_or("musicbrainz");
         connection.execute(
             "INSERT INTO discography_items(
                 artist_id, title, normalized_title, year, release_type,
-                musicbrainz_release_group_id, sort_key, created_at, updated_at
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
-             ON CONFLICT(artist_id, normalized_title, release_type) DO UPDATE SET
+                musicbrainz_release_group_id, discogs_master_id,
+                role, format, source, thumb_url,
+                sort_key, created_at, updated_at
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
+             ON CONFLICT(artist_id, normalized_title, release_type, role) DO UPDATE SET
                 title = excluded.title,
-                year = COALESCE(excluded.year, discography_items.year),
+                year = COALESCE(
+                    CASE
+                        WHEN discography_items.year IS NULL THEN excluded.year
+                        WHEN excluded.year IS NULL THEN discography_items.year
+                        WHEN excluded.year < discography_items.year THEN excluded.year
+                        ELSE discography_items.year
+                    END,
+                    discography_items.year
+                ),
                 musicbrainz_release_group_id = COALESCE(
                     excluded.musicbrainz_release_group_id,
                     discography_items.musicbrainz_release_group_id
                 ),
+                discogs_master_id = COALESCE(
+                    excluded.discogs_master_id,
+                    discography_items.discogs_master_id
+                ),
+                format = COALESCE(excluded.format, discography_items.format),
+                thumb_url = COALESCE(excluded.thumb_url, discography_items.thumb_url),
+                source = CASE
+                    WHEN discography_items.source = excluded.source THEN discography_items.source
+                    ELSE 'musicbrainz+discogs'
+                END,
                 sort_key = excluded.sort_key,
                 updated_at = excluded.updated_at",
             params![
@@ -1927,6 +3142,11 @@ impl CatalogStore {
                 year,
                 release_type,
                 musicbrainz_release_group_id,
+                discogs_master_id,
+                role,
+                format,
+                source,
+                thumb_url,
                 sort_key,
                 now,
             ],
@@ -1934,8 +3154,9 @@ impl CatalogStore {
         connection
             .query_row(
                 "SELECT id FROM discography_items
-                 WHERE artist_id = ?1 AND normalized_title = ?2 AND release_type = ?3",
-                params![artist_id, normalized_title, release_type],
+                 WHERE artist_id = ?1 AND normalized_title = ?2
+                   AND release_type = ?3 AND role = ?4",
+                params![artist_id, normalized_title, release_type, role],
                 |row| row.get(0),
             )
             .context("failed to select discography item id")
@@ -2198,6 +3419,8 @@ impl CatalogStore {
             year: Option<String>,
             artwork_path: Option<PathBuf>,
             track_count: usize,
+            description: Option<String>,
+            description_state: AlbumDescriptionState,
         }
 
         // SQL-side aggregation: one row per
@@ -2206,6 +3429,11 @@ impl CatalogStore {
         // `primary_artist_name()` in Rust on the much smaller result
         // set. `MAX(COALESCE(cover, art))` mirrors the prior per-row
         // fallback for albums without a dedicated cover asset.
+        // `albums.description` is also one-per-album, so we just MAX it
+        // to keep the GROUP BY satisfied. The description-state lookup
+        // joins the latest `metadata_jobs` row (job_type =
+        // 'fetch_album_profile' or 'fetch_album_wikipedia_summary') so
+        // we can tell "tried and failed" apart from "not yet checked".
         let connection = self.lock_connection()?;
         let (root_filter, root_params) = root_path_filter(roots);
         let mut statement = connection.prepare_cached(&format!(
@@ -2216,11 +3444,19 @@ impl CatalogStore {
                 tracks.artist_name,
                 albums.year,
                 MAX(COALESCE(cover_assets.cache_path, tracks.artwork_path)) AS artwork_path,
-                COUNT(*) AS track_count
+                COUNT(*) AS track_count,
+                MAX(albums.description) AS description,
+                MAX(albums.metadata_status) AS metadata_status,
+                MAX(profile_job.error_kind) AS profile_error_kind,
+                MAX(profile_job.status) AS profile_job_status
              FROM albums
              JOIN tracks ON tracks.album_id = albums.id
              JOIN files ON files.id = tracks.file_id
              LEFT JOIN assets AS cover_assets ON cover_assets.id = albums.cover_asset_id
+             LEFT JOIN metadata_jobs AS profile_job
+                ON profile_job.entity_type = 'album'
+                AND profile_job.entity_id = albums.id
+                AND profile_job.job_type = 'fetch_album_profile'
              WHERE files.status = 'present' AND ({root_filter})
              GROUP BY albums.id, tracks.artist_name
              ORDER BY tracks.artist_name COLLATE NOCASE, albums.year, albums.normalized_title",
@@ -2236,17 +3472,39 @@ impl CatalogStore {
                 row.get::<_, Option<String>>(4)?, // year
                 artwork_path.map(PathBuf::from),
                 track_count.max(0) as usize,
+                row.get::<_, Option<String>>(7)?,  // description
+                row.get::<_, Option<String>>(8)?,  // metadata_status
+                row.get::<_, Option<String>>(9)?,  // profile_error_kind
+                row.get::<_, Option<String>>(10)?, // profile_job_status
             ))
         })?;
 
         let mut albums = HashMap::<String, AlbumAggregate>::new();
         for row in rows.filter_map(|row| row.ok()) {
-            let (album_id, artist_id, title, track_artist, year, artwork_path, track_count) = row;
+            let (
+                album_id,
+                artist_id,
+                title,
+                track_artist,
+                year,
+                artwork_path,
+                track_count,
+                description,
+                metadata_status,
+                profile_error_kind,
+                profile_job_status,
+            ) = row;
             let primary_artist = primary_artist_name(&track_artist);
             let key = format!(
                 "{}:{}",
                 normalize_key(&primary_artist),
                 normalize_key(&title)
+            );
+            let description_state = derive_album_description_state(
+                description.as_deref(),
+                metadata_status.as_deref(),
+                profile_error_kind.as_deref(),
+                profile_job_status.as_deref(),
             );
             let aggregate = albums.entry(key).or_insert_with(|| AlbumAggregate {
                 album_id,
@@ -2256,12 +3514,22 @@ impl CatalogStore {
                 year,
                 artwork_path: None,
                 track_count: 0,
+                description: None,
+                description_state: AlbumDescriptionState::Pending,
             });
 
             if aggregate.artwork_path.is_none() {
                 aggregate.artwork_path = artwork_path;
             }
             aggregate.track_count += track_count;
+            if aggregate.description.is_none() {
+                aggregate.description = description;
+            }
+            // Promote description_state to the most informative variant
+            // we've seen across the GROUP BY (Available > Unavailable >
+            // Pending).
+            aggregate.description_state =
+                merge_description_state(aggregate.description_state, description_state);
         }
 
         let mut albums = albums
@@ -2274,6 +3542,8 @@ impl CatalogStore {
                 year: album.year,
                 artwork_path: album.artwork_path,
                 track_count: album.track_count,
+                description: album.description,
+                description_state: album.description_state,
             })
             .collect::<Vec<_>>();
         albums.sort_by(|left, right| {
@@ -2468,6 +3738,10 @@ fn enqueue_missing_album_art_jobs(
     for (album_id, release_group_id, artist_musicbrainz_id) in album_rows {
         match (release_group_id, artist_musicbrainz_id) {
             (Some(_), _) => {
+                // Tier-0 Lidarr first; the legacy CAA cover job stays
+                // as fallback.
+                enqueue_metadata_job(connection, "album", album_id, "fetch_album_lidarr", now)?;
+                enqueued += 1;
                 enqueue_metadata_job(connection, "album", album_id, "fetch_album_cover", now)?;
                 enqueued += 1;
             }
@@ -2485,6 +3759,50 @@ fn enqueue_missing_album_art_jobs(
         }
     }
 
+    Ok(enqueued)
+}
+
+/// Companion backfill for album descriptions. Enqueues
+/// `fetch_album_profile` for any album that has a release-group MBID
+/// but no description yet. Albums without an MBID are handled by
+/// [`enqueue_missing_album_art_jobs`], which enqueues
+/// `resolve_album_musicbrainz`; once the MBID lands, the worker chains
+/// `fetch_album_profile` automatically.
+fn enqueue_missing_album_description_jobs(
+    connection: &Connection,
+    artist_id: Option<i64>,
+    now: i64,
+) -> Result<usize> {
+    let mut sql = String::from(
+        "SELECT albums.id
+         FROM albums
+         WHERE albums.musicbrainz_release_group_id IS NOT NULL
+           AND (albums.description IS NULL OR albums.description = '')",
+    );
+    if artist_id.is_some() {
+        sql.push_str(" AND albums.artist_id = ?1");
+    }
+    sql.push_str(" ORDER BY albums.title");
+
+    let album_ids = {
+        let mut statement = connection.prepare_cached(&sql)?;
+        if let Some(artist_id) = artist_id {
+            let rows = statement.query_map(params![artist_id], |row| row.get::<_, i64>(0))?;
+            rows.filter_map(|row| row.ok()).collect::<Vec<_>>()
+        } else {
+            let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+            rows.filter_map(|row| row.ok()).collect::<Vec<_>>()
+        }
+    };
+
+    let mut enqueued = 0usize;
+    for album_id in album_ids {
+        // Tier-0 Lidarr first; legacy TADb album profile stays as fallback.
+        enqueue_metadata_job(connection, "album", album_id, "fetch_album_lidarr", now)?;
+        enqueued += 1;
+        enqueue_metadata_job(connection, "album", album_id, "fetch_album_profile", now)?;
+        enqueued += 1;
+    }
     Ok(enqueued)
 }
 
@@ -2540,6 +3858,53 @@ fn select_id_by_i64(connection: &Connection, table: &str, column: &str, value: i
         .with_context(|| format!("failed to select id from {table}"))
 }
 
+/// Reduce the persisted `(metadata_status, error_kind, job_status)`
+/// triple to the tri-state the album hero needs.
+///
+/// - "Available": we have a description string in hand.
+/// - "Unavailable": every viable source has been exhausted (the
+///   `fetch_album_profile` job is `complete` AND the album row's
+///   metadata_status reports a terminal `missing`/`no_match`-style
+///   outcome). UI should show "No online description available."
+/// - "Pending": fall-through. Either online metadata is disabled, the
+///   job is still queued, or it has retried with `pending`/`running`
+///   status.
+fn derive_album_description_state(
+    description: Option<&str>,
+    metadata_status: Option<&str>,
+    profile_error_kind: Option<&str>,
+    profile_job_status: Option<&str>,
+) -> AlbumDescriptionState {
+    if description.is_some_and(|d| !d.trim().is_empty()) {
+        return AlbumDescriptionState::Available;
+    }
+
+    let job_complete = matches!(profile_job_status, Some("complete"));
+    let exhausted_via_status = matches!(metadata_status, Some("missing"));
+    let exhausted_via_kind = matches!(profile_error_kind, Some("no_match"));
+
+    if (job_complete && exhausted_via_status) || exhausted_via_kind {
+        return AlbumDescriptionState::Unavailable;
+    }
+
+    AlbumDescriptionState::Pending
+}
+
+fn merge_description_state(
+    current: AlbumDescriptionState,
+    incoming: AlbumDescriptionState,
+) -> AlbumDescriptionState {
+    match (current, incoming) {
+        (AlbumDescriptionState::Available, _) | (_, AlbumDescriptionState::Available) => {
+            AlbumDescriptionState::Available
+        }
+        (AlbumDescriptionState::Unavailable, _) | (_, AlbumDescriptionState::Unavailable) => {
+            AlbumDescriptionState::Unavailable
+        }
+        _ => AlbumDescriptionState::Pending,
+    }
+}
+
 fn add_column_if_missing(
     connection: &Connection,
     table: &str,
@@ -2559,6 +3924,235 @@ fn add_column_if_missing(
     let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
     connection.execute(&sql, [])?;
     Ok(())
+}
+
+/// One-shot rebuild of `discography_items`. Two pre-v6 shapes need
+/// fixing:
+///
+/// 1. Pre-v5 tables had a 3-column `UNIQUE(artist_id, normalized_title,
+///    release_type)` that doesn't admit per-role rows.
+/// 2. v5-shipped tables had column-level `UNIQUE` on
+///    `musicbrainz_release_group_id` and `discogs_master_id`. With
+///    `role` now part of the natural key, the same MBID can legitimately
+///    appear in more than one row across artists; the column-level
+///    UNIQUE rejected those upserts and surfaced as the
+///    "UNIQUE constraint failed: discography_items.musicbrainz_release_group_id"
+///    we observed in the wild.
+///
+/// The v6 shape:
+/// - `UNIQUE(artist_id, normalized_title, release_type, role)`
+/// - `UNIQUE(artist_id, musicbrainz_release_group_id)` (table-level,
+///   admits NULLs)
+/// - Partial unique index on `discogs_master_id` (per artist scope is
+///   not enforced; Discogs ids are globally unique).
+///
+/// SQLite can't drop column-level UNIQUE in place, so we rebuild the
+/// table when either pre-v6 shape is detected. Idempotent on already-v6
+/// tables.
+fn rebuild_discography_items_unique(connection: &Connection) -> Result<()> {
+    let mut indexes_stmt =
+        connection.prepare("SELECT name, [unique] FROM pragma_index_list('discography_items')")?;
+    let unique_index_names: Vec<String> = indexes_stmt
+        .query_map([], |row| {
+            let name: String = row.get(0)?;
+            let is_unique: i64 = row.get(1)?;
+            Ok((name, is_unique))
+        })?
+        .filter_map(|row| row.ok())
+        .filter(|(_, unique)| *unique != 0)
+        .map(|(name, _)| name)
+        .collect();
+
+    let mut has_legacy_3col_unique = false;
+    let mut has_role_unique = false;
+    let mut has_artist_mbid_unique = false;
+    let mut has_column_mbid_unique = false;
+    let mut has_column_discogs_unique = false;
+    for index_name in &unique_index_names {
+        let mut info_stmt = connection.prepare(&format!(
+            "SELECT name FROM pragma_index_info({})",
+            quote_sql_string(index_name)
+        ))?;
+        let columns: Vec<String> = info_stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|row| row.ok())
+            .collect();
+        match columns.as_slice() {
+            cols if cols.len() == 3
+                && cols[0] == "artist_id"
+                && cols[1] == "normalized_title"
+                && cols[2] == "release_type" =>
+            {
+                has_legacy_3col_unique = true;
+            }
+            cols if cols.len() == 4
+                && cols[0] == "artist_id"
+                && cols[1] == "normalized_title"
+                && cols[2] == "release_type"
+                && cols[3] == "role" =>
+            {
+                has_role_unique = true;
+            }
+            cols if cols.len() == 2
+                && cols[0] == "artist_id"
+                && cols[1] == "musicbrainz_release_group_id" =>
+            {
+                has_artist_mbid_unique = true;
+            }
+            cols if cols.len() == 1 && cols[0] == "musicbrainz_release_group_id" => {
+                // The auto-index for the column-level UNIQUE is named
+                // `sqlite_autoindex_*`; the named partial index we
+                // create separately doesn't show in pragma_index_list
+                // with a single column at this point. Treat any
+                // single-column unique on this field as the bad one.
+                has_column_mbid_unique = true;
+            }
+            cols if cols.len() == 1 && cols[0] == "discogs_master_id" => {
+                // Same treatment for discogs_master_id; we'll rebuild
+                // even if the user-defined partial index exists, since
+                // the column-level UNIQUE that came with v5 is what we
+                // need to drop.
+                has_column_discogs_unique = true;
+            }
+            _ => {}
+        }
+    }
+    drop(indexes_stmt);
+
+    // The user-defined partial unique index on `discogs_master_id` (
+    // `discography_items_discogs_master_idx`) shows up as a 1-column
+    // UNIQUE too. Distinguish it from the column-level constraint by
+    // inspecting `sql` from `sqlite_master` -- the auto-index has no
+    // SQL stored.
+    let column_mbid_is_auto = if has_column_mbid_unique {
+        connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master
+                 WHERE type = 'index'
+                   AND tbl_name = 'discography_items'
+                   AND name LIKE 'sqlite_autoindex_%'
+                   AND sql IS NULL
+                   AND name IN (SELECT name FROM pragma_index_list('discography_items')
+                                WHERE [unique] = 1)
+                   AND EXISTS (SELECT 1 FROM pragma_index_info(name)
+                               WHERE name = 'musicbrainz_release_group_id')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some()
+    } else {
+        false
+    };
+    let column_discogs_is_auto = if has_column_discogs_unique {
+        connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master
+                 WHERE type = 'index'
+                   AND tbl_name = 'discography_items'
+                   AND name LIKE 'sqlite_autoindex_%'
+                   AND sql IS NULL
+                   AND name IN (SELECT name FROM pragma_index_list('discography_items')
+                                WHERE [unique] = 1)
+                   AND EXISTS (SELECT 1 FROM pragma_index_info(name)
+                               WHERE name = 'discogs_master_id')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some()
+    } else {
+        false
+    };
+
+    let needs_rebuild = has_legacy_3col_unique
+        || !has_role_unique
+        || column_mbid_is_auto
+        || column_discogs_is_auto
+        || !has_artist_mbid_unique;
+
+    if !needs_rebuild {
+        return Ok(());
+    }
+
+    connection.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         BEGIN;
+
+         CREATE TABLE discography_items_new (
+            id INTEGER PRIMARY KEY,
+            artist_id INTEGER NOT NULL REFERENCES artists(id),
+            title TEXT NOT NULL,
+            normalized_title TEXT NOT NULL,
+            year TEXT,
+            release_type TEXT NOT NULL,
+            musicbrainz_release_group_id TEXT,
+            discogs_master_id TEXT,
+            cover_asset_id INTEGER REFERENCES assets(id),
+            local_album_id INTEGER REFERENCES albums(id),
+            is_local INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'musicbrainz',
+            role TEXT NOT NULL DEFAULT 'Main',
+            format TEXT,
+            thumb_url TEXT,
+            sort_key TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(artist_id, normalized_title, release_type, role),
+            UNIQUE(artist_id, musicbrainz_release_group_id)
+         );
+
+         INSERT INTO discography_items_new(
+            id, artist_id, title, normalized_title, year, release_type,
+            musicbrainz_release_group_id, discogs_master_id, cover_asset_id,
+            local_album_id, is_local, source, role, format, thumb_url,
+            sort_key, created_at, updated_at
+         )
+         SELECT
+            id, artist_id, title, normalized_title, year, release_type,
+            musicbrainz_release_group_id,
+            COALESCE(discogs_master_id, NULL),
+            cover_asset_id,
+            local_album_id, is_local,
+            COALESCE(source, 'musicbrainz'),
+            COALESCE(role, 'Main'),
+            COALESCE(format, NULL),
+            COALESCE(thumb_url, NULL),
+            sort_key, created_at, updated_at
+         FROM discography_items;
+
+         DROP TABLE discography_items;
+         ALTER TABLE discography_items_new RENAME TO discography_items;
+
+         CREATE INDEX IF NOT EXISTS discography_artist_idx
+            ON discography_items(artist_id, sort_key);
+         CREATE UNIQUE INDEX IF NOT EXISTS discography_items_discogs_master_idx
+            ON discography_items(discogs_master_id) WHERE discogs_master_id IS NOT NULL;
+
+         COMMIT;
+         PRAGMA foreign_keys = ON;",
+    )?;
+    perf::event(
+        "catalog.migrate.rebuilt",
+        "table=discography_items reason=v6_drop_column_unique",
+    );
+    Ok(())
+}
+
+/// SQL string literal escaper for identifiers passed via SQL string
+/// (`pragma_index_info('name')`). Wraps the value in single quotes and
+/// doubles any embedded single quotes.
+fn quote_sql_string(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push('\'');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('\'');
+    quoted
 }
 
 fn normalize_key(value: &str) -> String {
@@ -2828,6 +4422,123 @@ mod tests {
     #[test]
     fn normalizes_keys_for_matching() {
         assert_eq!(normalize_key("  The   Cure "), "the cure");
+    }
+
+    #[test]
+    fn description_state_is_available_when_text_present() {
+        assert_eq!(
+            derive_album_description_state(Some("a great record"), None, None, None,),
+            AlbumDescriptionState::Available,
+        );
+    }
+
+    #[test]
+    fn description_state_is_unavailable_when_complete_and_missing() {
+        assert_eq!(
+            derive_album_description_state(None, Some("missing"), None, Some("complete")),
+            AlbumDescriptionState::Unavailable,
+        );
+    }
+
+    #[test]
+    fn description_state_is_unavailable_on_no_match() {
+        assert_eq!(
+            derive_album_description_state(None, None, Some("no_match"), None),
+            AlbumDescriptionState::Unavailable,
+        );
+    }
+
+    #[test]
+    fn description_state_is_pending_when_in_flight() {
+        assert_eq!(
+            derive_album_description_state(None, Some("running"), None, Some("running")),
+            AlbumDescriptionState::Pending,
+        );
+        assert_eq!(
+            derive_album_description_state(None, None, None, None),
+            AlbumDescriptionState::Pending,
+        );
+    }
+
+    #[test]
+    fn description_state_promotes_available_over_unavailable_on_merge() {
+        assert_eq!(
+            merge_description_state(
+                AlbumDescriptionState::Unavailable,
+                AlbumDescriptionState::Available,
+            ),
+            AlbumDescriptionState::Available,
+        );
+        assert_eq!(
+            merge_description_state(
+                AlbumDescriptionState::Available,
+                AlbumDescriptionState::Pending,
+            ),
+            AlbumDescriptionState::Available,
+        );
+        assert_eq!(
+            merge_description_state(
+                AlbumDescriptionState::Pending,
+                AlbumDescriptionState::Unavailable,
+            ),
+            AlbumDescriptionState::Unavailable,
+        );
+    }
+
+    #[test]
+    fn save_album_profile_round_trip() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = CatalogStore::open_at(
+            temp_dir.path().join("tempo.sqlite"),
+            temp_dir.path().join("cache"),
+        )
+        .unwrap();
+
+        let now = now_millis();
+        let (artist_id, album_id) = {
+            let connection = store.lock_connection().unwrap();
+            let artist_id = upsert_artist(&connection, "Brian Eno", now).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO albums(
+                        title, normalized_title, artist_id, artist_name, year,
+                        created_at, updated_at
+                     ) VALUES('Another Green World', 'another green world', ?1, 'Brian Eno', '1975', ?2, ?2)",
+                    params![artist_id, now],
+                )
+                .unwrap();
+            let album_id: i64 = connection
+                .query_row(
+                    "SELECT id FROM albums WHERE artist_id = ?1",
+                    params![artist_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (artist_id, album_id)
+        };
+        let _ = artist_id;
+
+        store
+            .save_album_profile(
+                album_id,
+                Some("audiodb-id-123"),
+                Some("an ambient classic"),
+                Some("theaudiodb"),
+            )
+            .unwrap();
+
+        let connection = store.lock_connection().unwrap();
+        let (audiodb_id, description, source): (Option<String>, Option<String>, Option<String>) =
+            connection
+                .query_row(
+                    "SELECT audiodb_id, description, description_source FROM albums WHERE id = ?1",
+                    params![album_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+        assert_eq!(audiodb_id.as_deref(), Some("audiodb-id-123"));
+        assert_eq!(description.as_deref(), Some("an ambient classic"));
+        assert_eq!(source.as_deref(), Some("theaudiodb"));
     }
 
     #[test]

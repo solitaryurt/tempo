@@ -114,12 +114,28 @@ impl TempoApp {
         if album.artwork_path.is_none() {
             self.queue_album_cover_demand(album.album_id);
         }
+        // Trigger an on-demand description fetch the first time this
+        // hero is rendered without a description already in hand. The
+        // demand queue dedupes per-session so this is cheap. Skipped
+        // when the album is in the `Unavailable` terminal state.
+        if album.description.is_none()
+            && album.description_state != AlbumDescriptionState::Unavailable
+        {
+            self.queue_album_profile_demand(album.album_id);
+        }
         let colors = *self.colors();
-        let artist_bio = self
-            .artist_by_id(album.artist_id)
-            .and_then(|artist| artist.bio.clone());
-        let description = artist_bio.unwrap_or_else(|| {
-            album
+        // Description priority:
+        //   1. Real online description from TheAudioDB / Wikipedia /
+        //      Discogs (Phase 1 fills in #1; Phase 2/3 add the others).
+        //   2. Synthetic local fallback while still pending.
+        //   3. "No online description available." once every fallback
+        //      source has been exhausted.
+        let description = match (album.description.clone(), album.description_state) {
+            (Some(text), _) if !text.trim().is_empty() => text,
+            (_, AlbumDescriptionState::Unavailable) => {
+                "No online description available.".to_string()
+            }
+            _ => album
                 .year
                 .as_ref()
                 .map(|year| {
@@ -133,8 +149,8 @@ impl TempoApp {
                         "A local album by {}, collected in your library with {} tracks.",
                         album.artist, album.track_count
                     )
-                })
-        });
+                }),
+        };
 
         Some(
             div()

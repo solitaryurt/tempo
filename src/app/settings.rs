@@ -676,7 +676,82 @@ impl TempoApp {
                                 OnlineMetadataMode::Automatic,
                                 cx,
                             )),
+                    )
+                    .when(self.online_metadata_mode == OnlineMetadataMode::Automatic, |this| {
+                        this.child(self.render_online_metadata_resync_row(cx))
+                    }),
+            )
+    }
+
+    /// Manual "Resync metadata" action surfaced as a button row inside
+    /// the Online Metadata settings panel. Walks every artist/album
+    /// that's still missing a bio, photo, description, or cover and
+    /// enqueues the next link in the multi-source fallback chain.
+    /// Useful after a fresh build that adds new sources (Wikipedia /
+    /// Discogs) lands on a library that previously got stuck on
+    /// TheAudioDB-only enrichment.
+    fn render_online_metadata_resync_row(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+        let activity = &self.metadata_activity;
+        let status_label = if activity.is_active() {
+            format!(
+                "Syncing… {} active, {} queued",
+                activity.running.max(1),
+                activity.pending,
+            )
+        } else if let Some(reported) = self.metadata_resync_status.as_deref() {
+            reported.to_string()
+        } else {
+            "Idle".to_string()
+        };
+
+        div()
+            .pt_2()
+            .border_t_1()
+            .border_color(rgb(colors.border))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(colors.text_strong))
+                            .child("Resync metadata"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(colors.text_muted))
+                            .child(status_label),
                     ),
+            )
+            .child(
+                div()
+                    .id("online-metadata-resync")
+                    .cursor_pointer()
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(colors.waveform_border))
+                    .bg(rgb(colors.button))
+                    .text_color(rgb(colors.text))
+                    .hover(|this| this.bg(rgb(colors.button_hover)))
+                    .active(|this| this.opacity(0.82))
+                    .child("Resync now")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.run_metadata_resync();
+                        cx.notify();
+                    })),
             )
     }
 

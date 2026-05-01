@@ -804,7 +804,7 @@ impl TempoApp {
                     }
                     Page::Liked
                     | Page::PlaybackHistory
-                    | Page::ScanErrors
+                    | Page::Errors
                     | Page::Analytics
                     | Page::Settings => {}
                 }

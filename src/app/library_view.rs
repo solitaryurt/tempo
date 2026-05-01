@@ -19,7 +19,7 @@ impl TempoApp {
             Page::Genres => self.render_genres_page(window, cx).into_any_element(),
             Page::Liked => self.render_liked_page(cx).into_any_element(),
             Page::PlaybackHistory => self.render_playback_history_page(cx).into_any_element(),
-            Page::ScanErrors => self.render_scan_errors_page(cx).into_any_element(),
+            Page::Errors => self.render_errors_page(cx).into_any_element(),
             Page::Analytics => div()
                 .flex_1()
                 .min_w_0()
@@ -752,20 +752,92 @@ impl TempoApp {
         .into_any_element()
     }
 
+    /// Compute a wall-clock ETA for the pending enrichment queue.
+    ///
+    /// The worker is single-threaded and serializes all jobs, but each
+    /// job's pacing wait is keyed on the source it hits (MusicBrainz,
+    /// TheAudioDB, Wikipedia, Discogs, Cover Art Archive). Different
+    /// sources don't share rate-limit slots, so jobs that target
+    /// distinct sources can overlap the *waits* even though the work
+    /// itself runs serially. The wall-clock floor is therefore the
+    /// max across per-source totals, not the sum.
+    ///
+    /// Per-source delays mirror the worker's `*_DELAY` constants in
+    /// `metadata_worker.rs`. Jobs that touch two sources sequentially
+    /// (Wikipedia summary jobs hit MusicBrainz first, then Wikipedia)
+    /// contribute to both totals.
+    ///
+    /// `fetch_artist_discography` and `fetch_artist_discogs_releases`
+    /// paginate; we approximate at 3 pages per job on average.
     fn metadata_sync_eta_label(&self) -> Option<String> {
         let activity = &self.metadata_activity;
-        let estimated_seconds = activity.pending_artist_resolve
-            + activity.pending_artist_discography
-            + activity.pending_album_resolve
-            + activity.pending_album_cover
-            + (activity.pending_artist_profile * 2);
 
-        if estimated_seconds == 0 {
+        // Per-source delays, in milliseconds. Match the worker's
+        // `*_DELAY` constants (1.0s MB, 2.0s TADb, 0.25s Wikipedia,
+        // 2.4s Discogs, 1.0s Lidarr). Cover Art Archive has no
+        // explicit slot but is bound by HTTP latency; treat as
+        // 0.5s/job.
+        const MB_MS: u64 = 1_000;
+        const TADB_MS: u64 = 2_000;
+        const WIKI_MS: u64 = 250;
+        const DISCOGS_MS: u64 = 2_400;
+        const CAA_MS: u64 = 500;
+        const LIDARR_MS: u64 = 1_000;
+        const PAGES_AVG: u64 = 3;
+
+        // MusicBrainz: artist resolve, album resolve, MB-based discography (paginated),
+        // and the MB url-rels lookup that prefixes both Wikipedia jobs.
+        let mb_jobs = activity.pending_artist_resolve as u64
+            + activity.pending_album_resolve as u64
+            + (activity.pending_artist_discography as u64) * PAGES_AVG
+            + activity.pending_artist_wikipedia_summary as u64
+            + activity.pending_album_wikipedia_summary as u64;
+        let mb_total_ms = mb_jobs * MB_MS;
+
+        // TheAudioDB: artist profile, album profile, TADb-search fallbacks for both.
+        let tadb_jobs = activity.pending_artist_profile as u64
+            + activity.pending_album_profile as u64
+            + activity.pending_artist_audiodb_search as u64
+            + activity.pending_album_audiodb_search as u64;
+        let tadb_total_ms = tadb_jobs * TADB_MS;
+
+        // Wikipedia REST summary: one call per Wikipedia summary job.
+        let wiki_jobs = activity.pending_artist_wikipedia_summary as u64
+            + activity.pending_album_wikipedia_summary as u64;
+        let wiki_total_ms = wiki_jobs * WIKI_MS;
+
+        // Discogs: identity searches, profile, releases (paginated),
+        // album image, and per-row thumbs.
+        let discogs_jobs = activity.pending_artist_discogs_search as u64
+            + activity.pending_album_discogs_search as u64
+            + activity.pending_artist_discogs_profile as u64
+            + activity.pending_album_discogs_image as u64
+            + (activity.pending_artist_discogs_releases as u64) * PAGES_AVG
+            + activity.pending_thumb_fetch as u64;
+        let discogs_total_ms = discogs_jobs * DISCOGS_MS;
+
+        // Cover Art Archive: album cover fetches.
+        let caa_total_ms = activity.pending_album_cover as u64 * CAA_MS;
+
+        // Lidarr: tier-0 artist + album lookups. Single round-trip
+        // each; the worker paces at LIDARR_DELAY (1s).
+        let lidarr_jobs =
+            activity.pending_artist_lidarr as u64 + activity.pending_album_lidarr as u64;
+        let lidarr_total_ms = lidarr_jobs * LIDARR_MS;
+
+        let estimated_ms = mb_total_ms
+            .max(tadb_total_ms)
+            .max(wiki_total_ms)
+            .max(discogs_total_ms)
+            .max(caa_total_ms)
+            .max(lidarr_total_ms);
+
+        if estimated_ms == 0 {
             return None;
         }
 
-        Some(Self::metadata_duration_label(Duration::from_secs(
-            estimated_seconds as u64,
+        Some(Self::metadata_duration_label(Duration::from_millis(
+            estimated_ms,
         )))
     }
 
@@ -789,42 +861,151 @@ impl TempoApp {
         }
     }
 
-    pub(super) fn render_scan_errors_page(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
+    pub(super) fn render_errors_page(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let colors = *self.colors();
-        let item_count = self.scan_errors.len();
-        let subtitle = if self.scan_errors.is_empty() {
-            "No scan errors".to_string()
-        } else {
+        let total = self.total_error_count();
+        let visible_rows = self.visible_error_rows();
+        let visible_count = visible_rows.len();
+        let subtitle = if total == 0 {
+            "No errors".to_string()
+        } else if visible_count == total {
             format!(
-                "{} {} from the current scan",
-                self.scan_errors.len(),
-                if self.scan_errors.len() == 1 {
-                    "error"
-                } else {
-                    "errors"
-                }
+                "{total} {} from scans and online metadata",
+                if total == 1 { "error" } else { "errors" }
             )
+        } else {
+            format!("{visible_count} of {total} errors visible (filters applied)")
         };
 
         div()
-            .id("scan-errors-page")
+            .id("errors-page")
             .flex_1()
             .min_w_0()
             .bg(rgb(colors.surface))
             .flex()
             .flex_col()
-            .child(self.render_simple_page_header("Scan Errors", subtitle))
+            .child(self.render_simple_page_header("Errors", subtitle))
             .child(self.render_tab_bar(cx))
+            .child(self.render_errors_badge_bar(cx))
             .child(
                 div()
-                    .id("scan-errors-scroll")
+                    .id("errors-scroll")
                     .flex_1()
                     .min_h_0()
-                    .child(self.render_scan_errors_table(item_count, cx)),
+                    .child(self.render_errors_table(visible_rows, cx)),
             )
+    }
+
+    /// Toggleable badge bar rendered between the header and the table.
+    /// One pill per `ErrorCategory`, plus All/None shortcuts on the
+    /// right. Active pills use `colors.accent`; inactive pills are
+    /// dimmed. Counts come from `error_counts_by_category` (full
+    /// underlying state, not filtered).
+    fn render_errors_badge_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+        let counts = self.error_counts_by_category();
+        let active = self.active_error_filters.clone();
+
+        let mut row = div()
+            .id("errors-badge-bar")
+            .flex_none()
+            .px_4()
+            .py_2()
+            .border_b_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.app))
+            .flex()
+            .items_center()
+            .gap_2();
+
+        for category in ErrorCategory::ALL {
+            let count = counts.get(&category).copied().unwrap_or(0);
+            let is_active = active.contains(&category);
+            let label = format!("{} {}", category.label(), count);
+            let id = SharedString::from(format!(
+                "errors-badge-{}",
+                category.label().to_lowercase().replace(' ', "-")
+            ));
+            let bg = if is_active {
+                colors.accent
+            } else {
+                colors.elevated
+            };
+            let fg = if is_active {
+                colors.text_strong
+            } else {
+                colors.text_muted
+            };
+            let border = if is_active {
+                colors.accent
+            } else {
+                colors.border
+            };
+            let pill = div()
+                .id(id)
+                .h(px(24.0))
+                .px_3()
+                .rounded_full()
+                .border_1()
+                .border_color(rgb(border))
+                .bg(rgb(bg))
+                .text_xs()
+                .text_color(rgb(fg))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_error_filter(category);
+                    cx.notify();
+                }));
+            row = row.child(pill);
+        }
+
+        // Right-side spacer + All/None shortcuts.
+        let all_button = div()
+            .id("errors-badge-all")
+            .h(px(24.0))
+            .px_3()
+            .rounded_full()
+            .border_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.elevated))
+            .text_xs()
+            .text_color(rgb(colors.text_muted))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .child("All")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.set_all_error_filters(true);
+                cx.notify();
+            }));
+        let none_button = div()
+            .id("errors-badge-none")
+            .h(px(24.0))
+            .px_3()
+            .rounded_full()
+            .border_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.elevated))
+            .text_xs()
+            .text_color(rgb(colors.text_muted))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .child("None")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.set_all_error_filters(false);
+                cx.notify();
+            }));
+
+        row.child(div().flex_1())
+            .child(all_button)
+            .child(none_button)
     }
 
     pub(super) fn render_simple_page_header(
@@ -859,13 +1040,20 @@ impl TempoApp {
             )
     }
 
-    fn render_scan_errors_table(
+    fn render_errors_table(
         &self,
-        item_count: usize,
+        rows: Vec<ErrorRowView>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let colors = *self.colors();
-        let scroll_handle = self.scan_errors_scroll_handle.clone();
+        let scroll_handle = self.errors_scroll_handle.clone();
+        let item_count = rows.len();
+        let total = self.total_error_count();
+        let empty_message = if total == 0 {
+            "No errors".to_string()
+        } else {
+            "No errors match the selected filters.".to_string()
+        };
 
         div()
             .flex()
@@ -874,41 +1062,38 @@ impl TempoApp {
             .child(self.render_resizable_table_header(
                 27.0,
                 &[
-                    ColumnResizeTarget::ScanError(ScanErrorColumn::Index),
-                    ColumnResizeTarget::ScanError(ScanErrorColumn::Path),
-                    ColumnResizeTarget::ScanError(ScanErrorColumn::Error),
+                    ColumnResizeTarget::Error(ErrorColumn::Index),
+                    ColumnResizeTarget::Error(ErrorColumn::Kind),
+                    ColumnResizeTarget::Error(ErrorColumn::Path),
+                    ColumnResizeTarget::Error(ErrorColumn::Error),
                 ],
                 cx,
             ))
-            .when(self.scan_errors.is_empty(), |this| {
+            .when(item_count == 0, |this| {
                 this.child(
                     div()
                         .p_5()
                         .text_color(rgb(colors.text_muted))
-                        .child("No scan errors for the current scan."),
+                        .child(empty_message),
                 )
             })
-            .when(!self.scan_errors.is_empty(), |this| {
+            .when(item_count > 0, |this| {
+                let rows = std::sync::Arc::new(rows);
+                let rows_for_processor = rows.clone();
                 this.child(
                     uniform_list(
-                        "scan-errors-rows",
+                        "errors-rows",
                         item_count,
                         cx.processor(move |this, range: Range<usize>, _window, _cx| {
                             let visible = range.end.saturating_sub(range.start);
                             let _build_span = perf::span(
-                                "scan_errors.uniform_list.build",
+                                "errors.uniform_list.build",
                                 format!("rows={} range={}..{}", visible, range.start, range.end),
                             );
-                            let item_count = this.scan_errors.len();
-
                             range
                                 .filter_map(|row_ix| {
-                                    let error_ix = item_count.checked_sub(row_ix + 1)?;
-                                    let error = this.scan_errors.get(error_ix)?;
-                                    Some(
-                                        this.render_scan_error_row(row_ix, error)
-                                            .into_any_element(),
-                                    )
+                                    let view = rows_for_processor.get(row_ix)?.clone();
+                                    Some(this.render_error_row(row_ix, view).into_any_element())
                                 })
                                 .collect()
                         }),
@@ -920,8 +1105,9 @@ impl TempoApp {
             })
     }
 
-    fn render_scan_error_row(&self, ix: usize, error: &IndexingError) -> impl IntoElement {
+    fn render_error_row(&self, ix: usize, view: ErrorRowView) -> impl IntoElement {
         let colors = *self.colors();
+        let category = view.category;
 
         div()
             .min_h(px(TABLE_ROW_H))
@@ -939,27 +1125,53 @@ impl TempoApp {
             .gap_3()
             .child(
                 div()
-                    .w(px(self.scan_error_column_width(ScanErrorColumn::Index)))
+                    .w(px(self.error_column_width(ErrorColumn::Index)))
                     .flex_none()
                     .text_color(rgb(colors.text_faint))
                     .child((ix + 1).to_string()),
             )
             .child(
                 div()
-                    .w(px(self.scan_error_column_width(ScanErrorColumn::Path)))
+                    .w(px(self.error_column_width(ErrorColumn::Kind)))
+                    .flex_none()
+                    .child(self.render_error_category_badge(category)),
+            )
+            .child(
+                div()
+                    .w(px(self.error_column_width(ErrorColumn::Path)))
                     .flex_none()
                     .text_color(rgb(colors.text_strong))
                     .overflow_hidden()
                     .text_ellipsis()
-                    .child(error.path.display().to_string()),
+                    .child(view.path_label),
             )
             .child(
                 div()
-                    .w(px(self.scan_error_column_width(ScanErrorColumn::Error)))
+                    .w(px(self.error_column_width(ErrorColumn::Error)))
                     .min_w_0()
                     .text_color(rgb(colors.text_muted))
-                    .child(error.message.clone()),
+                    .child(view.message),
             )
+    }
+
+    /// Inline pill rendered inside the TYPE column. Reuses the same
+    /// dimmed-elevated pill styling as the badge bar so the visual
+    /// vocabulary stays consistent across the page.
+    fn render_error_category_badge(&self, category: ErrorCategory) -> impl IntoElement {
+        let colors = *self.colors();
+        div()
+            .h(px(20.0))
+            .px_2()
+            .rounded_full()
+            .border_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.elevated))
+            .text_xs()
+            .text_color(rgb(colors.text_muted))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(category.label())
     }
 
     /// Format a precomputed library byte total. `TempoApp::library_size_bytes`

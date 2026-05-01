@@ -544,10 +544,18 @@ impl TempoApp {
                 let Ok(activity) = catalog.load_metadata_activity() else {
                     continue;
                 };
+                // Errors page piggybacks on the same poll cadence so we
+                // don't add a third timer. Failures here are logged but
+                // don't gate the activity update.
+                let metadata_errors = catalog.load_metadata_errors().unwrap_or_else(|error| {
+                    perf::event("metadata.errors.poll_error", format!("error={error:#}"));
+                    Vec::new()
+                });
 
                 if this
                     .update(cx, |app, cx| {
                         app.metadata_activity = activity;
+                        app.metadata_errors = metadata_errors;
                         cx.notify();
                     })
                     .is_err()

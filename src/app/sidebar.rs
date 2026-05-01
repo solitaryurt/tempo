@@ -210,12 +210,12 @@ impl TempoApp {
                 Page::PlaybackHistory,
                 cx,
             ))
-            .when(self.scan_progress.errors > 0, |this| {
+            .when(self.has_any_errors(), |this| {
                 this.child(self.render_nav_item(
-                    "Scan Errors",
-                    Self::format_count_short(self.scan_progress.errors),
-                    self.page == Page::ScanErrors,
-                    Page::ScanErrors,
+                    "Errors",
+                    Self::format_count_short(self.total_error_count()),
+                    self.page == Page::Errors,
+                    Page::Errors,
                     cx,
                 ))
             })
@@ -609,7 +609,7 @@ impl TempoApp {
 <path d="M12 7.4V12L15.5 14.1" fill="none" stroke="{accent_stroke}" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
 <path d="M5.5 6.3L3.8 4.6M18.5 6.3L20.2 4.6" fill="none" stroke="{color}" stroke-width="1.4" stroke-linecap="round"/>"#
             ),
-            Page::ScanErrors => format!(
+            Page::Errors => format!(
                 r#"<path d="M12 4.2L20 18.2H4L12 4.2Z" fill="none" stroke="{color}" stroke-width="1.6" stroke-linejoin="round"/>
 <path d="M12 9V13" fill="none" stroke="{accent_stroke}" stroke-width="1.8" stroke-linecap="round"/>
 <circle cx="12" cy="16" r="1" fill="{accent_stroke}"/>"#

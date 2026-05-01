@@ -41,7 +41,7 @@ impl TempoApp {
             ColumnResizeTarget::Artist(column) => self.artist_table_column_width(column),
             ColumnResizeTarget::Album(column) => self.album_table_column_width(column),
             ColumnResizeTarget::Genre(column) => self.genre_table_column_width(column),
-            ColumnResizeTarget::ScanError(column) => self.scan_error_column_width(column),
+            ColumnResizeTarget::Error(column) => self.error_column_width(column),
             ColumnResizeTarget::PlaybackHistoryPlayedAt => self.playback_history_played_at_width,
         }
     }
@@ -97,11 +97,12 @@ impl TempoApp {
         }
     }
 
-    pub(super) fn scan_error_column_width(&self, column: ScanErrorColumn) -> f32 {
+    pub(super) fn error_column_width(&self, column: ErrorColumn) -> f32 {
         match column {
-            ScanErrorColumn::Index => self.scan_error_column_widths.index,
-            ScanErrorColumn::Path => self.scan_error_column_widths.path,
-            ScanErrorColumn::Error => self.scan_error_column_widths.error,
+            ErrorColumn::Index => self.error_column_widths.index,
+            ErrorColumn::Kind => self.error_column_widths.kind,
+            ErrorColumn::Path => self.error_column_widths.path,
+            ErrorColumn::Error => self.error_column_widths.error,
         }
     }
 
@@ -131,10 +132,11 @@ impl TempoApp {
                 GenreTableColumn::Tracks => self.genre_table_column_widths.tracks = width,
                 GenreTableColumn::Duration => self.genre_table_column_widths.duration = width,
             },
-            ColumnResizeTarget::ScanError(column) => match column {
-                ScanErrorColumn::Index => self.scan_error_column_widths.index = width,
-                ScanErrorColumn::Path => self.scan_error_column_widths.path = width,
-                ScanErrorColumn::Error => self.scan_error_column_widths.error = width,
+            ColumnResizeTarget::Error(column) => match column {
+                ErrorColumn::Index => self.error_column_widths.index = width,
+                ErrorColumn::Kind => self.error_column_widths.kind = width,
+                ErrorColumn::Path => self.error_column_widths.path = width,
+                ErrorColumn::Error => self.error_column_widths.error = width,
             },
             ColumnResizeTarget::PlaybackHistoryPlayedAt => {
                 self.playback_history_played_at_width = width
@@ -303,8 +305,8 @@ impl TempoApp {
             | ColumnResizeTarget::Album(AlbumTableColumn::Artist)
             | ColumnResizeTarget::Genre(GenreTableColumn::Genre)
             | ColumnResizeTarget::Genre(GenreTableColumn::Artists)
-            | ColumnResizeTarget::ScanError(ScanErrorColumn::Path)
-            | ColumnResizeTarget::ScanError(ScanErrorColumn::Error) => 96.0,
+            | ColumnResizeTarget::Error(ErrorColumn::Path)
+            | ColumnResizeTarget::Error(ErrorColumn::Error) => 96.0,
             ColumnResizeTarget::Artist(ArtistTableColumn::Albums)
             | ColumnResizeTarget::Artist(ArtistTableColumn::Tracks)
             | ColumnResizeTarget::Artist(ArtistTableColumn::Duration)
@@ -314,7 +316,8 @@ impl TempoApp {
             | ColumnResizeTarget::Genre(GenreTableColumn::Albums)
             | ColumnResizeTarget::Genre(GenreTableColumn::Tracks)
             | ColumnResizeTarget::Genre(GenreTableColumn::Duration)
-            | ColumnResizeTarget::ScanError(ScanErrorColumn::Index) => 52.0,
+            | ColumnResizeTarget::Error(ErrorColumn::Index)
+            | ColumnResizeTarget::Error(ErrorColumn::Kind) => 52.0,
             ColumnResizeTarget::PlaybackHistoryPlayedAt => 120.0,
         }
     }
@@ -514,9 +517,10 @@ impl TempoApp {
             ColumnResizeTarget::Genre(GenreTableColumn::Albums) => "Albums",
             ColumnResizeTarget::Genre(GenreTableColumn::Tracks) => "Tracks",
             ColumnResizeTarget::Genre(GenreTableColumn::Duration) => "Duration",
-            ColumnResizeTarget::ScanError(ScanErrorColumn::Index) => "#",
-            ColumnResizeTarget::ScanError(ScanErrorColumn::Path) => "PATH",
-            ColumnResizeTarget::ScanError(ScanErrorColumn::Error) => "ERROR",
+            ColumnResizeTarget::Error(ErrorColumn::Index) => "#",
+            ColumnResizeTarget::Error(ErrorColumn::Kind) => "TYPE",
+            ColumnResizeTarget::Error(ErrorColumn::Path) => "PATH",
+            ColumnResizeTarget::Error(ErrorColumn::Error) => "ERROR",
             ColumnResizeTarget::PlaybackHistoryPlayedAt => "PLAYED AT",
         }
     }
@@ -571,14 +575,15 @@ impl TempoApp {
                     GenreTableColumn::Duration => format_duration_compact(genre.duration_value),
                 })
                 .collect(),
-            ColumnResizeTarget::ScanError(column) => self
-                .scan_errors
-                .iter()
+            ColumnResizeTarget::Error(column) => self
+                .visible_error_rows()
+                .into_iter()
                 .enumerate()
-                .map(|(ix, error)| match column {
-                    ScanErrorColumn::Index => (ix + 1).to_string(),
-                    ScanErrorColumn::Path => error.path.display().to_string(),
-                    ScanErrorColumn::Error => error.message.clone(),
+                .map(|(ix, view)| match column {
+                    ErrorColumn::Index => (ix + 1).to_string(),
+                    ErrorColumn::Kind => view.category.label().to_string(),
+                    ErrorColumn::Path => view.path_label,
+                    ErrorColumn::Error => view.message,
                 })
                 .collect(),
             ColumnResizeTarget::PlaybackHistoryPlayedAt => self
@@ -803,7 +808,7 @@ impl TempoApp {
                     Self::sanitize_genre_table_columns(self.visible_genre_columns.clone());
             }
             ColumnResizeTarget::Track(_)
-            | ColumnResizeTarget::ScanError(_)
+            | ColumnResizeTarget::Error(_)
             | ColumnResizeTarget::PlaybackHistoryPlayedAt => return,
         }
 
@@ -2692,7 +2697,7 @@ impl TempoApp {
             ColumnResizeTarget::Album(column) => self.visible_album_columns.contains(&column),
             ColumnResizeTarget::Genre(column) => self.visible_genre_columns.contains(&column),
             ColumnResizeTarget::Track(_)
-            | ColumnResizeTarget::ScanError(_)
+            | ColumnResizeTarget::Error(_)
             | ColumnResizeTarget::PlaybackHistoryPlayedAt => false,
         };
         let locked = matches!(
@@ -2801,9 +2806,10 @@ impl TempoApp {
             ColumnResizeTarget::Genre(GenreTableColumn::Albums) => "genre-albums",
             ColumnResizeTarget::Genre(GenreTableColumn::Tracks) => "genre-tracks",
             ColumnResizeTarget::Genre(GenreTableColumn::Duration) => "genre-duration",
-            ColumnResizeTarget::ScanError(ScanErrorColumn::Index) => "scan-error-index",
-            ColumnResizeTarget::ScanError(ScanErrorColumn::Path) => "scan-error-path",
-            ColumnResizeTarget::ScanError(ScanErrorColumn::Error) => "scan-error-error",
+            ColumnResizeTarget::Error(ErrorColumn::Index) => "errors-index",
+            ColumnResizeTarget::Error(ErrorColumn::Kind) => "errors-kind",
+            ColumnResizeTarget::Error(ErrorColumn::Path) => "errors-path",
+            ColumnResizeTarget::Error(ErrorColumn::Error) => "errors-error",
             ColumnResizeTarget::PlaybackHistoryPlayedAt => "playback-history-played-at",
         }
     }
@@ -2814,7 +2820,7 @@ impl TempoApp {
             ColumnResizeTarget::Album(column) => self.album_table_sort_column == column,
             ColumnResizeTarget::Genre(column) => self.genre_table_sort_column == column,
             ColumnResizeTarget::Track(_)
-            | ColumnResizeTarget::ScanError(_)
+            | ColumnResizeTarget::Error(_)
             | ColumnResizeTarget::PlaybackHistoryPlayedAt => false,
         }
     }
@@ -2825,7 +2831,7 @@ impl TempoApp {
             ColumnResizeTarget::Album(_) => self.album_table_sort_direction,
             ColumnResizeTarget::Genre(_) => self.genre_table_sort_direction,
             ColumnResizeTarget::Track(_)
-            | ColumnResizeTarget::ScanError(_)
+            | ColumnResizeTarget::Error(_)
             | ColumnResizeTarget::PlaybackHistoryPlayedAt => SortDirection::Ascending,
         };
 
@@ -2861,7 +2867,7 @@ impl TempoApp {
                 );
             }
             ColumnResizeTarget::Track(_)
-            | ColumnResizeTarget::ScanError(_)
+            | ColumnResizeTarget::Error(_)
             | ColumnResizeTarget::PlaybackHistoryPlayedAt => return,
         }
 

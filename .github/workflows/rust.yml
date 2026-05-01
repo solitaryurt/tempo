@@ -7,6 +7,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Opt into Node.js 24 for all JavaScript-based actions ahead of the
+  # June 2026 forced cutover. Removes the Node 20 deprecation warning
+  # emitted by actions/checkout, actions/upload-artifact, etc.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   checks:

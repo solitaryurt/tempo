@@ -21,8 +21,9 @@ use rodio::{Decoder, Source as _};
 use serde::{Deserialize, Serialize};
 use tempo::{
     catalog::{
-        CatalogAlbum, CatalogArtist, CatalogMetadataActivity, CatalogStore, CatalogTrack,
-        individual_artist_names, primary_artist_name,
+        AlbumDescriptionState, CatalogAlbum, CatalogArtist, CatalogMetadataActivity,
+        CatalogMetadataError, CatalogStore, CatalogTrack, individual_artist_names,
+        primary_artist_name,
     },
     library::{
         Artwork as LibraryArtwork, IndexingError, LibraryEvent, LibraryIndexer, LibraryWatcher,
@@ -81,9 +82,81 @@ enum Page {
     Genres,
     Liked,
     PlaybackHistory,
-    ScanErrors,
+    /// Unified error page combining scan errors with online-metadata
+    /// failures. The serde alias keeps state files written by older
+    /// builds (when the variant was `ScanErrors`) loadable; the alias
+    /// is read-only -- new writes use `Errors`.
+    #[serde(alias = "ScanErrors")]
+    Errors,
     Analytics,
     Settings,
+}
+
+/// Stable category buckets surfaced as toggleable filter pills on the
+/// Errors page. Scan failures land in `Scan`; metadata-job failures map
+/// from `metadata_jobs.error_kind` (or fall through to `Network` when
+/// the kind is missing). Order here matches the visual order of pills
+/// in the badge bar.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub(super) enum ErrorCategory {
+    Scan,
+    Network,
+    Http4xx,
+    Http5xx,
+    Parse,
+    NoMatch,
+}
+
+impl ErrorCategory {
+    /// Render label used both on the badge pills and inside the
+    /// table's TYPE column.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Scan => "Scan",
+            Self::Network => "Network",
+            Self::Http4xx => "HTTP 4xx",
+            Self::Http5xx => "HTTP 5xx",
+            Self::Parse => "Parse",
+            Self::NoMatch => "No match",
+        }
+    }
+
+    pub const ALL: [Self; 6] = [
+        Self::Scan,
+        Self::Network,
+        Self::Http4xx,
+        Self::Http5xx,
+        Self::Parse,
+        Self::NoMatch,
+    ];
+
+    /// Map a persisted `metadata_jobs.error_kind` string to a category.
+    /// Returns `None` for unknown classifiers; callers default to
+    /// `Network` so unclassified failures still show up under a sensible
+    /// pill.
+    pub fn from_error_kind(kind: &str) -> Option<Self> {
+        match kind {
+            "network" => Some(Self::Network),
+            "http_4xx" => Some(Self::Http4xx),
+            "http_5xx" => Some(Self::Http5xx),
+            "parse" => Some(Self::Parse),
+            "no_match" => Some(Self::NoMatch),
+            _ => None,
+        }
+    }
+}
+
+/// Per-row view computed by the Errors page renderer. Whether the row
+/// is a scan error or a metadata-job failure, we collapse it into a
+/// uniform shape so the table renderer doesn't need to branch on
+/// origin.
+#[derive(Clone)]
+pub(super) struct ErrorRowView {
+    pub category: ErrorCategory,
+    /// Display string for the PATH column. Scan rows put the file
+    /// path; metadata rows put `<entity_type>: <name>` style labels.
+    pub path_label: String,
+    pub message: String,
 }
 
 /// Sub-section of the Settings page. The Settings page renders as a
@@ -509,18 +582,20 @@ impl Default for GenreTableColumnWidths {
 }
 
 #[derive(Clone, Copy)]
-struct ScanErrorColumnWidths {
+struct ErrorColumnWidths {
     index: f32,
+    kind: f32,
     path: f32,
     error: f32,
 }
 
-impl Default for ScanErrorColumnWidths {
+impl Default for ErrorColumnWidths {
     fn default() -> Self {
         Self {
             index: 52.0,
-            path: 420.0,
-            error: 420.0,
+            kind: 110.0,
+            path: 380.0,
+            error: 380.0,
         }
     }
 }
@@ -554,8 +629,11 @@ enum GenreTableColumn {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ScanErrorColumn {
+enum ErrorColumn {
     Index,
+    /// Category badge column (Scan / Network / Http4xx / Http5xx /
+    /// Parse / NoMatch).
+    Kind,
     Path,
     Error,
 }
@@ -566,7 +644,7 @@ enum ColumnResizeTarget {
     Artist(ArtistTableColumn),
     Album(AlbumTableColumn),
     Genre(GenreTableColumn),
-    ScanError(ScanErrorColumn),
+    Error(ErrorColumn),
     PlaybackHistoryPlayedAt,
 }
 
@@ -652,6 +730,15 @@ struct Album {
     track_count: usize,
     initials: String,
     color: u32,
+    /// Online-sourced album description (TheAudioDB / Wikipedia / etc.).
+    /// `None` when not yet enriched or every fallback source produced
+    /// nothing; `description_state` distinguishes those two cases for
+    /// the UI.
+    description: Option<String>,
+    /// Tri-state used by the album-detail hero to decide between the
+    /// real description, the synthetic local fallback, and a final
+    /// "no online description available" copy.
+    description_state: AlbumDescriptionState,
     /// Pre-lowercased searchable blob; see `Track::searchable_lower`.
     searchable_lower: String,
 }
@@ -687,6 +774,12 @@ struct Genre {
 struct MetadataDemandQueue {
     artists: HashSet<i64>,
     albums: HashSet<i64>,
+    /// Album IDs we've already demanded a description for in this
+    /// session. Tracked separately from `albums` (which gates cover
+    /// fetches) so two independent UI demands for the same album --
+    /// one for a missing cover, one for a missing description -- both
+    /// fire exactly once.
+    album_descriptions: HashSet<i64>,
 }
 
 #[derive(Clone)]
@@ -1742,7 +1835,7 @@ pub(crate) struct TempoApp {
     artist_table_column_widths: ArtistTableColumnWidths,
     album_table_column_widths: AlbumTableColumnWidths,
     genre_table_column_widths: GenreTableColumnWidths,
-    scan_error_column_widths: ScanErrorColumnWidths,
+    error_column_widths: ErrorColumnWidths,
     playback_history_played_at_width: f32,
     column_resize: Option<ColumnResize>,
     visible_columns: Vec<TableColumn>,
@@ -1920,6 +2013,19 @@ pub(crate) struct TempoApp {
     online_metadata_mode: OnlineMetadataMode,
     scan_progress: ScanProgress,
     scan_errors: Vec<IndexingError>,
+    /// Snapshot of failed metadata-job rows refreshed on the activity
+    /// poll. Cleared to empty when the user disables online metadata
+    /// mode (so stale errors don't linger forever); re-populated on
+    /// the next poll while in `Automatic`.
+    metadata_errors: Vec<CatalogMetadataError>,
+    /// Runtime-only set of `ErrorCategory` filters currently enabled
+    /// on the Errors page badge bar. Intentionally NOT persisted --
+    /// resets to all-on each launch.
+    active_error_filters: std::collections::BTreeSet<ErrorCategory>,
+    /// Last status string from a manual "Resync metadata" Settings
+    /// click. Surfaced under the button label until the next poll
+    /// updates the activity counters. Runtime-only.
+    metadata_resync_status: Option<String>,
     scan_changed_tracks: bool,
     last_scan_browse_reload: Option<Instant>,
     is_scanning: bool,
@@ -1932,7 +2038,7 @@ pub(crate) struct TempoApp {
     album_grid_scroll_handle: UniformListScrollHandle,
     album_table_scroll_handle: UniformListScrollHandle,
     genre_grid_scroll_handle: UniformListScrollHandle,
-    scan_errors_scroll_handle: UniformListScrollHandle,
+    errors_scroll_handle: UniformListScrollHandle,
     playback_history_scroll_handle: UniformListScrollHandle,
     liked_scroll_handle: UniformListScrollHandle,
     /// Scroll handle for the Up Next queue's `uniform_list` in the
@@ -2263,7 +2369,7 @@ impl TempoApp {
             artist_table_column_widths: ArtistTableColumnWidths::default(),
             album_table_column_widths: AlbumTableColumnWidths::default(),
             genre_table_column_widths: GenreTableColumnWidths::default(),
-            scan_error_column_widths: ScanErrorColumnWidths::default(),
+            error_column_widths: ErrorColumnWidths::default(),
             playback_history_played_at_width: 178.0,
             column_resize: None,
             visible_columns,
@@ -2339,6 +2445,9 @@ impl TempoApp {
             online_metadata_mode: state.online_metadata_mode,
             scan_progress: ScanProgress::default(),
             scan_errors: Vec::new(),
+            metadata_errors: Vec::new(),
+            active_error_filters: ErrorCategory::ALL.iter().copied().collect(),
+            metadata_resync_status: None,
             scan_changed_tracks: false,
             last_scan_browse_reload: None,
             is_scanning: false,
@@ -2351,7 +2460,7 @@ impl TempoApp {
             album_grid_scroll_handle: UniformListScrollHandle::new(),
             album_table_scroll_handle: UniformListScrollHandle::new(),
             genre_grid_scroll_handle: UniformListScrollHandle::new(),
-            scan_errors_scroll_handle: UniformListScrollHandle::new(),
+            errors_scroll_handle: UniformListScrollHandle::new(),
             playback_history_scroll_handle: UniformListScrollHandle::new(),
             liked_scroll_handle: UniformListScrollHandle::new(),
             queue_sidebar_scroll_handle: UniformListScrollHandle::new(),
@@ -2472,6 +2581,39 @@ impl TempoApp {
         self.save_app_state();
     }
 
+    /// Manual "Resync metadata" entry point invoked from the Online
+    /// Metadata settings panel. Spawns a background thread that calls
+    /// [`CatalogStore::resync_metadata_enrichment`] and reports
+    /// completion via `metadata_resync_status`. The worker picks up
+    /// the newly-pending jobs on its normal claim loop -- we don't
+    /// have to touch it from here.
+    fn run_metadata_resync(&mut self) {
+        let Some(catalog) = self.catalog.clone() else {
+            self.metadata_resync_status = Some("Catalog unavailable".to_string());
+            return;
+        };
+        if self.online_metadata_mode != OnlineMetadataMode::Automatic {
+            self.metadata_resync_status = Some("Enable Online Metadata to resync".to_string());
+            return;
+        }
+
+        self.metadata_resync_status = Some("Resync started...".to_string());
+
+        std::thread::Builder::new()
+            .name("tempo-metadata-resync".into())
+            .spawn(move || match catalog.resync_metadata_enrichment() {
+                Ok(count) => perf::event(
+                    "metadata.resync.user_triggered",
+                    format!("enqueued={count}"),
+                ),
+                Err(error) => perf::event(
+                    "metadata.resync.user_triggered_error",
+                    format!("error={error:#}"),
+                ),
+            })
+            .ok();
+    }
+
     fn queue_artist_metadata_demand(&self, artist_id: i64) {
         if self.online_metadata_mode != OnlineMetadataMode::Automatic {
             return;
@@ -2526,6 +2668,128 @@ impl TempoApp {
                 }
             })
             .ok();
+    }
+
+    /// On-demand counterpart to [`queue_album_cover_demand`] for album
+    /// descriptions. Called by the album-detail hero when it renders
+    /// without a description in hand. Gated on `OnlineMetadataMode::Automatic`
+    /// so toggling enrichment off in Settings cleanly stops new
+    /// demands without touching jobs already in flight.
+    fn queue_album_profile_demand(&self, album_id: i64) {
+        if self.online_metadata_mode != OnlineMetadataMode::Automatic {
+            return;
+        }
+        let Some(catalog) = self.catalog.clone() else {
+            return;
+        };
+        let Ok(mut demand_queue) = self.metadata_demand_queue.lock() else {
+            return;
+        };
+        if !demand_queue.album_descriptions.insert(album_id) {
+            return;
+        }
+        drop(demand_queue);
+
+        std::thread::Builder::new()
+            .name("tempo-metadata-demand".into())
+            .spawn(move || {
+                if let Err(error) = catalog.enqueue_album_profile_demand(album_id) {
+                    perf::event(
+                        "metadata.demand.album_profile_error",
+                        format!("album_id={album_id} error={error:#}"),
+                    );
+                }
+            })
+            .ok();
+    }
+
+    /// Whether the unified Errors page has anything to show today.
+    /// Used by the sidebar to gate visibility of the Errors entry.
+    pub(super) fn has_any_errors(&self) -> bool {
+        !self.scan_errors.is_empty() || !self.metadata_errors.is_empty()
+    }
+
+    /// Combined count for the sidebar badge. Counts both scan errors
+    /// and metadata-job failures regardless of the active badge
+    /// filters (the filters are a *display* concern; the sidebar
+    /// reflects the underlying state).
+    pub(super) fn total_error_count(&self) -> usize {
+        self.scan_errors.len() + self.metadata_errors.len()
+    }
+
+    /// Materialize every error -- scan + metadata-job -- into a uniform
+    /// shape, filtered by `active_error_filters`. Sort order: most
+    /// recently observed first. Scan errors don't carry a per-row
+    /// timestamp so we render them after metadata errors of the same
+    /// poll batch (most recent metadata first, then scans).
+    pub(super) fn visible_error_rows(&self) -> Vec<ErrorRowView> {
+        let mut rows: Vec<ErrorRowView> =
+            Vec::with_capacity(self.scan_errors.len() + self.metadata_errors.len());
+
+        for error in self.metadata_errors.iter() {
+            let category = error
+                .error_kind
+                .as_deref()
+                .and_then(ErrorCategory::from_error_kind)
+                .unwrap_or(ErrorCategory::Network);
+            if !self.active_error_filters.contains(&category) {
+                continue;
+            }
+            rows.push(ErrorRowView {
+                category,
+                path_label: format!("{}: {}", error.entity_type, error.entity_label),
+                message: error.message.clone(),
+            });
+        }
+
+        // Scan errors are always category=Scan; honour the filter.
+        if self.active_error_filters.contains(&ErrorCategory::Scan) {
+            for error in self.scan_errors.iter().rev() {
+                rows.push(ErrorRowView {
+                    category: ErrorCategory::Scan,
+                    path_label: error.path.display().to_string(),
+                    message: error.message.clone(),
+                });
+            }
+        }
+
+        rows
+    }
+
+    pub(super) fn toggle_error_filter(&mut self, category: ErrorCategory) {
+        if self.active_error_filters.contains(&category) {
+            self.active_error_filters.remove(&category);
+        } else {
+            self.active_error_filters.insert(category);
+        }
+    }
+
+    pub(super) fn set_all_error_filters(&mut self, enabled: bool) {
+        if enabled {
+            self.active_error_filters = ErrorCategory::ALL.iter().copied().collect();
+        } else {
+            self.active_error_filters.clear();
+        }
+    }
+
+    /// Per-category total counts -- used by the badge bar to show
+    /// pill counts and to dim categories with zero rows. Includes the
+    /// full underlying state regardless of the active filter set.
+    pub(super) fn error_counts_by_category(
+        &self,
+    ) -> std::collections::HashMap<ErrorCategory, usize> {
+        let mut counts: std::collections::HashMap<ErrorCategory, usize> =
+            std::collections::HashMap::new();
+        counts.insert(ErrorCategory::Scan, self.scan_errors.len());
+        for error in &self.metadata_errors {
+            let category = error
+                .error_kind
+                .as_deref()
+                .and_then(ErrorCategory::from_error_kind)
+                .unwrap_or(ErrorCategory::Network);
+            *counts.entry(category).or_insert(0) += 1;
+        }
+        counts
     }
 
     fn rebuild_genres(&mut self) {
@@ -3148,7 +3412,7 @@ impl TempoApp {
             | Page::Albums
             | Page::Genres
             | Page::Liked
-            | Page::ScanErrors
+            | Page::Errors
             | Page::Analytics
                 if library_roots.is_empty() =>
             {
@@ -3818,13 +4082,15 @@ fn album_searchable_lower(
     artist: &str,
     year: Option<&str>,
     track_count: usize,
+    description: Option<&str>,
 ) -> String {
     format!(
-        "{} {} {} {}",
+        "{} {} {} {} {}",
         title,
         artist,
         year.unwrap_or_default(),
-        track_count
+        track_count,
+        description.unwrap_or_default(),
     )
     .to_lowercase()
 }
@@ -3942,6 +4208,7 @@ impl From<CatalogAlbum> for Album {
             &album.artist,
             album.year.as_deref(),
             album.track_count,
+            album.description.as_deref(),
         );
         Self {
             album_id: album.album_id,
@@ -3953,6 +4220,8 @@ impl From<CatalogAlbum> for Album {
             year: album.year,
             artwork_path: album.artwork_path,
             track_count: album.track_count,
+            description: album.description,
+            description_state: album.description_state,
             searchable_lower,
         }
     }
@@ -4453,7 +4722,7 @@ impl TempoApp {
             Page::Genres => "genres",
             Page::Liked => "liked",
             Page::PlaybackHistory => "playback_history",
-            Page::ScanErrors => "scan_errors",
+            Page::Errors => "errors",
             Page::Analytics => "analytics",
             Page::Settings => "settings",
         }

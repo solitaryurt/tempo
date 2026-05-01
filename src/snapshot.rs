@@ -41,7 +41,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 
 use crate::{
-    catalog::{CatalogAlbum, CatalogArtist, CatalogTrack},
+    catalog::{AlbumDescriptionState, CatalogAlbum, CatalogArtist, CatalogTrack},
     perf,
 };
 
@@ -51,7 +51,12 @@ const MAGIC: &[u8; 8] = b"TEMPO_S1";
 // Bumped to invalidate snapshots written by builds that used the
 // feat-only splitter, so upgraded users see the corrected Artists view
 // without waiting for a rescan.
-const SNAPSHOT_VERSION: u32 = 4;
+// v5: appended `description` (`Option<String>`) and `description_state`
+// (`u8` discriminant) to the album record so the in-memory `Album`
+// hydrates with descriptions/states populated by online enrichment.
+// Older snapshots are silently invalidated and rebuilt from SQLite on
+// the first launch after the upgrade.
+const SNAPSHOT_VERSION: u32 = 5;
 const SNAPSHOT_FILE: &str = "startup_snapshot.v3.bin";
 
 pub struct StartupSnapshot {
@@ -306,6 +311,8 @@ fn write_album(buffer: &mut Vec<u8>, album: &CatalogAlbum) {
     write_opt_str(buffer, album.year.as_deref());
     write_opt_path(buffer, album.artwork_path.as_deref());
     write_u64(buffer, album.track_count as u64);
+    write_opt_str(buffer, album.description.as_deref());
+    buffer.push(album.description_state.as_u8());
 }
 
 fn read_album(cursor: &mut Cursor<'_>) -> Result<CatalogAlbum> {
@@ -317,6 +324,8 @@ fn read_album(cursor: &mut Cursor<'_>) -> Result<CatalogAlbum> {
         year: cursor.read_opt_string()?,
         artwork_path: cursor.read_opt_path()?,
         track_count: cursor.read_u64()? as usize,
+        description: cursor.read_opt_string()?,
+        description_state: AlbumDescriptionState::from_u8(cursor.read_u8()?),
     })
 }
 
@@ -398,6 +407,12 @@ impl<'a> Cursor<'a> {
         let mut tag = [0u8; 1];
         self.read_exact(&mut tag)?;
         Ok(tag[0] != 0)
+    }
+
+    fn read_u8(&mut self) -> Result<u8> {
+        let mut tag = [0u8; 1];
+        self.read_exact(&mut tag)?;
+        Ok(tag[0])
     }
 
     fn read_opt_u32(&mut self) -> Result<Option<u32>> {
@@ -527,6 +542,8 @@ mod tests {
             year: Some("2024".to_string()),
             artwork_path: None,
             track_count: 10,
+            description: None,
+            description_state: AlbumDescriptionState::Pending,
         }
     }
 
@@ -547,6 +564,28 @@ mod tests {
         assert_eq!(snapshot.tracks[0].title, "Title 0");
         assert_eq!(snapshot.artists[1].name, "Artist 1");
         assert_eq!(snapshot.albums[0].title, "Album 0");
+    }
+
+    #[test]
+    fn round_trips_album_description_and_state() {
+        let tmp = TempDir::new().unwrap();
+        let cache_dir = tmp.path();
+        let roots = vec![PathBuf::from("/music")];
+        let mut album = sample_album(7);
+        album.description = Some("a cinematic record about loneliness".to_string());
+        album.description_state = AlbumDescriptionState::Available;
+
+        save(cache_dir, &roots, &[], &[], std::slice::from_ref(&album)).unwrap();
+        let snapshot = load(cache_dir, &roots).expect("snapshot loads");
+        assert_eq!(snapshot.albums.len(), 1);
+        assert_eq!(
+            snapshot.albums[0].description.as_deref(),
+            Some("a cinematic record about loneliness")
+        );
+        assert_eq!(
+            snapshot.albums[0].description_state,
+            AlbumDescriptionState::Available
+        );
     }
 
     #[test]
