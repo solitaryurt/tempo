@@ -68,6 +68,11 @@ impl TempoApp {
                     self.sidebar_button("‹", "toggle-left-sidebar")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.left_sidebar_collapsed = !this.left_sidebar_collapsed;
+                            // The button disappears/relocates after this
+                            // click, so GPUI never fires the hover-out
+                            // event that would normally hide the tooltip.
+                            // Clear it explicitly to avoid a stuck label.
+                            this.clear_tooltip();
                             this.save_app_state();
                             cx.notify();
                         })),
@@ -748,6 +753,11 @@ impl TempoApp {
                                         this.right_sidebar_collapsed =
                                             !this.right_sidebar_collapsed;
                                         this.right_sidebar_view_menu_open = false;
+                                        // The button disappears/relocates
+                                        // after this click; clear any
+                                        // active tooltip so it doesn't
+                                        // linger until the next hover.
+                                        this.clear_tooltip();
                                         this.save_app_state();
                                         cx.notify();
                                     }),

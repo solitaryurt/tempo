@@ -558,6 +558,13 @@ impl TempoApp {
                                 self.sidebar_button("›", "open-left-sidebar").on_click(
                                     cx.listener(|this, _, _, cx| {
                                         this.left_sidebar_collapsed = false;
+                                        // The button vanishes from the
+                                        // header once the sidebar opens,
+                                        // so the hover-out event never
+                                        // fires. Clear the tooltip
+                                        // ourselves to avoid a stuck
+                                        // label.
+                                        this.clear_tooltip();
                                         this.save_app_state();
                                         cx.notify();
                                     }),
@@ -663,6 +670,11 @@ impl TempoApp {
                             self.sidebar_button("‹", "open-right-sidebar")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.right_sidebar_collapsed = false;
+                                    // The button vanishes from the header
+                                    // once the right sidebar reopens, so
+                                    // the hover-out event never fires.
+                                    // Clear the tooltip ourselves.
+                                    this.clear_tooltip();
                                     this.save_app_state();
                                     cx.notify();
                                 })),
