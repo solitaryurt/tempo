@@ -24,10 +24,9 @@
 
 use std::time::Duration;
 
-use gpui::{AppContext as _, Context, WindowHandle};
 use tempo::perf;
 
-use super::TempoApp;
+use super::*;
 
 impl TempoApp {
     /// Install the local single-instance server. Repeated launches
@@ -210,6 +209,221 @@ impl TempoApp {
     pub fn on_window_close_intercepted(&mut self, _cx: &mut Context<Self>) {
         self.set_window_hidden(true);
         self.fire_minimize_toast_once();
+    }
+
+    /// Cluster #3 ("Ask every time") entry point: surface the
+    /// confirmation overlay rendered by [`super::TempoApp::render`]
+    /// when [`super::TempoApp::close_confirmation_open`] is `true`.
+    /// Used by the `on_window_should_close` interceptor in `main.rs`
+    /// and the mini-mode swap path in `TempoApp::render`.
+    pub fn show_close_confirmation(&mut self, cx: &mut Context<Self>) {
+        if !self.close_confirmation_open {
+            self.close_confirmation_open = true;
+            cx.notify();
+        }
+    }
+
+    /// Dismiss the close-confirmation overlay without taking any
+    /// action. Bound to the overlay's "Cancel" button and to a
+    /// click-outside / Escape handler.
+    pub(super) fn dismiss_close_confirmation(&mut self, cx: &mut Context<Self>) {
+        if self.close_confirmation_open {
+            self.close_confirmation_open = false;
+            cx.notify();
+        }
+    }
+
+    /// Confirmation-overlay choice "Minimize to tray". Mirrors the
+    /// default X-button path so the user gets exactly the same
+    /// behaviour as `CloseWindowBehavior::MinimizeToTray`.
+    pub(super) fn confirm_close_minimize(&mut self, cx: &mut Context<Self>) {
+        self.close_confirmation_open = false;
+        self.hide_main_window(cx);
+    }
+
+    /// Confirmation-overlay choice "Quit Tempo". Equivalent to the
+    /// tray menu's Quit item or the Ctrl+Q hotkey.
+    pub(super) fn confirm_close_quit(&mut self, cx: &mut Context<Self>) {
+        self.close_confirmation_open = false;
+        perf::event("lifecycle.close_confirmation.quit", "");
+        cx.quit();
+    }
+
+    /// Render the close-confirmation modal on top of the main view.
+    /// Mirrors the styling of `render_playlist_delete_confirm` for
+    /// visual consistency: full-window backdrop with a centered
+    /// dialog, click-outside dismisses, three buttons.
+    pub(super) fn render_close_confirmation(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = *self.colors();
+
+        div()
+            .id("close-confirm-backdrop")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::rgba(0x00000080))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.dismiss_close_confirmation(cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .child(
+                div()
+                    .id("close-confirm-dialog")
+                    .w(px(380.0))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(colors.border_strong))
+                    .bg(rgb(colors.elevated))
+                    .shadow_lg()
+                    .overflow_hidden()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .px_4()
+                            .py_3()
+                            .border_b_1()
+                            .border_color(rgb(colors.border))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(colors.text_strong))
+                            .child("Close Tempo?"),
+                    )
+                    .child(div().px_4().py_3().text_color(rgb(colors.text)).child(
+                        SharedString::from(
+                            "Tempo can keep playing in the system tray, or fully quit.",
+                        ),
+                    ))
+                    .child(
+                        div()
+                            .px_4()
+                            .py_3()
+                            .border_t_1()
+                            .border_color(rgb(colors.border))
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("close-confirm-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(colors.border))
+                                    .bg(rgb(colors.button))
+                                    .text_color(rgb(colors.text))
+                                    .cursor_pointer()
+                                    .hover(move |this| {
+                                        this.bg(rgb(colors.button_hover))
+                                            .text_color(rgb(colors.text_strong))
+                                    })
+                                    .child("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.dismiss_close_confirmation(cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("close-confirm-tray")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(colors.border))
+                                    .bg(rgb(colors.button))
+                                    .text_color(rgb(colors.text))
+                                    .cursor_pointer()
+                                    .hover(move |this| {
+                                        this.bg(rgb(colors.button_hover))
+                                            .text_color(rgb(colors.text_strong))
+                                    })
+                                    .child("Minimize to tray")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.confirm_close_minimize(cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("close-confirm-quit")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(colors.accent))
+                                    .text_color(rgb(colors.text_strong))
+                                    .cursor_pointer()
+                                    .hover(|this| this.opacity(0.85))
+                                    .child("Quit")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.confirm_close_quit(cx);
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
+    /// Cluster #6: emit a desktop notification for a track-change
+    /// event. Branches on `NotificationMode`:
+    ///
+    /// - `Never` → no-op (the default).
+    /// - `OnlyWhenHidden` → fire only when the main window is in
+    ///   the tray (`window_hidden`).
+    /// - `Always` → fire on every track change.
+    ///
+    /// Spawns a detached thread for the `notify-send` shell-out so
+    /// the GPUI tick is never blocked on the D-Bus round-trip.
+    pub(super) fn fire_track_change_notification(&self) {
+        let should_fire = match self.notification_mode {
+            NotificationMode::Never => false,
+            NotificationMode::OnlyWhenHidden => self.window_hidden,
+            NotificationMode::Always => true,
+        };
+        if !should_fire {
+            return;
+        }
+        let Some(track) = self.tracks.get(self.playing_track) else {
+            return;
+        };
+        let title = track.title.to_string();
+        let body = if track.album.is_empty() {
+            track.artist.to_string()
+        } else {
+            format!("{} — {}", track.artist, track.album)
+        };
+        let icon = art_url_for_track(track)
+            .and_then(|url| url.strip_prefix("file://").map(str::to_string));
+
+        let _ = std::thread::Builder::new()
+            .name("tempo-track-toast".into())
+            .spawn(move || {
+                let mut command = std::process::Command::new("notify-send");
+                command
+                    .arg("--app-name=Tempo")
+                    .arg("--expire-time=4000")
+                    .arg(&title)
+                    .arg(&body);
+                if let Some(icon) = icon {
+                    command.arg(format!("--icon={icon}"));
+                } else {
+                    command.arg("--icon=multimedia-player");
+                }
+                if let Err(error) = command.status() {
+                    perf::event(
+                        "lifecycle.track_notification",
+                        format!("notify_send_failed err={error}"),
+                    );
+                }
+            });
     }
 
     /// Show a one-time "Tempo continues in the tray" toast the first

@@ -1048,6 +1048,7 @@ impl TempoApp {
         // playing from the queue). When nothing is playing from the
         // queue (`queue_cursor == None`), no row is highlighted.
         let active = self.queue_cursor == Some(ix);
+        let is_playing = self.player.read(cx).is_playing();
         let colors = *self.colors();
         let bg = if active {
             colors.queue_active
@@ -1071,8 +1072,20 @@ impl TempoApp {
                 div()
                     .w(px(22.0))
                     .text_xs()
-                    .text_color(rgb(colors.text_faint))
-                    .child(format!("{}", ix + 1)),
+                    .text_color(rgb(if active {
+                        colors.accent
+                    } else {
+                        colors.text_faint
+                    }))
+                    .child(if active {
+                        if is_playing {
+                            "▶".to_string()
+                        } else {
+                            "❚❚".to_string()
+                        }
+                    } else {
+                        format!("{}", ix + 1)
+                    }),
             )
             .child(artwork::album_tile(track, 28.0, colors))
             .child(
@@ -1455,7 +1468,7 @@ impl TempoApp {
         if let Some(track_ix) = resolved_track_ix {
             row = row.on_click(cx.listener(move |this, _, _, cx| {
                 if track_ix < this.tracks.len() {
-                    this.play_track(track_ix, cx);
+                    this.play_track_from_picker(track_ix, cx);
                     cx.notify();
                 }
             }));
@@ -1595,7 +1608,7 @@ impl TempoApp {
                     move |this, _, _, cx| {
                         this.history_context_menu = None;
                         if track_ix < this.tracks.len() {
-                            this.play_track(track_ix, cx);
+                            this.play_track_from_picker(track_ix, cx);
                         }
                         cx.notify();
                     },
@@ -1804,6 +1817,7 @@ impl TempoApp {
     ) -> impl IntoElement + use<> {
         let row_id = SharedString::from(format!("playlist-sidebar-row-{row_ix}"));
         let active = self.playing_track == track_ix;
+        let is_playing = self.player.read(cx).is_playing();
 
         div()
             .id(row_id)
@@ -1823,8 +1837,20 @@ impl TempoApp {
                 div()
                     .w(px(22.0))
                     .text_xs()
-                    .text_color(rgb(colors.text_faint))
-                    .child(format!("{}", row_ix + 1)),
+                    .text_color(rgb(if active {
+                        colors.accent
+                    } else {
+                        colors.text_faint
+                    }))
+                    .child(if active {
+                        if is_playing {
+                            "▶".to_string()
+                        } else {
+                            "❚❚".to_string()
+                        }
+                    } else {
+                        format!("{}", row_ix + 1)
+                    }),
             )
             .child(artwork::album_tile(track, 28.0, colors))
             .child(
@@ -1863,7 +1889,7 @@ impl TempoApp {
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 if track_ix < this.tracks.len() {
-                    this.play_track(track_ix, cx);
+                    this.play_track_from_picker(track_ix, cx);
                     cx.notify();
                 }
             }))

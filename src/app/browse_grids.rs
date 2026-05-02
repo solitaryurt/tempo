@@ -991,6 +991,34 @@ impl TempoApp {
     }
 
     pub(super) fn sort_album_indices(&self, album_indices: &mut [usize]) {
+        // Cluster #8: when the user hasn't manually clicked a column
+        // header (i.e. we're still on the catalog default), honour
+        // the `album_default_sort` setting. Per-column clicks
+        // override `album_table_sort_column` directly and bypass this
+        // mapping, so power users can still sort by anything they
+        // want.
+        let effective_column = if self.album_table_sort_column == default_album_table_sort_column()
+            && self.album_table_sort_direction == default_sort_direction()
+        {
+            match self.album_default_sort {
+                AlbumDefaultSort::ArtistThenYear => AlbumTableColumn::Artist,
+                AlbumDefaultSort::ReleaseDate => AlbumTableColumn::Year,
+                AlbumDefaultSort::DateAdded => AlbumTableColumn::Year, // proxy until DateAdded col exists
+                AlbumDefaultSort::Title => AlbumTableColumn::Album,
+            }
+        } else {
+            self.album_table_sort_column
+        };
+        let effective_direction = if effective_column == AlbumTableColumn::Year
+            && self.album_default_sort == AlbumDefaultSort::ReleaseDate
+        {
+            SortDirection::Descending
+        } else {
+            self.album_table_sort_direction
+        };
+        let prefer_artist_year = self.album_default_sort == AlbumDefaultSort::ArtistThenYear
+            && effective_column == AlbumTableColumn::Artist;
+
         album_indices.sort_by(|left, right| {
             let Some(left) = self.albums.get(*left) else {
                 return std::cmp::Ordering::Equal;
@@ -998,15 +1026,21 @@ impl TempoApp {
             let Some(right) = self.albums.get(*right) else {
                 return std::cmp::Ordering::Equal;
             };
-            let ordering = match self.album_table_sort_column {
+            let ordering = match effective_column {
                 AlbumTableColumn::Artwork | AlbumTableColumn::Album => left
                     .title
                     .cmp(&right.title)
                     .then(left.artist.cmp(&right.artist)),
-                AlbumTableColumn::Artist => left
-                    .artist
-                    .cmp(&right.artist)
-                    .then(left.title.cmp(&right.title)),
+                AlbumTableColumn::Artist => {
+                    let primary = left.artist.cmp(&right.artist);
+                    if prefer_artist_year {
+                        primary
+                            .then(left.year.cmp(&right.year))
+                            .then(left.title.cmp(&right.title))
+                    } else {
+                        primary.then(left.title.cmp(&right.title))
+                    }
+                }
                 AlbumTableColumn::Year => left
                     .year
                     .cmp(&right.year)
@@ -1020,7 +1054,7 @@ impl TempoApp {
                     .cmp(&self.album_total_duration(right.album_id))
                     .then(left.title.cmp(&right.title)),
             };
-            match self.album_table_sort_direction {
+            match effective_direction {
                 SortDirection::Ascending => ordering,
                 SortDirection::Descending => ordering.reverse(),
             }

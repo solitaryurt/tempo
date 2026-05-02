@@ -74,9 +74,9 @@ pub(in crate::app) use menu::{
 use crate::{
     CloseAllTabs, CloseTab, CycleMiniPlayer, FocusSearch, HideWindow, MoveSelectionDown,
     MoveSelectionUp, NavigateBack, NavigateForward, NewTab, NextTab, OpenSettings, PlayRandomTrack,
-    PlaySelected, PreviousTab, ReopenClosedTab, SelectTab1, SelectTab2, SelectTab3, SelectTab4,
-    SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9, SelectTab10, ToggleMiniPlayer,
-    TogglePause,
+    PlaySelected, PreviousTab, QuitTempo, ReopenClosedTab, SelectTab1, SelectTab2, SelectTab3,
+    SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9, SelectTab10,
+    ToggleMiniPlayer, TogglePause,
 };
 use text_input::TextInputState;
 use theme::{Theme, ThemeColors, bundled_themes, default_theme_id, resolve_theme_id};
@@ -179,6 +179,7 @@ pub(super) struct ErrorRowView {
 pub(super) enum SettingsSection {
     Appearance,
     AudioOutput,
+    Playback,
     Window,
     Library,
     OnlineMetadata,
@@ -190,6 +191,7 @@ impl SettingsSection {
         match self {
             Self::Appearance => "Appearance",
             Self::AudioOutput => "Audio Output",
+            Self::Playback => "Playback",
             Self::Window => "Window",
             Self::Library => "Library",
             Self::OnlineMetadata => "Online Metadata",
@@ -197,10 +199,11 @@ impl SettingsSection {
         }
     }
 
-    pub(super) fn all() -> [Self; 6] {
+    pub(super) fn all() -> [Self; 7] {
         [
             Self::Appearance,
             Self::AudioOutput,
+            Self::Playback,
             Self::Window,
             Self::Library,
             Self::OnlineMetadata,
@@ -360,7 +363,7 @@ pub(crate) enum WindowMode {
 /// and the album art fills whatever rectangle the window currently
 /// has, minus the bottom metadata strip. The size is *not* remembered
 /// across cycles — re-entering `Square` always reopens at 400x400.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub(crate) enum MiniSize {
     /// 360x100 horizontal bar with thumbnail on the left and
     /// title/artist/album stacked on the right.
@@ -486,6 +489,172 @@ impl WindowRestoreMode {
         match self {
             Self::BringHere => "Bring window here",
             Self::GoToWindow => "Go to window",
+        }
+    }
+}
+
+/// Auto-scroll-to-now-playing policy. Cluster #2 of the Settings
+/// rollout: do nothing by default so library browsing isn't
+/// interrupted; users opt in to the "follow" behaviour explicitly.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum FollowNowPlaying {
+    Off,
+    OnPlaybackStart,
+    OnEverySongChange,
+}
+
+impl FollowNowPlaying {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Don't follow",
+            Self::OnPlaybackStart => "When I press play",
+            Self::OnEverySongChange => "On every song change",
+        }
+    }
+}
+
+/// What the X-button does. The default keeps the existing tray
+/// lifecycle (see `main.rs::on_window_should_close`) but power
+/// users may want a confirmation modal or to outright quit.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum CloseWindowBehavior {
+    MinimizeToTray,
+    AskEveryTime,
+    Quit,
+}
+
+impl CloseWindowBehavior {
+    fn label(self) -> &'static str {
+        match self {
+            Self::MinimizeToTray => "Keep playing in the tray",
+            Self::AskEveryTime => "Ask me every time",
+            Self::Quit => "Quit Tempo",
+        }
+    }
+}
+
+/// What happens to the current Up Next queue when the user picks a
+/// new track from the library. `Auto` reproduces the new
+/// "play-then-resume" semantics agreed in cluster #4: empty queue
+/// → replace; populated queue → insert after the playing track and
+/// keep going.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum LibraryPlayBehavior {
+    Auto,
+    AlwaysReplaceQueue,
+    AlwaysInsertAfterCurrent,
+}
+
+impl LibraryPlayBehavior {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Smart: keep my queue if I have one",
+            Self::AlwaysReplaceQueue => "Replace the queue",
+            Self::AlwaysInsertAfterCurrent => "Insert after current track",
+        }
+    }
+}
+
+/// What `play_random_track` (and the global hotkey) shuffles
+/// across. `CurrentSource` honours the active library tab / search
+/// / playlist filters; `Everything` always picks from the full
+/// catalog.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum ShuffleScope {
+    CurrentSource,
+    Everything,
+}
+
+impl ShuffleScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::CurrentSource => "Shuffle the current view",
+            Self::Everything => "Shuffle everything",
+        }
+    }
+}
+
+/// Top-level startup behaviour. `OpenLibrary` is the default per
+/// the cluster #5 decision; `Restore` reuses the saved page; the
+/// remaining variants flip the window into a non-default mode.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum StartupBehavior {
+    OpenLibrary,
+    RestoreLastView,
+    StartHidden,
+    OpenMini,
+}
+
+impl StartupBehavior {
+    fn label(self) -> &'static str {
+        match self {
+            Self::OpenLibrary => "Open the library",
+            Self::RestoreLastView => "Restore my last view",
+            Self::StartHidden => "Start hidden in the tray",
+            Self::OpenMini => "Open the mini player",
+        }
+    }
+}
+
+/// Track-change notification policy. Mirrors the system-tray /
+/// `notify-send` integration in `lifecycle.rs`. Default `Never`
+/// per cluster #6.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum NotificationMode {
+    Always,
+    OnlyWhenHidden,
+    Never,
+}
+
+impl NotificationMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Always => "On every song change",
+            Self::OnlyWhenHidden => "Only when Tempo is hidden",
+            Self::Never => "Never",
+        }
+    }
+}
+
+/// Catalog merge policy when both embedded tags and online
+/// enrichment are available for the same field. `EmbeddedFallback`
+/// matches today's behaviour (read embedded first, fill gaps from
+/// online).
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum MetadataSourceOfTruth {
+    TrustEmbedded,
+    TrustOnline,
+    PreferEmbeddedFallbackOnline,
+}
+
+impl MetadataSourceOfTruth {
+    fn label(self) -> &'static str {
+        match self {
+            Self::TrustEmbedded => "Trust the file's tags",
+            Self::TrustOnline => "Trust online metadata",
+            Self::PreferEmbeddedFallbackOnline => "Prefer tags, fall back to online",
+        }
+    }
+}
+
+/// Default sort order for the album browse view. Drives the
+/// initial column / grid order; user-driven column clicks still
+/// override per-tab.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum AlbumDefaultSort {
+    ArtistThenYear,
+    ReleaseDate,
+    DateAdded,
+    Title,
+}
+
+impl AlbumDefaultSort {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ArtistThenYear => "Artist, then year",
+            Self::ReleaseDate => "Release year",
+            Self::DateAdded => "Date added",
+            Self::Title => "Album title",
         }
     }
 }
@@ -1497,6 +1666,42 @@ struct AppState {
     /// only show it once per install so it doesn't become noise.
     #[serde(default)]
     seen_tray_minimize_toast: bool,
+    /// Cluster #2: auto-scroll-to-now-playing policy.
+    #[serde(default = "default_follow_now_playing")]
+    follow_now_playing: FollowNowPlaying,
+    /// Cluster #3: what the X-button does.
+    #[serde(default = "default_close_window_behavior")]
+    close_window_behavior: CloseWindowBehavior,
+    /// Cluster #4: how the queue reacts to library plays.
+    #[serde(default = "default_library_play_behavior")]
+    library_play_behavior: LibraryPlayBehavior,
+    /// Cluster #5: where Tempo lands on launch.
+    #[serde(default = "default_startup_behavior")]
+    startup_behavior: StartupBehavior,
+    /// Cluster #5 partner: the last-used mini-player size, so
+    /// `StartupBehavior::OpenMini` can come up at the user's
+    /// preferred footprint instead of always starting at the
+    /// smallest variant.
+    #[serde(default)]
+    last_mini_size: Option<MiniSize>,
+    /// Cluster #6: track-change notification policy.
+    #[serde(default = "default_notification_mode")]
+    notification_mode: NotificationMode,
+    /// Cluster #7: hide tracks whose underlying file no longer
+    /// resolves on disk (kept in catalog for play-count history,
+    /// just filtered out of playable surfaces).
+    #[serde(default = "default_hide_missing_files")]
+    hide_missing_files: bool,
+    /// Cluster #8: default album sort order.
+    #[serde(default = "default_album_default_sort")]
+    album_default_sort: AlbumDefaultSort,
+    /// Cluster #9: catalog merge policy between embedded tags and
+    /// online enrichment.
+    #[serde(default = "default_metadata_source_of_truth")]
+    metadata_source_of_truth: MetadataSourceOfTruth,
+    /// Cluster #10: scope of `play_random_track` / shuffle hotkey.
+    #[serde(default = "default_shuffle_scope")]
+    shuffle_scope: ShuffleScope,
 }
 
 fn default_eq_gains() -> [f32; tempo::equalizer::BAND_COUNT] {
@@ -1571,6 +1776,16 @@ impl Default for AppState {
             eq_profiles: Vec::new(),
             global_hotkeys: HashMap::new(),
             seen_tray_minimize_toast: false,
+            follow_now_playing: default_follow_now_playing(),
+            close_window_behavior: default_close_window_behavior(),
+            library_play_behavior: default_library_play_behavior(),
+            startup_behavior: default_startup_behavior(),
+            last_mini_size: None,
+            notification_mode: default_notification_mode(),
+            hide_missing_files: default_hide_missing_files(),
+            album_default_sort: default_album_default_sort(),
+            metadata_source_of_truth: default_metadata_source_of_truth(),
+            shuffle_scope: default_shuffle_scope(),
         }
     }
 }
@@ -1581,6 +1796,42 @@ fn default_online_metadata_mode() -> OnlineMetadataMode {
 
 fn default_window_restore_mode() -> WindowRestoreMode {
     WindowRestoreMode::BringHere
+}
+
+fn default_follow_now_playing() -> FollowNowPlaying {
+    FollowNowPlaying::Off
+}
+
+fn default_close_window_behavior() -> CloseWindowBehavior {
+    CloseWindowBehavior::MinimizeToTray
+}
+
+fn default_library_play_behavior() -> LibraryPlayBehavior {
+    LibraryPlayBehavior::Auto
+}
+
+fn default_startup_behavior() -> StartupBehavior {
+    StartupBehavior::OpenLibrary
+}
+
+fn default_notification_mode() -> NotificationMode {
+    NotificationMode::Never
+}
+
+fn default_hide_missing_files() -> bool {
+    true
+}
+
+fn default_album_default_sort() -> AlbumDefaultSort {
+    AlbumDefaultSort::ArtistThenYear
+}
+
+fn default_metadata_source_of_truth() -> MetadataSourceOfTruth {
+    MetadataSourceOfTruth::PreferEmbeddedFallbackOnline
+}
+
+fn default_shuffle_scope() -> ShuffleScope {
+    ShuffleScope::CurrentSource
 }
 
 fn default_page() -> Page {
@@ -2059,6 +2310,44 @@ pub(crate) struct TempoApp {
     library_status: String,
     online_metadata_mode: OnlineMetadataMode,
     window_restore_mode: WindowRestoreMode,
+    /// Cluster #2: scroll-to-now-playing policy. Mirrored from
+    /// `AppState`; updated by the Settings UI (which calls
+    /// `save_app_state`).
+    pub(super) follow_now_playing: FollowNowPlaying,
+    /// Cluster #3: X-button policy.
+    pub(super) close_window_behavior: CloseWindowBehavior,
+    /// Cluster #4: queue policy on a library play.
+    pub(super) library_play_behavior: LibraryPlayBehavior,
+    /// Cluster #5: where to land on launch.
+    pub(super) startup_behavior: StartupBehavior,
+    /// Cluster #5 partner: last user-selected mini-player size, so
+    /// `StartupBehavior::OpenMini` can come up with the variant the
+    /// user actually likes. Updated whenever the user enters mini
+    /// mode or cycles its size; persisted via `AppState::last_mini_size`.
+    pub(super) last_mini_size: Option<MiniSize>,
+    /// Cluster #6: track-change notification policy.
+    pub(super) notification_mode: NotificationMode,
+    /// Cluster #7: hide tracks whose underlying file is missing.
+    pub(super) hide_missing_files: bool,
+    /// Cluster #8: default album sort order.
+    pub(super) album_default_sort: AlbumDefaultSort,
+    /// Cluster #9: catalog merge policy.
+    pub(super) metadata_source_of_truth: MetadataSourceOfTruth,
+    /// Cluster #10: shuffle scope.
+    pub(super) shuffle_scope: ShuffleScope,
+    /// Cluster #2 transient flag: set to `true` on user-initiated
+    /// `play_track_with_history` calls and consumed by the next
+    /// `PlayerEvent::PlayingTrackChanged` arm. Used to scope the
+    /// `FollowNowPlaying::OnPlaybackStart` setting (only follow on
+    /// explicit user plays, not auto-advance / device-switch
+    /// reloads).
+    pub(super) pending_follow_scroll: bool,
+    /// Cluster #7: paths that were on disk during the most recent
+    /// scan but no longer resolve (`Path::exists() == false`). Used
+    /// only when `hide_missing_files` is on. Populated by the
+    /// metadata activity poll on a background tick so the UI thread
+    /// never stats files itself. Runtime-only.
+    pub(super) missing_track_paths: HashSet<PathBuf>,
     scan_progress: ScanProgress,
     scan_errors: Vec<IndexingError>,
     /// Snapshot of failed metadata-job rows refreshed on the activity
@@ -2078,6 +2367,12 @@ pub(crate) struct TempoApp {
     last_scan_browse_reload: Option<Instant>,
     is_scanning: bool,
     metadata_activity: CatalogMetadataActivity,
+    /// Peak `pending + running` seen during the current metadata sync
+    /// run. Used as the baseline for the circular progress glyph next
+    /// to "All Music": progress = `(peak - remaining) / peak`. Resets
+    /// to `0` whenever activity falls back to idle so the next run
+    /// starts a fresh progress arc.
+    metadata_activity_peak: usize,
     table_scrollbar_drag: Option<TableScrollbarDrag>,
     table_horizontal_scrollbar_drag: Option<TableHorizontalScrollbarDrag>,
     browse_scrollbar_drag: Option<BrowseScrollbarDrag>,
@@ -2273,6 +2568,12 @@ pub(crate) struct TempoApp {
     /// that hides or shows the window. Not persisted — fresh
     /// launches always start with the window visible.
     pub(super) window_hidden: bool,
+    /// Cluster #3: when `CloseWindowBehavior::AskEveryTime` is
+    /// active, the X-button interceptor sets this to `true` and the
+    /// renderer overlays a small Cancel/Minimize/Quit modal. The
+    /// overlay handlers reset it to `false` on dismissal. Not
+    /// persisted.
+    pub(super) close_confirmation_open: bool,
 }
 
 impl TempoApp {
@@ -2393,10 +2694,23 @@ impl TempoApp {
             this.handle_player_event(event, cx);
         });
 
+        // Cluster #5: branch on the user's startup choice. Empty
+        // libraries always force Settings (so the onboarding card
+        // is unmissable); otherwise the rule is:
+        // - `RestoreLastView` → reopen on whatever page was last
+        //   active.
+        // - `OpenLibrary` (default) / `StartHidden` / `OpenMini` →
+        //   land on the library; the latter two also affect window
+        //   mode below.
         let initial_page = if roots.is_empty() {
             Page::Settings
         } else {
-            state.page
+            match state.startup_behavior {
+                StartupBehavior::RestoreLastView => state.page,
+                StartupBehavior::OpenLibrary
+                | StartupBehavior::StartHidden
+                | StartupBehavior::OpenMini => Page::Library,
+            }
         };
         // Resolve the now-playing track index by path so a rescanned library
         // (which can shift indices) still highlights the correct row in the
@@ -2555,6 +2869,18 @@ impl TempoApp {
             library_status,
             online_metadata_mode: state.online_metadata_mode,
             window_restore_mode: state.window_restore_mode,
+            follow_now_playing: state.follow_now_playing,
+            close_window_behavior: state.close_window_behavior,
+            library_play_behavior: state.library_play_behavior,
+            startup_behavior: state.startup_behavior,
+            last_mini_size: state.last_mini_size,
+            notification_mode: state.notification_mode,
+            hide_missing_files: state.hide_missing_files,
+            album_default_sort: state.album_default_sort,
+            metadata_source_of_truth: state.metadata_source_of_truth,
+            shuffle_scope: state.shuffle_scope,
+            pending_follow_scroll: false,
+            missing_track_paths: HashSet::new(),
             scan_progress: ScanProgress::default(),
             scan_errors: Vec::new(),
             metadata_errors: Vec::new(),
@@ -2564,6 +2890,7 @@ impl TempoApp {
             last_scan_browse_reload: None,
             is_scanning: false,
             metadata_activity: CatalogMetadataActivity::default(),
+            metadata_activity_peak: 0,
             table_scrollbar_drag: None,
             table_horizontal_scrollbar_drag: None,
             browse_scrollbar_drag: None,
@@ -2618,6 +2945,7 @@ impl TempoApp {
             main_window: None,
             seen_tray_minimize_toast: state.seen_tray_minimize_toast,
             window_hidden: false,
+            close_confirmation_open: false,
         };
 
         app.artist_grid_scroll_handle
@@ -2713,6 +3041,28 @@ impl TempoApp {
                     this.set_window_hidden(false);
                 }
             }));
+        // Cluster #5: apply the user's startup choice for the two
+        // variants that affect the window itself rather than the
+        // initial page. We do these *after* the activation
+        // subscription is wired so `window_hidden` flips correctly
+        // when the compositor later restores Tempo via taskbar /
+        // tray click.
+        match state.startup_behavior {
+            StartupBehavior::OpenLibrary | StartupBehavior::RestoreLastView => {}
+            StartupBehavior::OpenMini => {
+                if !app.library_roots.is_empty() {
+                    // Skip mini on a fresh / empty install — the
+                    // mini player has no meaningful content yet and
+                    // the onboarding card is hidden in mini mode.
+                    app.enter_mini_mode(cx);
+                }
+            }
+            StartupBehavior::StartHidden => {
+                cx.defer_in(window, |this, _window, cx| {
+                    this.hide_main_window(cx);
+                });
+            }
+        }
         app
     }
 
@@ -2724,6 +3074,7 @@ impl TempoApp {
         self.online_metadata_mode = mode;
         if mode == OnlineMetadataMode::Off {
             self.metadata_activity = CatalogMetadataActivity::default();
+            self.metadata_activity_peak = 0;
         }
         self.restart_metadata_worker();
         self.save_app_state();
@@ -4041,6 +4392,28 @@ impl TempoApp {
         self.open_album_tab(album_id);
     }
 
+    /// Cluster #2 helper: scroll the *active* library tab to the
+    /// currently-playing track if it's visible there. Unlike
+    /// [`Self::select_track_in_all_music`], this never switches tabs
+    /// or opens new ones — if the active view doesn't contain the
+    /// playing track, the call is a quiet no-op so library browsing
+    /// is never interrupted by a passive song change.
+    fn follow_now_playing_in_active_tab(&self) {
+        if self.playing_track >= self.tracks.len() {
+            return;
+        }
+        let Some(row_ix) = self
+            .current_track_indices()
+            .iter()
+            .position(|ix| *ix == self.playing_track)
+        else {
+            return;
+        };
+        self.active_tab()
+            .table_scroll_handle
+            .scroll_to_item(row_ix, ScrollStrategy::Center);
+    }
+
     fn select_track_in_all_music(&mut self, track_ix: usize) {
         if track_ix >= self.tracks.len() {
             return;
@@ -4639,15 +5012,32 @@ impl Render for TempoApp {
                         handle
                             .update(cx, |app, window, cx| {
                                 window.on_window_should_close(cx, move |window, cx| {
-                                    window.minimize_window();
-                                    #[cfg(all(unix, not(target_os = "macos")))]
-                                    tempo::hypr::hide_window();
-                                    close_handle
-                                        .update(cx, |app, _window, cx| {
-                                            app.on_window_close_intercepted(cx);
-                                        })
-                                        .ok();
-                                    false
+                                    let behavior = close_handle
+                                        .read(cx)
+                                        .map(|app| app.close_window_behavior)
+                                        .unwrap_or(CloseWindowBehavior::MinimizeToTray);
+                                    match behavior {
+                                        CloseWindowBehavior::Quit => true,
+                                        CloseWindowBehavior::AskEveryTime => {
+                                            close_handle
+                                                .update(cx, |app, _window, cx| {
+                                                    app.show_close_confirmation(cx);
+                                                })
+                                                .ok();
+                                            false
+                                        }
+                                        CloseWindowBehavior::MinimizeToTray => {
+                                            window.minimize_window();
+                                            #[cfg(all(unix, not(target_os = "macos")))]
+                                            tempo::hypr::hide_window();
+                                            close_handle
+                                                .update(cx, |app, _window, cx| {
+                                                    app.on_window_close_intercepted(cx);
+                                                })
+                                                .ok();
+                                            false
+                                        }
+                                    }
                                 });
                                 app.set_main_window(handle);
                             })
@@ -4705,6 +5095,7 @@ impl Render for TempoApp {
             .on_action(cx.listener(Self::toggle_mini_player_action))
             .on_action(cx.listener(Self::cycle_mini_player_action))
             .on_action(cx.listener(Self::hide_window_action))
+            .on_action(cx.listener(Self::quit_tempo_action))
             .on_mouse_down(
                 MouseButton::Navigate(NavigationDirection::Back),
                 cx.listener(Self::navigate_back_mouse),
@@ -4831,6 +5222,9 @@ impl Render for TempoApp {
             .when_some(self.tooltip.clone(), |this, tooltip| {
                 this.child(self.render_tooltip(&tooltip))
             })
+            .when(self.close_confirmation_open, |this| {
+                this.child(self.render_close_confirmation(cx))
+            })
     }
 }
 
@@ -4929,7 +5323,7 @@ impl TempoApp {
             return;
         }
 
-        self.play_track(self.active_selected_track(), cx);
+        self.play_track_from_picker(self.active_selected_track(), cx);
         cx.notify();
     }
 
@@ -5007,6 +5401,14 @@ impl TempoApp {
     fn hide_window_action(&mut self, _: &HideWindow, _: &mut Window, cx: &mut Context<Self>) {
         self.hide_main_window(cx);
         cx.notify();
+    }
+
+    /// Bound to Ctrl+Q. Fully exits the app, bypassing the
+    /// X-button-to-tray interception. Mirror of the tray menu's
+    /// "Quit Tempo" item.
+    fn quit_tempo_action(&mut self, _: &QuitTempo, _: &mut Window, cx: &mut Context<Self>) {
+        perf::event("hotkey.quit_tempo", "");
+        cx.quit();
     }
 
     fn close_all_tabs_action(&mut self, _: &CloseAllTabs, _: &mut Window, cx: &mut Context<Self>) {

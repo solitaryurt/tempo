@@ -29,6 +29,16 @@
 use super::*;
 use std::time::Instant;
 
+/// Resolved branch of [`LibraryPlayBehavior`] for a single
+/// `play_track_from_picker` call. Internal helper enum: the public
+/// setting has an `Auto` variant that maps to either of these two
+/// based on `self.queue` emptiness; this enum is the post-resolution
+/// shape so the call site can match exhaustively.
+enum LibraryPlayResolved {
+    Replace,
+    InsertAfter,
+}
+
 mod entity;
 mod mini;
 mod render;
@@ -54,6 +64,26 @@ impl TempoApp {
                 {
                     self.playing_track = ix;
                 }
+                // Cluster #2: apply the follow-now-playing policy.
+                // - `Off` → do nothing.
+                // - `OnPlaybackStart` → scroll only when this change
+                //   was triggered by an explicit user play (the
+                //   `pending_follow_scroll` flag set in
+                //   `play_track_with_history`).
+                // - `OnEverySongChange` → scroll on every track flip,
+                //   including auto-advance, but never switch tabs.
+                let user_initiated = std::mem::take(&mut self.pending_follow_scroll);
+                let should_follow = match self.follow_now_playing {
+                    FollowNowPlaying::Off => false,
+                    FollowNowPlaying::OnPlaybackStart => user_initiated,
+                    FollowNowPlaying::OnEverySongChange => true,
+                };
+                if should_follow {
+                    self.follow_now_playing_in_active_tab();
+                }
+                // Cluster #6: emit a desktop notification (no-op
+                // unless the user opted in via Settings → Playback).
+                self.fire_track_change_notification();
                 // Keep the OS title bar in sync with the active
                 // track while we're in mini mode (the user can't
                 // see the in-app marquee from outside the window).
@@ -195,8 +225,15 @@ impl TempoApp {
         if matches!(self.window_mode, WindowMode::Mini(_)) {
             return;
         }
-        let target = MiniSize::CompactBar;
+        // Cluster #5: open at whatever mini size the user last used,
+        // falling back to `CompactBar` for fresh installs. The choice
+        // is persisted in `AppState::last_mini_size` so
+        // `StartupBehavior::OpenMini` can also come up at the right
+        // size on a cold launch.
+        let target = self.last_mini_size.unwrap_or(MiniSize::CompactBar);
         self.window_mode = WindowMode::Mini(target);
+        self.last_mini_size = Some(target);
+        self.save_app_state();
         self.pending_window_swap = Some(PendingWindowSwap {
             target_size: self.target_size_for(target),
             // Render-time computes the centered position so the new
@@ -272,6 +309,10 @@ impl TempoApp {
         };
         let next = current.next();
         self.window_mode = WindowMode::Mini(next);
+        // Persist the cycle so the next launch (with
+        // `StartupBehavior::OpenMini`) honours the user's preference.
+        self.last_mini_size = Some(next);
+        self.save_app_state();
         self.pending_window_swap = Some(PendingWindowSwap {
             target_size: self.target_size_for(next),
             // Keep the new window centered on the current window's
@@ -618,6 +659,58 @@ impl TempoApp {
         self.play_track_with_history(track_ix, true, cx);
     }
 
+    /// Cluster #4 entry point. UI surfaces (library tables, search
+    /// results, etc.) call this when the user explicitly picks a
+    /// track to start playback from. The behaviour branches on the
+    /// `library_play_behavior` setting:
+    ///
+    /// - `AlwaysReplaceQueue` → fall through to `play_track`, which
+    ///   clears `queue_cursor` and lets the next auto-advance walk
+    ///   the library order from this track forward.
+    /// - `AlwaysInsertAfterCurrent` → splice the picked track into
+    ///   the queue right after the current cursor (or at the front
+    ///   if there's no cursor) and play it from there.
+    /// - `Auto` → if the queue has any entries, behave as
+    ///   `AlwaysInsertAfterCurrent` so the user's curated queue is
+    ///   preserved; otherwise replace.
+    pub(super) fn play_track_from_picker(&mut self, track_ix: usize, cx: &mut Context<Self>) {
+        if track_ix >= self.tracks.len() {
+            return;
+        }
+        let strategy = match self.library_play_behavior {
+            LibraryPlayBehavior::AlwaysReplaceQueue => LibraryPlayResolved::Replace,
+            LibraryPlayBehavior::AlwaysInsertAfterCurrent => LibraryPlayResolved::InsertAfter,
+            LibraryPlayBehavior::Auto => {
+                if self.queue.is_empty() {
+                    LibraryPlayResolved::Replace
+                } else {
+                    LibraryPlayResolved::InsertAfter
+                }
+            }
+        };
+        match strategy {
+            LibraryPlayResolved::Replace => self.play_track(track_ix, cx),
+            LibraryPlayResolved::InsertAfter => {
+                let insert_at = match self.queue_cursor {
+                    Some(cursor) => (cursor + 1).min(self.queue.len()),
+                    None => 0,
+                };
+                self.queue.insert(insert_at, track_ix);
+                self.queue_cursor = Some(insert_at);
+                // Same as `play_queue_entry`: don't clear the queue,
+                // do play this track now and arm the user-initiated
+                // follow-scroll.
+                self.pending_follow_scroll = true;
+                self.play_track_with_history(track_ix, true, cx);
+                // `play_track_with_history` clears `queue_cursor`,
+                // but since we *are* in the queue now, restore it
+                // so the active row indicator reflects the queue
+                // position.
+                self.queue_cursor = Some(insert_at);
+            }
+        }
+    }
+
     pub(super) fn play_track_with_history(
         &mut self,
         track_ix: usize,
@@ -631,6 +724,13 @@ impl TempoApp {
         // queue auto-advance in `play_finished_track`) re-set the
         // cursor *after* this call returns.
         self.queue_cursor = None;
+        // Cluster #2: arm the follow-on-playback-start scroll for
+        // user-initiated plays only (record_history==true). The next
+        // `PlayingTrackChanged` event consumes the flag in
+        // `handle_player_event`.
+        if record_history {
+            self.pending_follow_scroll = true;
+        }
         let start = Instant::now();
         let Some(track) = self.tracks.get(track_ix) else {
             return;
@@ -918,16 +1018,26 @@ impl TempoApp {
     }
 
     pub(super) fn play_random_track(&mut self, cx: &mut Context<Self>) {
-        let indices = self.current_track_indices();
-        if indices.is_empty() {
+        // Cluster #10: branch on `ShuffleScope`. `CurrentSource`
+        // honours the active library tab / search / playlist
+        // (whatever `current_track_indices` resolves to);
+        // `Everything` ignores filters and picks across the full
+        // catalog. Either way, the result is fed through
+        // `play_track` so the queue cursor / play-then-resume
+        // semantics from cluster #4 are unchanged.
+        let pool: Vec<usize> = match self.shuffle_scope {
+            ShuffleScope::CurrentSource => self.current_track_indices().to_vec(),
+            ShuffleScope::Everything => (0..self.tracks.len()).collect(),
+        };
+        if pool.is_empty() {
             return;
         }
 
         let seed = Self::shuffle_seed();
-        let next = indices
+        let next = pool
             .iter()
             .copied()
-            .filter(|track_ix| indices.len() == 1 || *track_ix != self.playing_track)
+            .filter(|track_ix| pool.len() == 1 || *track_ix != self.playing_track)
             .min_by_key(|track_ix| Self::shuffle_key(&self.tracks[*track_ix], *track_ix, seed))
             .unwrap_or(self.playing_track);
         self.play_track(next, cx);

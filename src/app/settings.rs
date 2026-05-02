@@ -15,6 +15,128 @@ fn settings_icon_cache() -> &'static Mutex<HashMap<SettingsIconCacheKey, Arc<Ima
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Build a labelled radio-group panel: an elevated header strip
+/// followed by a body filled with the caller-provided option rows.
+/// Mirrors the chrome used by the existing Theme / Audio Output /
+/// Library panels but wraps the radio-row body in a single
+/// `flex_col + gap_2` so callers don't have to repeat the layout
+/// glue at every call site.
+fn setting_panel(
+    title: impl Into<SharedString>,
+    summary: impl Into<SharedString>,
+    colors: ThemeColors,
+    options: Vec<gpui::AnyElement>,
+) -> gpui::Div {
+    div()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(colors.border))
+        .bg(rgb(colors.surface))
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .px_4()
+                .py_2()
+                .bg(rgb(colors.elevated))
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .child(title.into()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(colors.text_muted))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(summary.into()),
+                ),
+        )
+        .child(
+            div()
+                .px_4()
+                .py_3()
+                .border_t_1()
+                .border_color(rgb(colors.border))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .children(options),
+        )
+}
+
+/// Generic radio-row chrome — title, description, and an "Active"
+/// pill. Callers wire `.on_click(...)` themselves on the returned
+/// element so they keep their normal `cx.listener` integration with
+/// the [`TempoApp`] entity.
+fn render_radio_option(
+    id: SharedString,
+    title: SharedString,
+    description: SharedString,
+    selected: bool,
+    colors: ThemeColors,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .px_3()
+        .py_2()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(if selected {
+            colors.accent
+        } else {
+            colors.border
+        }))
+        .bg(rgb(if selected {
+            colors.selected
+        } else {
+            colors.button
+        }))
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .hover(move |this| {
+            this.bg(rgb(if selected {
+                colors.selected
+            } else {
+                colors.hover
+            }))
+        })
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_color(rgb(colors.text_strong)).child(title))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(colors.text_muted))
+                        .child(description),
+                ),
+        )
+        .child(
+            div()
+                .w(px(56.0))
+                .text_xs()
+                .text_color(rgb(if selected {
+                    colors.accent_soft
+                } else {
+                    colors.text_faint
+                }))
+                .child(if selected { "Active" } else { "" }),
+        )
+}
+
 impl TempoApp {
     pub(super) fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = *self.colors();
@@ -113,6 +235,9 @@ impl TempoApp {
                                 }
                                 SettingsSection::AudioOutput => {
                                     self.render_output_settings(cx).into_any_element()
+                                }
+                                SettingsSection::Playback => {
+                                    self.render_playback_settings(cx).into_any_element()
                                 }
                                 SettingsSection::Window => {
                                     self.render_window_settings(cx).into_any_element()
@@ -267,6 +392,11 @@ impl TempoApp {
                 r#"<path d="M5 9.5H8.2L13 5.5V18.5L8.2 14.5H5V9.5Z" fill="none" stroke="{color}" stroke-width="1.6" stroke-linejoin="round"/>
 <path d="M16 9.2C17.2 10.2 17.9 11.5 17.9 12.9C17.9 14.4 17.2 15.7 16 16.7" fill="none" stroke="{accent_stroke}" stroke-width="1.5" stroke-linecap="round"/>
 <path d="M18.5 6.8C20.4 8.4 21.4 10.6 21.4 12.9C21.4 15.3 20.4 17.5 18.5 19.1" fill="none" stroke="{accent_stroke}" stroke-width="1.5" stroke-linecap="round"/>"#
+            ),
+            // Play triangle — playback behaviour cluster.
+            SettingsSection::Playback => format!(
+                r#"<path d="M8 5.4L18 12L8 18.6Z" fill="none" stroke="{color}" stroke-width="1.6" stroke-linejoin="round"/>
+<path d="M11 9.6L14 12L11 14.4Z" fill="{accent_stroke}" stroke="{accent_stroke}" stroke-width="1" stroke-linejoin="round"/>"#
             ),
             // Window / workspace restore behaviour.
             SettingsSection::Window => format!(
@@ -556,59 +686,328 @@ impl TempoApp {
             )
     }
 
+    pub(super) fn render_playback_settings(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+
+        let follow_panel = setting_panel(
+            "When playback starts or songs change",
+            self.follow_now_playing.label(),
+            colors,
+            vec![
+                self.render_follow_option(
+                    FollowNowPlaying::Off,
+                    "Browsing isn't interrupted by playback.",
+                    cx,
+                ),
+                self.render_follow_option(
+                    FollowNowPlaying::OnPlaybackStart,
+                    "Scroll to the playing track when you press play.",
+                    cx,
+                ),
+                self.render_follow_option(
+                    FollowNowPlaying::OnEverySongChange,
+                    "Always keep the now-playing row in view.",
+                    cx,
+                ),
+            ],
+        );
+
+        let library_play_panel = setting_panel(
+            "When you play a track from the library",
+            self.library_play_behavior.label(),
+            colors,
+            vec![
+                self.render_library_play_option(
+                    LibraryPlayBehavior::Auto,
+                    "If your queue is empty, replace it. Otherwise, drop the new track in after the current one.",
+                    cx,
+                ),
+                self.render_library_play_option(
+                    LibraryPlayBehavior::AlwaysReplaceQueue,
+                    "Treat each library play as a fresh queue.",
+                    cx,
+                ),
+                self.render_library_play_option(
+                    LibraryPlayBehavior::AlwaysInsertAfterCurrent,
+                    "Keep your queue and slot the picked track in after the current one.",
+                    cx,
+                ),
+            ],
+        );
+
+        let shuffle_panel = setting_panel(
+            "When you shuffle",
+            self.shuffle_scope.label(),
+            colors,
+            vec![
+                self.render_shuffle_option(
+                    ShuffleScope::CurrentSource,
+                    "Pick from the active library tab, search, or playlist.",
+                    cx,
+                ),
+                self.render_shuffle_option(
+                    ShuffleScope::Everything,
+                    "Pick from your full catalog regardless of context.",
+                    cx,
+                ),
+            ],
+        );
+
+        let notify_panel = setting_panel(
+            "Show a desktop notification on song change",
+            self.notification_mode.label(),
+            colors,
+            vec![
+                self.render_notification_option(
+                    NotificationMode::Never,
+                    "Tempo never sends desktop notifications.",
+                    cx,
+                ),
+                self.render_notification_option(
+                    NotificationMode::OnlyWhenHidden,
+                    "Notify only when the main window is in the tray.",
+                    cx,
+                ),
+                self.render_notification_option(
+                    NotificationMode::Always,
+                    "Notify on every track change, even when Tempo is visible.",
+                    cx,
+                ),
+            ],
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(follow_panel)
+            .child(library_play_panel)
+            .child(shuffle_panel)
+            .child(notify_panel)
+    }
+
+    fn render_follow_option(
+        &self,
+        mode: FollowNowPlaying,
+        description: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = *self.colors();
+        let selected = self.follow_now_playing == mode;
+        let id = SharedString::from(format!(
+            "follow-now-playing-{}",
+            match mode {
+                FollowNowPlaying::Off => "off",
+                FollowNowPlaying::OnPlaybackStart => "on-start",
+                FollowNowPlaying::OnEverySongChange => "always",
+            }
+        ));
+
+        render_radio_option(
+            id,
+            SharedString::from(mode.label()),
+            SharedString::from(description),
+            selected,
+            colors,
+        )
+        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+            if this.follow_now_playing != mode {
+                this.follow_now_playing = mode;
+                this.save_app_state();
+                cx.notify();
+            }
+        }))
+        .into_any_element()
+    }
+
+    fn render_library_play_option(
+        &self,
+        mode: LibraryPlayBehavior,
+        description: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = *self.colors();
+        let selected = self.library_play_behavior == mode;
+        let id = SharedString::from(format!(
+            "library-play-behavior-{}",
+            match mode {
+                LibraryPlayBehavior::Auto => "auto",
+                LibraryPlayBehavior::AlwaysReplaceQueue => "replace",
+                LibraryPlayBehavior::AlwaysInsertAfterCurrent => "insert",
+            }
+        ));
+
+        render_radio_option(
+            id,
+            SharedString::from(mode.label()),
+            SharedString::from(description),
+            selected,
+            colors,
+        )
+        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+            if this.library_play_behavior != mode {
+                this.library_play_behavior = mode;
+                this.save_app_state();
+                cx.notify();
+            }
+        }))
+        .into_any_element()
+    }
+
+    fn render_shuffle_option(
+        &self,
+        mode: ShuffleScope,
+        description: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = *self.colors();
+        let selected = self.shuffle_scope == mode;
+        let id = SharedString::from(format!(
+            "shuffle-scope-{}",
+            match mode {
+                ShuffleScope::CurrentSource => "current",
+                ShuffleScope::Everything => "everything",
+            }
+        ));
+
+        render_radio_option(
+            id,
+            SharedString::from(mode.label()),
+            SharedString::from(description),
+            selected,
+            colors,
+        )
+        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+            if this.shuffle_scope != mode {
+                this.shuffle_scope = mode;
+                this.save_app_state();
+                cx.notify();
+            }
+        }))
+        .into_any_element()
+    }
+
+    fn render_notification_option(
+        &self,
+        mode: NotificationMode,
+        description: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = *self.colors();
+        let selected = self.notification_mode == mode;
+        let id = SharedString::from(format!(
+            "notification-mode-{}",
+            match mode {
+                NotificationMode::Always => "always",
+                NotificationMode::OnlyWhenHidden => "hidden",
+                NotificationMode::Never => "never",
+            }
+        ));
+
+        render_radio_option(
+            id,
+            SharedString::from(mode.label()),
+            SharedString::from(description),
+            selected,
+            colors,
+        )
+        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+            if this.notification_mode != mode {
+                this.notification_mode = mode;
+                this.save_app_state();
+                cx.notify();
+            }
+        }))
+        .into_any_element()
+    }
+
     pub(super) fn render_window_settings(
         &self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let colors = *self.colors();
 
+        let restore_panel = setting_panel(
+            "When opening Tempo from another workspace",
+            self.window_restore_mode.label(),
+            colors,
+            vec![
+                self.render_window_restore_option(
+                    WindowRestoreMode::BringHere,
+                    "Move Tempo to the current workspace as a floating window.",
+                    cx,
+                )
+                .into_any_element(),
+                self.render_window_restore_option(
+                    WindowRestoreMode::GoToWindow,
+                    "Switch to the workspace where Tempo already is.",
+                    cx,
+                )
+                .into_any_element(),
+            ],
+        );
+
+        let close_panel = setting_panel(
+            "When the window's X is clicked",
+            self.close_window_behavior.label(),
+            colors,
+            vec![
+                self.render_close_behavior_option(
+                    CloseWindowBehavior::MinimizeToTray,
+                    "Hide the window but keep audio playing in the tray.",
+                    cx,
+                ),
+                self.render_close_behavior_option(
+                    CloseWindowBehavior::AskEveryTime,
+                    "Show a confirmation toast before doing anything.",
+                    cx,
+                ),
+                self.render_close_behavior_option(
+                    CloseWindowBehavior::Quit,
+                    "Treat the X like a regular app close — Tempo exits.",
+                    cx,
+                ),
+            ],
+        );
+
+        let startup_panel = setting_panel(
+            "When Tempo starts",
+            self.startup_behavior.label(),
+            colors,
+            vec![
+                self.render_startup_option(
+                    StartupBehavior::OpenLibrary,
+                    "Land on the library, ignoring the previously-open page.",
+                    cx,
+                ),
+                self.render_startup_option(
+                    StartupBehavior::RestoreLastView,
+                    "Reopen Tempo on whatever page it was last on.",
+                    cx,
+                ),
+                self.render_startup_option(
+                    StartupBehavior::StartHidden,
+                    "Skip the window entirely; Tempo lives in the tray.",
+                    cx,
+                ),
+                self.render_startup_option(
+                    StartupBehavior::OpenMini,
+                    "Open straight into the mini player at its last size.",
+                    cx,
+                ),
+            ],
+        );
+
         div()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(colors.border))
-            .bg(rgb(colors.surface))
-            .overflow_hidden()
-            .child(
-                div()
-                    .px_4()
-                    .py_2()
-                    .bg(rgb(colors.elevated))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(div().font_weight(gpui::FontWeight::BOLD).child("Window"))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(colors.text_muted))
-                            .child(self.window_restore_mode.label()),
-                    ),
-            )
-            .child(
-                div()
-                    .px_4()
-                    .py_3()
-                    .border_t_1()
-                    .border_color(rgb(colors.border))
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_color(rgb(colors.text_strong))
-                            .child("When opening Tempo from another workspace"),
-                    )
-                    .child(self.render_window_restore_option(
-                        WindowRestoreMode::BringHere,
-                        "Move Tempo to the current workspace as a floating window.",
-                        cx,
-                    ))
-                    .child(self.render_window_restore_option(
-                        WindowRestoreMode::GoToWindow,
-                        "Switch to the workspace where Tempo already is.",
-                        cx,
-                    )),
-            )
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(restore_panel)
+            .child(close_panel)
+            .child(startup_panel)
     }
 
     fn render_window_restore_option(
@@ -616,87 +1015,107 @@ impl TempoApp {
         mode: WindowRestoreMode,
         description: &'static str,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
+    ) -> gpui::AnyElement {
         let colors = *self.colors();
         let selected = self.window_restore_mode == mode;
+        let id = SharedString::from(format!(
+            "window-restore-{}",
+            match mode {
+                WindowRestoreMode::BringHere => "bring-here",
+                WindowRestoreMode::GoToWindow => "go-to-window",
+            }
+        ));
 
-        div()
-            .id(SharedString::from(format!(
-                "window-restore-{}",
-                match mode {
-                    WindowRestoreMode::BringHere => "bring-here",
-                    WindowRestoreMode::GoToWindow => "go-to-window",
-                }
-            )))
-            .px_3()
-            .py_2()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(if selected {
-                colors.accent
-            } else {
-                colors.border
-            }))
-            .bg(rgb(if selected {
-                colors.selected
-            } else {
-                colors.button
-            }))
-            .cursor_pointer()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_3()
-            .hover(move |this| {
-                this.bg(rgb(if selected {
-                    colors.selected
-                } else {
-                    colors.hover
-                }))
-            })
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_color(rgb(colors.text_strong))
-                            .child(mode.label()),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(colors.text_muted))
-                            .child(description),
-                    ),
-            )
-            .child(
-                div()
-                    .w(px(56.0))
-                    .text_xs()
-                    .text_color(rgb(if selected {
-                        colors.accent_soft
-                    } else {
-                        colors.text_faint
-                    }))
-                    .child(if selected { "Active" } else { "" }),
-            )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if this.window_restore_mode != mode {
-                    this.window_restore_mode = mode;
-                    this.save_app_state();
-                    cx.notify();
-                }
-            }))
+        render_radio_option(
+            id,
+            SharedString::from(mode.label()),
+            SharedString::from(description),
+            selected,
+            colors,
+        )
+        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+            if this.window_restore_mode != mode {
+                this.window_restore_mode = mode;
+                this.save_app_state();
+                cx.notify();
+            }
+        }))
+        .into_any_element()
+    }
+
+    fn render_close_behavior_option(
+        &self,
+        mode: CloseWindowBehavior,
+        description: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = *self.colors();
+        let selected = self.close_window_behavior == mode;
+        let id = SharedString::from(format!(
+            "close-window-behavior-{}",
+            match mode {
+                CloseWindowBehavior::MinimizeToTray => "minimize",
+                CloseWindowBehavior::AskEveryTime => "ask",
+                CloseWindowBehavior::Quit => "quit",
+            }
+        ));
+
+        render_radio_option(
+            id,
+            SharedString::from(mode.label()),
+            SharedString::from(description),
+            selected,
+            colors,
+        )
+        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+            if this.close_window_behavior != mode {
+                this.close_window_behavior = mode;
+                this.save_app_state();
+                cx.notify();
+            }
+        }))
+        .into_any_element()
+    }
+
+    fn render_startup_option(
+        &self,
+        mode: StartupBehavior,
+        description: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = *self.colors();
+        let selected = self.startup_behavior == mode;
+        let id = SharedString::from(format!(
+            "startup-behavior-{}",
+            match mode {
+                StartupBehavior::OpenLibrary => "library",
+                StartupBehavior::RestoreLastView => "restore",
+                StartupBehavior::StartHidden => "hidden",
+                StartupBehavior::OpenMini => "mini",
+            }
+        ));
+
+        render_radio_option(
+            id,
+            SharedString::from(mode.label()),
+            SharedString::from(description),
+            selected,
+            colors,
+        )
+        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+            if this.startup_behavior != mode {
+                this.startup_behavior = mode;
+                this.save_app_state();
+                cx.notify();
+            }
+        }))
+        .into_any_element()
     }
 
     pub(super) fn render_library_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = *self.colors();
 
-        div()
+        let folders_panel = div()
             .rounded_lg()
             .border_1()
             .border_color(rgb(colors.border))
@@ -775,7 +1194,133 @@ impl TempoApp {
                                 })),
                         )
                     }),
-            )
+            );
+
+        let missing_panel = setting_panel(
+            "Files that are no longer on disk",
+            if self.hide_missing_files {
+                "Hidden from playback views"
+            } else {
+                "Always shown"
+            },
+            colors,
+            vec![
+                self.render_hide_missing_option(
+                    true,
+                    "Hide them",
+                    "Skip missing files in the library, search, and queue. Play counts and history are kept.",
+                    cx,
+                ),
+                self.render_hide_missing_option(
+                    false,
+                    "Show them",
+                    "Keep missing files visible everywhere, even if Tempo can't play them right now.",
+                    cx,
+                ),
+            ],
+        );
+
+        let album_sort_panel = setting_panel(
+            "Default sort for the album view",
+            self.album_default_sort.label(),
+            colors,
+            vec![
+                self.render_album_sort_option(
+                    AlbumDefaultSort::ArtistThenYear,
+                    "Group albums by their artist, then by release year.",
+                    cx,
+                ),
+                self.render_album_sort_option(
+                    AlbumDefaultSort::ReleaseDate,
+                    "Newest first; ignores artist.",
+                    cx,
+                ),
+                self.render_album_sort_option(
+                    AlbumDefaultSort::DateAdded,
+                    "Most recently added first.",
+                    cx,
+                ),
+                self.render_album_sort_option(
+                    AlbumDefaultSort::Title,
+                    "Plain alphabetical by album title.",
+                    cx,
+                ),
+            ],
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(folders_panel)
+            .child(missing_panel)
+            .child(album_sort_panel)
+    }
+
+    fn render_hide_missing_option(
+        &self,
+        target: bool,
+        label: &'static str,
+        description: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = *self.colors();
+        let selected = self.hide_missing_files == target;
+        let id = SharedString::from(format!(
+            "hide-missing-{}",
+            if target { "yes" } else { "no" }
+        ));
+
+        render_radio_option(
+            id,
+            SharedString::from(label),
+            SharedString::from(description),
+            selected,
+            colors,
+        )
+        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+            if this.hide_missing_files != target {
+                this.hide_missing_files = target;
+                this.save_app_state();
+                cx.notify();
+            }
+        }))
+        .into_any_element()
+    }
+
+    fn render_album_sort_option(
+        &self,
+        mode: AlbumDefaultSort,
+        description: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = *self.colors();
+        let selected = self.album_default_sort == mode;
+        let id = SharedString::from(format!(
+            "album-default-sort-{}",
+            match mode {
+                AlbumDefaultSort::ArtistThenYear => "artist-year",
+                AlbumDefaultSort::ReleaseDate => "release",
+                AlbumDefaultSort::DateAdded => "added",
+                AlbumDefaultSort::Title => "title",
+            }
+        ));
+
+        render_radio_option(
+            id,
+            SharedString::from(mode.label()),
+            SharedString::from(description),
+            selected,
+            colors,
+        )
+        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+            if this.album_default_sort != mode {
+                this.album_default_sort = mode;
+                this.save_app_state();
+                cx.notify();
+            }
+        }))
+        .into_any_element()
     }
 
     pub(super) fn render_online_metadata_settings(
@@ -784,7 +1329,7 @@ impl TempoApp {
     ) -> impl IntoElement + use<> {
         let colors = *self.colors();
 
-        div()
+        let mode_panel = div()
             .rounded_lg()
             .border_1()
             .border_color(rgb(colors.border))
@@ -840,7 +1385,71 @@ impl TempoApp {
                     .when(self.online_metadata_mode == OnlineMetadataMode::Automatic, |this| {
                         this.child(self.render_online_metadata_resync_row(cx))
                     }),
-            )
+            );
+
+        let source_panel = setting_panel(
+            "Where Tempo gets metadata when both are available",
+            self.metadata_source_of_truth.label(),
+            colors,
+            vec![
+                self.render_metadata_source_option(
+                    MetadataSourceOfTruth::PreferEmbeddedFallbackOnline,
+                    "Read the file's tags first; fill in blanks from online sources during enrichment.",
+                    cx,
+                ),
+                self.render_metadata_source_option(
+                    MetadataSourceOfTruth::TrustEmbedded,
+                    "Use the file's tags as the authority; online enrichment fills only missing fields.",
+                    cx,
+                ),
+                self.render_metadata_source_option(
+                    MetadataSourceOfTruth::TrustOnline,
+                    "Future enrichment will overwrite embedded tags with online data when both exist.",
+                    cx,
+                ),
+            ],
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(mode_panel)
+            .child(source_panel)
+    }
+
+    fn render_metadata_source_option(
+        &self,
+        mode: MetadataSourceOfTruth,
+        description: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = *self.colors();
+        let selected = self.metadata_source_of_truth == mode;
+        let id = SharedString::from(format!(
+            "metadata-source-{}",
+            match mode {
+                MetadataSourceOfTruth::TrustEmbedded => "embedded",
+                MetadataSourceOfTruth::TrustOnline => "online",
+                MetadataSourceOfTruth::PreferEmbeddedFallbackOnline => "embedded-fallback",
+            }
+        ));
+
+        render_radio_option(
+            id,
+            SharedString::from(mode.label()),
+            SharedString::from(description),
+            selected,
+            colors,
+        )
+        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+            if this.metadata_source_of_truth != mode {
+                this.metadata_source_of_truth = mode;
+                this.save_app_state();
+                cx.notify();
+            }
+        }))
+        .into_any_element()
     }
 
     /// Manual "Resync metadata" action surfaced as a button row inside

@@ -743,14 +743,48 @@ impl TempoApp {
     }
 
     fn metadata_sync_glyph(&self, colors: ThemeColors) -> AnyElement {
-        let color = format!("#{:06x}", colors.text_strong);
+        // Two concentric arcs in an SVG ring:
+        // - background ring: the full circle in muted color so the
+        //   user always sees the "track" the progress fills against,
+        // - progress arc: a partial arc in accent color sized to the
+        //   completion ratio derived from the activity baseline
+        //   (`metadata_activity_peak`) and the remaining jobs.
+        //
+        // The progress arc is anchored at 12 o'clock and grows
+        // clockwise, which is the standard reading direction. When
+        // we don't yet have a baseline (peak == 0) or the run just
+        // started, we fall back to an indeterminate ~5 % sliver so
+        // the user gets immediate feedback that something is happening.
+        let track_color = format!("#{:06x}", colors.border_strong);
+        let progress_color = format!("#{:06x}", colors.accent);
+
+        let remaining = self
+            .metadata_activity
+            .pending
+            .saturating_add(self.metadata_activity.running);
+        let peak = self.metadata_activity_peak.max(remaining).max(1);
+        let completed = peak.saturating_sub(remaining);
+        let raw_ratio = completed as f32 / peak as f32;
+        // Show at least a hint of progress so the arc is visible even
+        // at the very start of a sync; cap below 100 % so the arc
+        // doesn't fully occlude the muted track ring (the run will
+        // disappear once activity goes idle).
+        let ratio = raw_ratio.clamp(0.05, 0.99);
+
+        // Arc geometry: radius 9 inside a 24x24 viewBox, centered at
+        // (12, 12). Circumference = 2 * pi * r ≈ 56.55. We use
+        // `stroke-dasharray` to draw only the leading slice and
+        // `stroke-dashoffset` is unused (set to 0). The path itself
+        // is a full circle starting at 12 o'clock; the dasharray
+        // truncates it to the desired arc length.
+        const CIRCUMFERENCE: f32 = 2.0 * std::f32::consts::PI * 9.0;
+        let dash_on = CIRCUMFERENCE * ratio;
+        let dash_off = CIRCUMFERENCE - dash_on;
+
         let svg = format!(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24">
-<g transform-origin="12 12">
-<animateTransform attributeName="transform" attributeType="XML" type="rotate" from="0 12 12" to="360 12 12" dur="1.1s" repeatCount="indefinite"/>
-<path d="M12 4A8 8 0 1 1 4 12" fill="none" stroke="{color}" stroke-width="2.4" stroke-linecap="round"/>
-<path d="M4 12L7 9M4 12L7 15" fill="none" stroke="{color}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
-</g>
+<circle cx="12" cy="12" r="9" fill="none" stroke="{track_color}" stroke-width="2.4"/>
+<circle cx="12" cy="12" r="9" fill="none" stroke="{progress_color}" stroke-width="2.4" stroke-linecap="round" stroke-dasharray="{dash_on:.2} {dash_off:.2}" transform="rotate(-90 12 12)"/>
 </svg>"#
         );
 

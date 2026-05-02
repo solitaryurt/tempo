@@ -294,7 +294,7 @@ impl TempoApp {
                     this.column_menu_open = false;
 
                     if event.standard_click() && event.click_count() >= 2 {
-                        this.play_track(track_ix, cx);
+                        this.play_track_from_picker(track_ix, cx);
                     }
 
                     cx.notify();

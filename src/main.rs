@@ -40,7 +40,11 @@ actions!(
         /// tray icon's left-click or "Show Tempo" menu item, the
         /// MPRIS `Raise` method, or the global `ShowWindow` hotkey.
         /// Bound to Ctrl+H.
-        HideWindow
+        HideWindow,
+        /// Fully quit Tempo (audio stops, tray icon goes away). This
+        /// bypasses the X-button-to-tray interception in
+        /// `on_window_should_close`. Bound to Ctrl+Q.
+        QuitTempo
     ]
 );
 
@@ -89,22 +93,44 @@ fn main() {
         window_handle
             .update(cx, |app, window, cx| {
                 window.on_window_should_close(cx, move |window, cx| {
-                    window.minimize_window();
-                    // Hyprland ignores xdg_toplevel.set_minimized()
-                    // for tiled windows, so the call above is a
-                    // no-op there. Pair it with an explicit
-                    // `hyprctl dispatch` that parks the window on
-                    // a hidden special workspace. No-op on every
-                    // other environment (the helper short-circuits
-                    // when HYPRLAND_INSTANCE_SIGNATURE is unset).
-                    #[cfg(all(unix, not(target_os = "macos")))]
-                    tempo::hypr::hide_window();
-                    close_handle
-                        .update(cx, |app, _window, cx| {
-                            app.on_window_close_intercepted(cx);
-                        })
-                        .ok();
-                    false
+                    // Branch on the user's `CloseWindowBehavior`
+                    // setting (cluster #3). The default is still
+                    // tray-minimize so audio keeps playing; users can
+                    // opt into "Quit" or "Ask every time" in
+                    // Settings → Window.
+                    let behavior = close_handle
+                        .read(cx)
+                        .map(|app| app.close_window_behavior)
+                        .unwrap_or(app::CloseWindowBehavior::MinimizeToTray);
+                    match behavior {
+                        app::CloseWindowBehavior::Quit => true,
+                        app::CloseWindowBehavior::AskEveryTime => {
+                            close_handle
+                                .update(cx, |app, _window, cx| {
+                                    app.show_close_confirmation(cx);
+                                })
+                                .ok();
+                            false
+                        }
+                        app::CloseWindowBehavior::MinimizeToTray => {
+                            window.minimize_window();
+                            // Hyprland ignores xdg_toplevel.set_minimized()
+                            // for tiled windows, so the call above is a
+                            // no-op there. Pair it with an explicit
+                            // `hyprctl dispatch` that parks the window on
+                            // a hidden special workspace. No-op on every
+                            // other environment (the helper short-circuits
+                            // when HYPRLAND_INSTANCE_SIGNATURE is unset).
+                            #[cfg(all(unix, not(target_os = "macos")))]
+                            tempo::hypr::hide_window();
+                            close_handle
+                                .update(cx, |app, _window, cx| {
+                                    app.on_window_close_intercepted(cx);
+                                })
+                                .ok();
+                            false
+                        }
+                    }
                 });
                 // Stash the window handle on the app so the tray,
                 // MPRIS Raise, and global hotkeys can route to a
@@ -146,6 +172,7 @@ fn main() {
             KeyBinding::new("ctrl-m", ToggleMiniPlayer, None),
             KeyBinding::new("ctrl-shift-m", CycleMiniPlayer, None),
             KeyBinding::new("ctrl-h", HideWindow, None),
+            KeyBinding::new("ctrl-q", QuitTempo, None),
         ]);
 
         cx.activate(true);

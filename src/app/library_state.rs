@@ -219,6 +219,16 @@ impl TempoApp {
                 })
                 .unwrap_or_default(),
             seen_tray_minimize_toast: self.seen_tray_minimize_toast,
+            follow_now_playing: self.follow_now_playing,
+            close_window_behavior: self.close_window_behavior,
+            library_play_behavior: self.library_play_behavior,
+            startup_behavior: self.startup_behavior,
+            last_mini_size: self.last_mini_size,
+            notification_mode: self.notification_mode,
+            hide_missing_files: self.hide_missing_files,
+            album_default_sort: self.album_default_sort,
+            metadata_source_of_truth: self.metadata_source_of_truth,
+            shuffle_scope: self.shuffle_scope,
         }
     }
 
@@ -539,14 +549,63 @@ impl TempoApp {
 
     pub(super) fn start_metadata_activity_poll(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
+            // Independent counter so the missing-files check (cluster
+            // #7) runs every ~10 ticks rather than on every tick — a
+            // full library `Path::exists()` scan is cheap on local
+            // disk but adds up on big network mounts.
+            let mut tick = 0u64;
             loop {
                 cx.background_executor().timer(METADATA_ACTIVITY_TICK).await;
+                tick = tick.wrapping_add(1);
 
-                let Ok((mode, catalog)) = this.update(cx, |app, _cx| {
-                    (app.online_metadata_mode, app.catalog.clone())
-                }) else {
+                let Ok((mode, catalog, hide_missing, paths_for_check)) =
+                    this.update(cx, |app, _cx| {
+                        let needs_missing_check = app.hide_missing_files && tick.is_multiple_of(10);
+                        let paths = if needs_missing_check {
+                            app.tracks
+                                .iter()
+                                .map(|track| track.path.clone())
+                                .collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        };
+                        (
+                            app.online_metadata_mode,
+                            app.catalog.clone(),
+                            app.hide_missing_files,
+                            paths,
+                        )
+                    })
+                else {
                     return;
                 };
+
+                // Cluster #7: refresh the missing-files set on a
+                // background tick so the UI thread never stats files.
+                if hide_missing && !paths_for_check.is_empty() {
+                    let missing = cx
+                        .background_executor()
+                        .spawn(async move {
+                            paths_for_check
+                                .into_iter()
+                                .filter(|path| !path.exists())
+                                .collect::<HashSet<PathBuf>>()
+                        })
+                        .await;
+                    let changed = this
+                        .update(cx, |app, cx| {
+                            if app.missing_track_paths != missing {
+                                app.missing_track_paths = missing;
+                                app.invalidate_track_indices();
+                                cx.notify();
+                            }
+                        })
+                        .is_ok();
+                    if !changed {
+                        return;
+                    }
+                }
+
                 if mode != OnlineMetadataMode::Automatic {
                     continue;
                 }
@@ -566,6 +625,15 @@ impl TempoApp {
 
                 if this
                     .update(cx, |app, cx| {
+                        let remaining = activity.pending.saturating_add(activity.running);
+                        if remaining == 0 {
+                            // Run finished; reset baseline so the next
+                            // burst of jobs starts a fresh arc instead
+                            // of inheriting the prior run's peak.
+                            app.metadata_activity_peak = 0;
+                        } else if remaining > app.metadata_activity_peak {
+                            app.metadata_activity_peak = remaining;
+                        }
                         app.metadata_activity = activity;
                         app.metadata_errors = metadata_errors;
                         cx.notify();

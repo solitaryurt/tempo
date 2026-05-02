@@ -94,12 +94,21 @@ impl TempoApp {
             ),
         );
         let filter_start = Instant::now();
+        // Cluster #7: also drop tracks whose underlying file no
+        // longer resolves on disk. The `missing_track_paths` set is
+        // populated by `start_metadata_activity_poll` on a
+        // background tick, so the UI thread never stats files.
+        let hide_missing = self.hide_missing_files && !self.missing_track_paths.is_empty();
         let mut indices = source_indices
             .into_iter()
             .filter(|track_ix| {
-                self.tracks
-                    .get(*track_ix)
-                    .is_some_and(|track| Self::track_matches_search_terms(track, &terms))
+                let Some(track) = self.tracks.get(*track_ix) else {
+                    return false;
+                };
+                if hide_missing && self.missing_track_paths.contains(&track.path) {
+                    return false;
+                }
+                Self::track_matches_search_terms(track, &terms)
             })
             .collect::<Vec<_>>();
         perf::log_duration_if_slow(

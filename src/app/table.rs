@@ -2328,7 +2328,7 @@ impl TempoApp {
                         }
 
                         if event.standard_click() && event.click_count() >= 2 {
-                            this.play_track(track_ix, cx);
+                            this.play_track_from_picker(track_ix, cx);
                         }
 
                         cx.notify();
@@ -2398,10 +2398,20 @@ impl TempoApp {
         match column {
             TableColumn::Index => div()
                 .w(px(width))
+                .flex()
+                .items_center()
                 .text_xs()
-                .text_color(rgb(colors.text_faint))
+                .text_color(rgb(if active {
+                    colors.accent
+                } else {
+                    colors.text_faint
+                }))
                 .child(if active {
-                    if is_playing { "Ⅱ" } else { "▶" }.into()
+                    if is_playing {
+                        "▶".to_string()
+                    } else {
+                        "❚❚".to_string()
+                    }
                 } else {
                     format!("{:02}", track_ix + 1)
                 })
@@ -3026,7 +3036,7 @@ impl TempoApp {
                     self.context_menu_item("Play from start")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if track_ix < this.tracks.len() {
-                                this.play_track(track_ix, cx);
+                                this.play_track_from_picker(track_ix, cx);
                                 cx.notify();
                             }
                         })),
