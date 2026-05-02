@@ -34,7 +34,13 @@ actions!(
         NavigateBack,
         NavigateForward,
         ToggleMiniPlayer,
-        CycleMiniPlayer
+        CycleMiniPlayer,
+        /// Hide the main window to the system tray. The window stays
+        /// alive (audio keeps playing) and can be restored from the
+        /// tray icon's left-click or "Show Tempo" menu item, the
+        /// MPRIS `Raise` method, or the global `ShowWindow` hotkey.
+        /// Bound to Ctrl+H.
+        HideWindow
     ]
 );
 
@@ -42,15 +48,58 @@ fn main() {
     Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
 
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                app_id: Some("tempo".into()),
-                ..Default::default()
-            },
-            |window, cx| cx.new(|cx| app::TempoApp::new(window, cx)),
-        )
-        .expect("failed to open Tempo window");
+        let window_handle = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    app_id: Some("tempo".into()),
+                    ..Default::default()
+                },
+                |window, cx| cx.new(|cx| app::TempoApp::new(window, cx)),
+            )
+            .expect("failed to open Tempo window");
+
+        // Tray-as-process-root lifecycle. The user's expectation is
+        // that closing the main window leaves Tempo running so music
+        // keeps playing; only the tray's "Quit Tempo" item actually
+        // exits. We achieve this by intercepting the X-button click
+        // via `on_window_should_close` (returning `false` cancels
+        // the close on every backend GPUI ships) and minimizing
+        // instead. Tray "Show window" later un-minimizes via
+        // `Window::activate_window`. See gpui-0.2.2/src/window.rs:4329
+        // for the API; gpui-0.2.2/src/platform/linux/wayland/window.rs:540
+        // is the Wayland honor that makes this work without a fork.
+        //
+        // The same registration is repeated in the mini-window-swap
+        // path inside `TempoApp::render` so that swapped windows
+        // also intercept their X button.
+        let close_handle = window_handle;
+        window_handle
+            .update(cx, |app, window, cx| {
+                window.on_window_should_close(cx, move |window, cx| {
+                    window.minimize_window();
+                    // Hyprland ignores xdg_toplevel.set_minimized()
+                    // for tiled windows, so the call above is a
+                    // no-op there. Pair it with an explicit
+                    // `hyprctl dispatch` that parks the window on
+                    // a hidden special workspace. No-op on every
+                    // other environment (the helper short-circuits
+                    // when HYPRLAND_INSTANCE_SIGNATURE is unset).
+                    #[cfg(all(unix, not(target_os = "macos")))]
+                    tempo::hypr::hide_window();
+                    close_handle
+                        .update(cx, |app, _window, cx| {
+                            app.on_window_close_intercepted(cx);
+                        })
+                        .ok();
+                    false
+                });
+                // Stash the window handle on the app so the tray,
+                // MPRIS Raise, and global hotkeys can route to a
+                // single `focus_main_window` helper.
+                app.set_main_window(window_handle);
+            })
+            .ok();
 
         cx.bind_keys([
             KeyBinding::new("enter", PlaySelected, None),
@@ -81,6 +130,7 @@ fn main() {
             KeyBinding::new("alt-right", NavigateForward, None),
             KeyBinding::new("ctrl-m", ToggleMiniPlayer, None),
             KeyBinding::new("ctrl-shift-m", CycleMiniPlayer, None),
+            KeyBinding::new("ctrl-h", HideWindow, None),
         ]);
 
         cx.activate(true);

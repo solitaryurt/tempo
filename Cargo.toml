@@ -25,5 +25,13 @@ async-io = "2"
 futures-util = "0.3"
 rustfft = "6.4.1"
 
+# Linux StatusNotifierItem (system tray) implementation. ksni's
+# `async-io` feature shares the `async-io` runtime mpris-server
+# already pulls in, so the marginal cost is small. Gated to
+# Linux/BSD because Windows and macOS need fundamentally different
+# native paths (Shell_NotifyIconW / NSStatusItem) — see follow-up.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+ksni = { version = "0.3", default-features = false, features = ["async-io"] }
+
 [dev-dependencies]
 tempfile = "3.27.0"

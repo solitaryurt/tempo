@@ -217,6 +217,7 @@ impl TempoApp {
                         .collect()
                 })
                 .unwrap_or_default(),
+            seen_tray_minimize_toast: self.seen_tray_minimize_toast,
         }
     }
 

@@ -219,11 +219,10 @@ impl TempoApp {
                     .update(cx, |player, cx| player.cycle_playback_mode(cx));
             }
             HotkeyAction::ShowWindow => {
-                // GPUI 0.2.2 doesn't expose a window-raise API from a
-                // non-window event handler. Logged for diagnostics; a
-                // follow-up can route through `pending_window_swap`-style
-                // queue with a `&mut Window`.
-                perf::event("hotkeys.show_window", "queued");
+                // Routed through the shared `focus_main_window` helper
+                // so global hotkeys, MPRIS Raise, and the tray's
+                // "Show window" item all use the same un-minimize path.
+                self.focus_main_window(cx);
             }
         }
     }
@@ -275,7 +274,7 @@ impl TempoApp {
                 self.set_playback_volume(clamped, cx);
             }
             MprisCommand::Raise => {
-                perf::event("mpris.raise", "queued");
+                self.focus_main_window(cx);
             }
         }
     }
@@ -298,11 +297,7 @@ impl TempoApp {
             artist: track.artist.to_string(),
             album: track.album.to_string(),
             length_us: track.duration_value.as_micros() as i64,
-            // Embedded artwork would need a temp-file roundtrip to
-            // expose as a URL; on-disk artwork can be a `file://`.
-            // Skip for v1; the desktop widget falls back to a
-            // generic icon.
-            art_url: None,
+            art_url: super::art_url_for_track(track),
             trackid: track.path.to_string_lossy().into_owned(),
         })
     }

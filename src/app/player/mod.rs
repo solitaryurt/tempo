@@ -65,6 +65,13 @@ impl TempoApp {
                 // re-render with the new track.
                 let meta = self.mpris_current_metadata();
                 self.mpris_publish(tempo::mpris::MprisUpdate::Metadata(meta));
+                // Mirror to the system tray so the tooltip / menu
+                // header rows update at the same time.
+                #[cfg(all(unix, not(target_os = "macos")))]
+                {
+                    let tray_meta = self.tray_current_meta();
+                    self.tray_publish(tempo::tray::TrayUpdate::NowPlaying(tray_meta));
+                }
                 cx.notify();
             }
             PlayerEvent::IsPlayingChanged(is_playing) => {
@@ -83,6 +90,10 @@ impl TempoApp {
                     tempo::mpris::MprisPlaybackStatus::Paused
                 };
                 self.mpris_publish(tempo::mpris::MprisUpdate::PlaybackStatus(status));
+                // Tray overlay-icon and menu Play/Pause label key
+                // off the same boolean.
+                #[cfg(all(unix, not(target_os = "macos")))]
+                self.tray_publish(tempo::tray::TrayUpdate::PlayingState(*is_playing));
                 cx.notify();
             }
             PlayerEvent::TrackFinished { finished_path } => {

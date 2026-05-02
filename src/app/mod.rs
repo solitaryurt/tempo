@@ -14,8 +14,8 @@ use gpui::{
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     NavigationDirection, ObjectFit, ParentElement, PathPromptOptions, Pixels, Point, Render,
     ScrollStrategy, ScrollWheelEvent, SharedString, Size, Styled, Subscription,
-    UniformListScrollHandle, Window, WindowBounds, anchored, div, img, point, prelude::*, px,
-    relative, rgb, size, uniform_list,
+    UniformListScrollHandle, Window, WindowBounds, WindowHandle, anchored, div, img, point,
+    prelude::*, px, relative, rgb, size, uniform_list,
 };
 use rodio::{Decoder, Source as _};
 use serde::{Deserialize, Serialize};
@@ -42,6 +42,11 @@ mod equalizer_panel;
 mod history;
 mod hotkeys_panel;
 mod library_state;
+mod lifecycle;
+mod mpris_art;
+#[cfg(all(unix, not(target_os = "macos")))]
+mod tray_panel;
+use mpris_art::art_url_for_track;
 mod library_view;
 mod liked;
 mod menu;
@@ -67,10 +72,11 @@ pub(in crate::app) use menu::{
 };
 
 use crate::{
-    CloseAllTabs, CloseTab, CycleMiniPlayer, FocusSearch, MoveSelectionDown, MoveSelectionUp,
-    NavigateBack, NavigateForward, NewTab, NextTab, OpenSettings, PlayRandomTrack, PlaySelected,
-    PreviousTab, ReopenClosedTab, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5,
-    SelectTab6, SelectTab7, SelectTab8, SelectTab9, SelectTab10, ToggleMiniPlayer, TogglePause,
+    CloseAllTabs, CloseTab, CycleMiniPlayer, FocusSearch, HideWindow, MoveSelectionDown,
+    MoveSelectionUp, NavigateBack, NavigateForward, NewTab, NextTab, OpenSettings, PlayRandomTrack,
+    PlaySelected, PreviousTab, ReopenClosedTab, SelectTab1, SelectTab2, SelectTab3, SelectTab4,
+    SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9, SelectTab10, ToggleMiniPlayer,
+    TogglePause,
 };
 use text_input::TextInputState;
 use theme::{Theme, ThemeColors, bundled_themes, default_theme_id, resolve_theme_id};
@@ -1466,6 +1472,11 @@ struct AppState {
     /// Settings → Hotkeys); preserved across versions.
     #[serde(default)]
     global_hotkeys: HashMap<String, tempo::hotkeys::KeyCombo>,
+    /// `true` after the user has seen the "Tempo continues in the tray"
+    /// toast that fires the first time they X-out of the window. We
+    /// only show it once per install so it doesn't become noise.
+    #[serde(default)]
+    seen_tray_minimize_toast: bool,
 }
 
 fn default_eq_gains() -> [f32; tempo::equalizer::BAND_COUNT] {
@@ -1538,6 +1549,7 @@ impl Default for AppState {
             eq_active_profile: None,
             eq_profiles: Vec::new(),
             global_hotkeys: HashMap::new(),
+            seen_tray_minimize_toast: false,
         }
     }
 }
@@ -2151,6 +2163,14 @@ pub(crate) struct TempoApp {
     /// app for the app's lifetime.
     _player_subscription: Subscription,
     _save_on_quit: Option<Subscription>,
+    /// Observer fired by GPUI when the main window's "active" state
+    /// (= has keyboard focus, on every backend) flips. We use it to
+    /// flip [`window_hidden`] back to `false` when the compositor
+    /// restores us via a path outside our control (taskbar click,
+    /// alt-tab, etc.). Held for the app's lifetime; dropping it
+    /// would mean the tray menu's "Show / Hide Tempo" label could
+    /// drift out of sync with the actual window state.
+    _activation_subscription: Option<Subscription>,
     /// Top-level window layout mode (full vs mini). Runtime-only;
     /// not serialized to `state.json`.
     pub(crate) window_mode: WindowMode,
@@ -2193,6 +2213,36 @@ pub(crate) struct TempoApp {
     /// per-app config. `None` when we couldn't acquire the bus name
     /// (most often: a second Tempo instance is already running).
     pub(super) mpris_service: Option<tempo::mpris::MprisService>,
+
+    // === System tray (StatusNotifierItem) ===
+    /// Linux SNI tray icon, kept alive for the app's lifetime. `None`
+    /// on non-Linux targets or when the D-Bus session is unreachable.
+    /// The tray, not the main window, owns Tempo's process lifetime:
+    /// closing the X is intercepted in `main.rs` and minimizes the
+    /// window instead, so audio keeps playing. Only the tray menu's
+    /// "Quit Tempo" item triggers `cx.quit()`.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub(super) tray_service: Option<tempo::tray::TrayService>,
+
+    // === Window lifecycle ===
+    /// Handle to the most recently created Tempo window. Updated by
+    /// [`TempoApp::set_main_window`] from `main.rs` at boot and from
+    /// the mini-mode window-swap path in [`TempoApp::render`]. Used
+    /// by the tray, MPRIS `Raise`, and global-hotkey `ShowWindow`
+    /// path through [`TempoApp::focus_main_window`].
+    pub(super) main_window: Option<WindowHandle<Self>>,
+    /// `true` after the user has dismissed (or simply seen) the
+    /// "Tempo continues in the tray" toast that fires the first time
+    /// the X-button is intercepted into a minimize. Persisted in
+    /// `AppState` so re-launching doesn't re-show it.
+    pub(super) seen_tray_minimize_toast: bool,
+    /// Tracks whether the main window has been minimized to the tray
+    /// (true) or is currently visible (false). Drives the tray
+    /// menu's "Show Tempo" / "Hide Tempo" label flip via
+    /// [`TempoApp::set_window_hidden`]. Updated by every code path
+    /// that hides or shows the window. Not persisted — fresh
+    /// launches always start with the window visible.
+    pub(super) window_hidden: bool,
 }
 
 impl TempoApp {
@@ -2523,6 +2573,7 @@ impl TempoApp {
             eq_profile_save_as_focus_handle: None,
             _player_subscription: player_subscription,
             _save_on_quit: Some(save_on_quit),
+            _activation_subscription: None,
             window_mode: WindowMode::Full,
             saved_full_bounds: None,
             pending_window_swap: None,
@@ -2530,6 +2581,11 @@ impl TempoApp {
             hotkey_service: None,
             recording_action: None,
             mpris_service: None,
+            #[cfg(all(unix, not(target_os = "macos")))]
+            tray_service: None,
+            main_window: None,
+            seen_tray_minimize_toast: state.seen_tray_minimize_toast,
+            window_hidden: false,
         };
 
         app.artist_grid_scroll_handle
@@ -2608,6 +2664,23 @@ impl TempoApp {
             app.start_global_hotkeys(state.global_hotkeys.clone(), cx)
         });
         perf::time("startup.start_mpris", "", || app.start_mpris_server(cx));
+        // System tray (StatusNotifierItem). Linux only; Windows
+        // and macOS ship in follow-up PRs via native APIs. Failures
+        // (no D-Bus session, no SNI watcher, sandboxed without
+        // policy) are logged and swallowed.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        perf::time("startup.start_tray", "", || app.start_tray_service(cx));
+        // Observe activation transitions so taskbar / alt-tab
+        // restores flip `window_hidden` back to false (and the tray
+        // menu re-renders "Hide Tempo"). We only flip false-on-
+        // activation; deactivation doesn't imply the window was
+        // hidden — another app may simply have focus.
+        app._activation_subscription =
+            Some(cx.observe_window_activation(window, |this, window, _cx| {
+                if window.is_window_active() && this.window_hidden {
+                    this.set_window_hidden(false);
+                }
+            }));
         app
     }
 
@@ -4524,7 +4597,29 @@ impl Render for TempoApp {
                     ..Default::default()
                 };
                 match cx.open_window(options, |_window, _cx| entity) {
-                    Ok(_handle) => {
+                    Ok(handle) => {
+                        // Re-register the X-button-to-minimize
+                        // interceptor on the new window and update
+                        // the entity's `main_window` pointer so the
+                        // tray and MPRIS Raise route to the latest
+                        // window.
+                        let close_handle = handle;
+                        handle
+                            .update(cx, |app, window, cx| {
+                                window.on_window_should_close(cx, move |window, cx| {
+                                    window.minimize_window();
+                                    #[cfg(all(unix, not(target_os = "macos")))]
+                                    tempo::hypr::hide_window();
+                                    close_handle
+                                        .update(cx, |app, _window, cx| {
+                                            app.on_window_close_intercepted(cx);
+                                        })
+                                        .ok();
+                                    false
+                                });
+                                app.set_main_window(handle);
+                            })
+                            .ok();
                         // Close the previous window after the new
                         // one has been mounted (deferred again to
                         // sequence cleanly after the new window's
@@ -4577,6 +4672,7 @@ impl Render for TempoApp {
             .on_action(cx.listener(Self::navigate_forward_action))
             .on_action(cx.listener(Self::toggle_mini_player_action))
             .on_action(cx.listener(Self::cycle_mini_player_action))
+            .on_action(cx.listener(Self::hide_window_action))
             .on_mouse_down(
                 MouseButton::Navigate(NavigationDirection::Back),
                 cx.listener(Self::navigate_back_mouse),
@@ -4873,6 +4969,11 @@ impl TempoApp {
 
     fn close_active_tab(&mut self, _: &CloseTab, _: &mut Window, cx: &mut Context<Self>) {
         self.close_tab(self.active_tab);
+        cx.notify();
+    }
+
+    fn hide_window_action(&mut self, _: &HideWindow, _: &mut Window, cx: &mut Context<Self>) {
+        self.hide_main_window(cx);
         cx.notify();
     }
 
