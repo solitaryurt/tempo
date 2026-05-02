@@ -114,6 +114,9 @@ impl TempoApp {
                                 SettingsSection::AudioOutput => {
                                     self.render_output_settings(cx).into_any_element()
                                 }
+                                SettingsSection::Window => {
+                                    self.render_window_settings(cx).into_any_element()
+                                }
                                 SettingsSection::Library => {
                                     self.render_library_settings(cx).into_any_element()
                                 }
@@ -264,6 +267,13 @@ impl TempoApp {
                 r#"<path d="M5 9.5H8.2L13 5.5V18.5L8.2 14.5H5V9.5Z" fill="none" stroke="{color}" stroke-width="1.6" stroke-linejoin="round"/>
 <path d="M16 9.2C17.2 10.2 17.9 11.5 17.9 12.9C17.9 14.4 17.2 15.7 16 16.7" fill="none" stroke="{accent_stroke}" stroke-width="1.5" stroke-linecap="round"/>
 <path d="M18.5 6.8C20.4 8.4 21.4 10.6 21.4 12.9C21.4 15.3 20.4 17.5 18.5 19.1" fill="none" stroke="{accent_stroke}" stroke-width="1.5" stroke-linecap="round"/>"#
+            ),
+            // Window / workspace restore behaviour.
+            SettingsSection::Window => format!(
+                r#"<rect x="4" y="5" width="16" height="14" rx="2" fill="none" stroke="{color}" stroke-width="1.6"/>
+<path d="M4 9H20" fill="none" stroke="{color}" stroke-width="1.5"/>
+<path d="M8 14H15.5" fill="none" stroke="{accent_stroke}" stroke-width="1.6" stroke-linecap="round"/>
+<path d="M13.2 11.8L15.5 14L13.2 16.2" fill="none" stroke="{accent_stroke}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#
             ),
             // Folder — library roots.
             SettingsSection::Library => format!(
@@ -544,6 +554,143 @@ impl TempoApp {
                     )
                     .child(self.playback_status_dropdown(OutputMenuSource::Settings, cx)),
             )
+    }
+
+    pub(super) fn render_window_settings(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+
+        div()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.surface))
+            .overflow_hidden()
+            .child(
+                div()
+                    .px_4()
+                    .py_2()
+                    .bg(rgb(colors.elevated))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().font_weight(gpui::FontWeight::BOLD).child("Window"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(colors.text_muted))
+                            .child(self.window_restore_mode.label()),
+                    ),
+            )
+            .child(
+                div()
+                    .px_4()
+                    .py_3()
+                    .border_t_1()
+                    .border_color(rgb(colors.border))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_color(rgb(colors.text_strong))
+                            .child("When opening Tempo from another workspace"),
+                    )
+                    .child(self.render_window_restore_option(
+                        WindowRestoreMode::BringHere,
+                        "Move Tempo to the current workspace as a floating window.",
+                        cx,
+                    ))
+                    .child(self.render_window_restore_option(
+                        WindowRestoreMode::GoToWindow,
+                        "Switch to the workspace where Tempo already is.",
+                        cx,
+                    )),
+            )
+    }
+
+    fn render_window_restore_option(
+        &self,
+        mode: WindowRestoreMode,
+        description: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+        let selected = self.window_restore_mode == mode;
+
+        div()
+            .id(SharedString::from(format!(
+                "window-restore-{}",
+                match mode {
+                    WindowRestoreMode::BringHere => "bring-here",
+                    WindowRestoreMode::GoToWindow => "go-to-window",
+                }
+            )))
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(if selected {
+                colors.accent
+            } else {
+                colors.border
+            }))
+            .bg(rgb(if selected {
+                colors.selected
+            } else {
+                colors.button
+            }))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .hover(move |this| {
+                this.bg(rgb(if selected {
+                    colors.selected
+                } else {
+                    colors.hover
+                }))
+            })
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_color(rgb(colors.text_strong))
+                            .child(mode.label()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(colors.text_muted))
+                            .child(description),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(56.0))
+                    .text_xs()
+                    .text_color(rgb(if selected {
+                        colors.accent_soft
+                    } else {
+                        colors.text_faint
+                    }))
+                    .child(if selected { "Active" } else { "" }),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if this.window_restore_mode != mode {
+                    this.window_restore_mode = mode;
+                    this.save_app_state();
+                    cx.notify();
+                }
+            }))
     }
 
     pub(super) fn render_library_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {

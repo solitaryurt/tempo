@@ -45,8 +45,20 @@ actions!(
 );
 
 fn main() {
+    let single_instance_server = match tempo::single_instance::SingleInstanceServer::bind() {
+        Ok(server) => Some(server),
+        Err(error) => {
+            if tempo::single_instance::send_focus_request().is_ok() {
+                return;
+            }
+            eprintln!("failed to start Tempo single-instance server: {error}");
+            None
+        }
+    };
+
     Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
+        let mut single_instance_server = single_instance_server;
 
         let window_handle = cx
             .open_window(
@@ -98,6 +110,9 @@ fn main() {
                 // MPRIS Raise, and global hotkeys can route to a
                 // single `focus_main_window` helper.
                 app.set_main_window(window_handle);
+                if let Some(server) = single_instance_server.take() {
+                    app.install_single_instance_server(server, cx);
+                }
             })
             .ok();
 

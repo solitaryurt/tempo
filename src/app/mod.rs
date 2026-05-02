@@ -179,6 +179,7 @@ pub(super) struct ErrorRowView {
 pub(super) enum SettingsSection {
     Appearance,
     AudioOutput,
+    Window,
     Library,
     OnlineMetadata,
     Hotkeys,
@@ -189,16 +190,18 @@ impl SettingsSection {
         match self {
             Self::Appearance => "Appearance",
             Self::AudioOutput => "Audio Output",
+            Self::Window => "Window",
             Self::Library => "Library",
             Self::OnlineMetadata => "Online Metadata",
             Self::Hotkeys => "Hotkeys",
         }
     }
 
-    pub(super) fn all() -> [Self; 5] {
+    pub(super) fn all() -> [Self; 6] {
         [
             Self::Appearance,
             Self::AudioOutput,
+            Self::Window,
             Self::Library,
             Self::OnlineMetadata,
             Self::Hotkeys,
@@ -468,6 +471,21 @@ impl OnlineMetadataMode {
         match self {
             Self::Off => "Off",
             Self::Automatic => "Automatic",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum WindowRestoreMode {
+    BringHere,
+    GoToWindow,
+}
+
+impl WindowRestoreMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::BringHere => "Bring window here",
+            Self::GoToWindow => "Go to window",
         }
     }
 }
@@ -1423,6 +1441,8 @@ struct AppState {
     playing_track_path: Option<PathBuf>,
     #[serde(default = "default_online_metadata_mode")]
     online_metadata_mode: OnlineMetadataMode,
+    #[serde(default = "default_window_restore_mode")]
+    window_restore_mode: WindowRestoreMode,
     /// One-shot flag tracking whether the Liked-column position
     /// migration has run on this saved state. The migration moves a
     /// legacy trailing `Liked` (formerly inert `Loved`) column to the
@@ -1537,6 +1557,7 @@ impl Default for AppState {
             playback_history: Vec::new(),
             playing_track_path: None,
             online_metadata_mode: default_online_metadata_mode(),
+            window_restore_mode: default_window_restore_mode(),
             // Fresh app state already builds the right default layout,
             // so the migration is a no-op. Mark it done so we don't
             // re-run it spuriously on the second launch.
@@ -1556,6 +1577,10 @@ impl Default for AppState {
 
 fn default_online_metadata_mode() -> OnlineMetadataMode {
     OnlineMetadataMode::Off
+}
+
+fn default_window_restore_mode() -> WindowRestoreMode {
+    WindowRestoreMode::BringHere
 }
 
 fn default_page() -> Page {
@@ -2033,6 +2058,7 @@ pub(crate) struct TempoApp {
     library_root_label: String,
     library_status: String,
     online_metadata_mode: OnlineMetadataMode,
+    window_restore_mode: WindowRestoreMode,
     scan_progress: ScanProgress,
     scan_errors: Vec<IndexingError>,
     /// Snapshot of failed metadata-job rows refreshed on the activity
@@ -2213,6 +2239,10 @@ pub(crate) struct TempoApp {
     /// per-app config. `None` when we couldn't acquire the bus name
     /// (most often: a second Tempo instance is already running).
     pub(super) mpris_service: Option<tempo::mpris::MprisService>,
+    /// Local single-instance socket. Later launches send a focus
+    /// request here and exit so users get the existing playback
+    /// process/window instead of a second Tempo.
+    pub(super) single_instance_server: Option<tempo::single_instance::SingleInstanceServer>,
 
     // === System tray (StatusNotifierItem) ===
     /// Linux SNI tray icon, kept alive for the app's lifetime. `None`
@@ -2524,6 +2554,7 @@ impl TempoApp {
             library_root_label,
             library_status,
             online_metadata_mode: state.online_metadata_mode,
+            window_restore_mode: state.window_restore_mode,
             scan_progress: ScanProgress::default(),
             scan_errors: Vec::new(),
             metadata_errors: Vec::new(),
@@ -2581,6 +2612,7 @@ impl TempoApp {
             hotkey_service: None,
             recording_action: None,
             mpris_service: None,
+            single_instance_server: None,
             #[cfg(all(unix, not(target_os = "macos")))]
             tray_service: None,
             main_window: None,

@@ -162,6 +162,7 @@ impl TempoApp {
             theme_id: self.theme_id.clone(),
             output_device: self.output_device_snapshot.clone(),
             online_metadata_mode: self.online_metadata_mode,
+            window_restore_mode: self.window_restore_mode,
             volume: self.volume_snapshot,
             visible_table_columns: self.visible_columns.clone(),
             visible_artist_table_columns: self.visible_artist_columns.clone(),

@@ -22,12 +22,58 @@
 //!   point of truth for the visibility flag; pushes a tray update
 //!   so the menu flips between "Show Tempo" and "Hide Tempo".
 
+use std::time::Duration;
+
 use gpui::{AppContext as _, Context, WindowHandle};
 use tempo::perf;
 
 use super::TempoApp;
 
 impl TempoApp {
+    /// Install the local single-instance server. Repeated launches
+    /// connect to it, ask this process to focus the existing window,
+    /// then exit before creating a second GPUI app.
+    pub(crate) fn install_single_instance_server(
+        &mut self,
+        server: tempo::single_instance::SingleInstanceServer,
+        cx: &mut Context<Self>,
+    ) {
+        self.single_instance_server = Some(server);
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                let should_focus = match this.update(cx, |app, _cx| {
+                    let Some(server) = app.single_instance_server.as_ref() else {
+                        return Ok(false);
+                    };
+                    server.try_accept_focus_request()
+                }) {
+                    Ok(Ok(should_focus)) => should_focus,
+                    Ok(Err(error)) => {
+                        perf::event("single_instance.accept", format!("err={error}"));
+                        false
+                    }
+                    Err(_) => return,
+                };
+                if !should_focus {
+                    continue;
+                }
+                if this
+                    .update(cx, |app, cx| {
+                        app.focus_main_window(cx);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
     /// Stash the current top-level window handle on the app entity.
     /// Called from `main.rs` immediately after the initial
     /// `cx.open_window(...)` succeeds, and from the mini-mode window
@@ -75,7 +121,10 @@ impl TempoApp {
         // the visible workspace before asking GPUI to focus. On
         // every other compositor this is a no-op.
         #[cfg(all(unix, not(target_os = "macos")))]
-        tempo::hypr::show_window();
+        tempo::hypr::show_window(match self.window_restore_mode {
+            super::WindowRestoreMode::BringHere => tempo::hypr::RestoreMode::BringHere,
+            super::WindowRestoreMode::GoToWindow => tempo::hypr::RestoreMode::GoToWindow,
+        });
         let result = cx.update_window(handle.into(), |_root, window, _app| {
             // `activate_window()` covers both "raise" and the
             // "un-minimize" transition on every backend GPUI ships.

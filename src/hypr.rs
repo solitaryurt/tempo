@@ -34,6 +34,12 @@ use std::process::Command;
 
 use crate::perf;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RestoreMode {
+    BringHere,
+    GoToWindow,
+}
+
 /// Special workspace name we park the Tempo window in when
 /// "hiding". Picked to be unique across the user's other tools so
 /// we don't collide with whatever they happen to use for personal
@@ -74,26 +80,30 @@ pub fn hide_window() -> bool {
     true
 }
 
-/// Show the Tempo window by yanking it out of the hidden special
-/// workspace and onto whatever workspace currently has focus, then
-/// focusing it. Mirror of `hide_window`.
+/// Show the Tempo window by either yanking it onto the focused
+/// workspace or switching to its existing workspace, then focusing it.
+/// Mirror of `hide_window`.
 ///
-/// We use two dispatches: first `movetoworkspacesilent` to land
-/// the window on the active workspace, then `focuswindow` to make
-/// sure it's the active client and not just sitting behind the
-/// previously-focused tile.
-pub fn show_window() -> bool {
+/// In `BringHere` mode we use three dispatches: first
+/// `movetoworkspacesilent` to land the window on the active workspace,
+/// then `setfloating` so it restores as an overlay instead of
+/// reshuffling the user's tiling layout, then `focuswindow`. In
+/// `GoToWindow` mode, `focuswindow` alone lets Hyprland switch to the
+/// workspace that already contains Tempo.
+pub fn show_window(mode: RestoreMode) -> bool {
     if !is_running_under_hyprland() {
         return false;
     }
-    // `name:` selects a workspace by its name; `~` is Hyprland's
-    // shorthand for "the last-used regular (non-special)
-    // workspace". `e+0` would be "current" but breaks if the
-    // current workspace is the hidden special one (unlikely but
-    // possible — the user could have toggled it via
-    // togglespecialworkspace). Using `~` sidesteps that.
-    let move_arg = format!("movetoworkspacesilent ~,{WINDOW_SELECTOR}");
-    run_hyprctl_dispatch(&move_arg, "hypr.show_window.move");
+    if mode == RestoreMode::BringHere {
+        // `e+0` is Hyprland's relative selector for the currently
+        // active workspace. That makes a tray click restore Tempo
+        // exactly where the user is, not wherever Tempo was last
+        // hidden from.
+        let move_arg = format!("movetoworkspacesilent e+0,{WINDOW_SELECTOR}");
+        run_hyprctl_dispatch(&move_arg, "hypr.show_window.move");
+        let float_arg = format!("setfloating {WINDOW_SELECTOR}");
+        run_hyprctl_dispatch(&float_arg, "hypr.show_window.float");
+    }
     let focus_arg = format!("focuswindow {WINDOW_SELECTOR}");
     run_hyprctl_dispatch(&focus_arg, "hypr.show_window.focus");
     true
