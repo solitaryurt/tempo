@@ -13,3 +13,4 @@ pub mod single_instance;
 pub mod snapshot;
 #[cfg(all(unix, not(target_os = "macos")))]
 pub mod tray;
+pub mod updates;

@@ -59,20 +59,28 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets --all-features --locked
 
-      - name: Build release binary
-        run: cargo build --release --locked
+      - name: Build release binaries
+        run: cargo build --release --locked --bins
 
-      - name: Stage Linux artifact
+      - name: Stage Linux artifacts
         run: |
           mkdir -p dist
           cp target/release/tempo dist/tempo-linux-x86_64
-          chmod +x dist/tempo-linux-x86_64
+          cp target/release/tempo-updater dist/tempo-updater-linux-x86_64
+          chmod +x dist/tempo-linux-x86_64 dist/tempo-updater-linux-x86_64
 
-      - name: Upload Linux artifact
+      - name: Upload Linux app binary
         uses: actions/upload-artifact@v4
         with:
           name: tempo-linux-x86_64
           path: dist/tempo-linux-x86_64
+          if-no-files-found: error
+
+      - name: Upload Linux updater helper
+        uses: actions/upload-artifact@v4
+        with:
+          name: tempo-updater-linux-x86_64
+          path: dist/tempo-updater-linux-x86_64
           if-no-files-found: error
 
   build-macos:
@@ -92,20 +100,28 @@ jobs:
           shared-key: rust-stable-macos
           cache-on-failure: "true"
 
-      - name: Build release binary
-        run: cargo build --release --locked
+      - name: Build release binaries
+        run: cargo build --release --locked --bins
 
-      - name: Stage macOS artifact
+      - name: Stage macOS artifacts
         run: |
           mkdir -p dist
           cp target/release/tempo dist/tempo-macos-aarch64
-          chmod +x dist/tempo-macos-aarch64
+          cp target/release/tempo-updater dist/tempo-updater-macos-aarch64
+          chmod +x dist/tempo-macos-aarch64 dist/tempo-updater-macos-aarch64
 
-      - name: Upload macOS artifact
+      - name: Upload macOS app binary
         uses: actions/upload-artifact@v4
         with:
           name: tempo-macos-aarch64
           path: dist/tempo-macos-aarch64
+          if-no-files-found: error
+
+      - name: Upload macOS updater helper
+        uses: actions/upload-artifact@v4
+        with:
+          name: tempo-updater-macos-aarch64
+          path: dist/tempo-updater-macos-aarch64
           if-no-files-found: error
 
   build-windows:
@@ -129,20 +145,28 @@ jobs:
           shared-key: rust-stable-windows
           cache-on-failure: "true"
 
-      - name: Build release binary
-        run: cargo build --release --locked
+      - name: Build release binaries
+        run: cargo build --release --locked --bins
 
-      - name: Stage Windows artifact
+      - name: Stage Windows artifacts
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target/release/tempo.exe dist/tempo-windows-x86_64.exe
+          Copy-Item target/release/tempo-updater.exe dist/tempo-updater-windows-x86_64.exe
 
-      - name: Upload Windows artifact
+      - name: Upload Windows app binary
         uses: actions/upload-artifact@v4
         with:
           name: tempo-windows-x86_64
           path: dist/tempo-windows-x86_64.exe
+          if-no-files-found: error
+
+      - name: Upload Windows updater helper
+        uses: actions/upload-artifact@v4
+        with:
+          name: tempo-updater-windows-x86_64
+          path: dist/tempo-updater-windows-x86_64.exe
           if-no-files-found: error
 
   release:

@@ -58,6 +58,7 @@ mod table;
 mod text_input;
 mod theme;
 mod tooltip;
+mod update_state;
 
 // Re-export the layout helpers so direct child modules
 // (`sidebar`, `table`, `library_view`, etc.) and grandchild modules
@@ -2574,6 +2575,13 @@ pub(crate) struct TempoApp {
     /// overlay handlers reset it to `false` on dismissal. Not
     /// persisted.
     pub(super) close_confirmation_open: bool,
+
+    /// Self-update bookkeeping (latest poll, staged download, error
+    /// toast). Driven by `start_update_poll` and the click handlers in
+    /// `update_state.rs`. Runtime-only — see `update_state::UpdateState`
+    /// for the rationale (a stale "update available" flag persisted
+    /// across launches would be misleading).
+    pub(super) update_state: update_state::UpdateState,
 }
 
 impl TempoApp {
@@ -2946,6 +2954,7 @@ impl TempoApp {
             seen_tray_minimize_toast: state.seen_tray_minimize_toast,
             window_hidden: false,
             close_confirmation_open: false,
+            update_state: update_state::UpdateState::default(),
         };
 
         app.artist_grid_scroll_handle
@@ -3024,6 +3033,13 @@ impl TempoApp {
             app.start_global_hotkeys(state.global_hotkeys.clone(), cx)
         });
         perf::time("startup.start_mpris", "", || app.start_mpris_server(cx));
+        // Periodically check GitHub for newer Tempo releases and
+        // surface a small "update available" pill in the top bar.
+        // No-op on dev builds and unsupported platforms; see
+        // `update_state.rs` for the loop body.
+        perf::time("startup.start_update_poll", "", || {
+            app.start_update_poll(cx)
+        });
         // System tray (StatusNotifierItem). Linux only; Windows
         // and macOS ship in follow-up PRs via native APIs. Failures
         // (no D-Bus session, no SNI watcher, sandboxed without

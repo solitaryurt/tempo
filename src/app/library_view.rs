@@ -592,6 +592,7 @@ impl TempoApp {
             .when_some(self.render_metadata_status(cx), |this, status| {
                 this.child(status)
             })
+            .when_some(self.render_update_pill(cx), |this, pill| this.child(pill))
             .child(div().flex_1())
             .child(self.render_search_box(window, "Search library", cx))
             .child(

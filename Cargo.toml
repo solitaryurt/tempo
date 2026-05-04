@@ -2,6 +2,21 @@
 name = "tempo"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
+
+[[bin]]
+name = "tempo"
+path = "src/main.rs"
+
+# Companion helper that performs the actual self-update on Linux:
+# the main `tempo` binary downloads the new release, spawns this
+# helper, and exits. The helper waits for the parent PID to die,
+# replaces the executable on disk, and re-launches `tempo`. It is
+# intentionally tiny so it has only `anyhow` as a dependency from
+# the workspace.
+[[bin]]
+name = "tempo-updater"
+path = "src/bin/tempo_updater.rs"
 
 [dependencies]
 anyhow = "1.0.102"
@@ -16,6 +31,7 @@ rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 serde_yaml = "0.9.34"
+sha2 = "0.10"
 walkdir = "2.5.0"
 crossbeam-channel = "0.5.15"
 rayon = "1.12.0"
